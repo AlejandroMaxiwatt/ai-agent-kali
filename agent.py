@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import contextlib
+import difflib
 import getpass
 import json
 import os
@@ -19,6 +20,7 @@ from openai import OpenAI
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.columns import Columns
 from rich.text import Text
@@ -594,6 +596,48 @@ Fidelidad al guardar datos del operador en TARGET_UPDATE — REGLA DURA:
     [[/TARGET_UPDATE]]
 - NUNCA encadenes dos `[[TARGET_UPDATE: …]]` seguidos sin cerrar
   el primero con `[[/TARGET_UPDATE]]`.
+
+Edición de código (FILE_READ / FILE_EDIT / FILE_WRITE):
+Cuando necesites leer, modificar o crear archivos de código (payloads en C/Python/Bash/etc.,
+scripts auxiliares, configuraciones), usa estos tres bloques en lugar de comandos shell
+tipo `sed -i`, `cat > file <<EOF` o `echo >> file`. El agente los procesa, muestra un
+diff coloreado al operador, pide confirmación (o aplica auto si AUTO_EXECUTE=True) y
+te reporta el resultado en el próximo turno.
+
+  [[FILE_READ: ruta/al/archivo.c]]
+
+    → Lee el archivo y lo inyecta al contexto con líneas numeradas. Úsalo SIEMPRE antes
+      de proponer un FILE_EDIT, para tener el texto exacto que vas a sustituir.
+
+  [[FILE_EDIT: ruta/al/archivo.c]]
+  <<<OLD
+  texto exacto que existe en el archivo (debe ser único)
+  OLD>>>
+  <<<NEW
+  texto que lo sustituye
+  NEW>>>
+  [[/FILE_EDIT]]
+
+    → Sustitución quirúrgica. OLD debe coincidir EXACTAMENTE (incluyendo whitespace e
+      indentación) y aparecer UNA SOLA VEZ en el archivo. Si aparece varias veces, añade
+      contexto (más líneas alrededor) hasta que sea único. NO uses regex — es match literal.
+
+  [[FILE_WRITE: ruta/al/archivo_nuevo.c]]
+  contenido entero del archivo (crea o sobreescribe)
+  [[/FILE_WRITE]]
+
+    → Para archivos nuevos o reescrituras completas donde un EDIT sería poco práctico.
+
+Reglas duras:
+- Rutas relativas al workspace (./skills/foo.md) o absolutas dentro de él. Path traversal
+  (..) se bloquea automáticamente.
+- Archivos protegidos NO se pueden tocar: .env, *.pem, id_rsa*, agent.py, memory/sessions/.
+  Si el operador quiere cambiar esos, lo hace él.
+- NO mezcles edición con shell. Si vas a tocar payload.c, emite el bloque FILE_EDIT, no
+  un `sed -i`. La razón: el operador ve el diff antes de aplicar, hay rollback implícito,
+  y se valida que OLD sea único (evita corromper el archivo si te confundes de match).
+- Después de un EDIT/WRITE, el siguiente turno recibirás un bloque [FILE_OPS_RESULT]
+  con qué se aplicó y qué falló. Léelo antes de proponer el siguiente paso.
 
 NO REGURGITAR el contexto system — REGLA DURA:
 - Los mensajes "system" que recibes (este SYSTEM_PROMPT, `[Scans en disco
@@ -3473,6 +3517,532 @@ def apply_target_update(filename, content):
     }
 
 
+# ============================================================
+# FILE_READ / FILE_EDIT / FILE_WRITE — edición de código por el modelo
+# ============================================================
+# El modelo puede emitir tres tipos de bloque al final de su respuesta:
+#
+#   [[FILE_READ: ruta/al/archivo.c]]               ← sin cuerpo
+#   [[FILE_READ: ruta/al/archivo.c L10-L40]]       ← rango opcional
+#
+#   [[FILE_EDIT: ruta/al/archivo.c]]
+#   <<<OLD
+#   texto exacto que existe en el archivo (debe ser único)
+#   OLD>>>
+#   <<<NEW
+#   texto que lo sustituye
+#   NEW>>>
+#   [[/FILE_EDIT]]
+#
+#   [[FILE_WRITE: ruta/al/archivo.c]]
+#   contenido entero del archivo (crea o sobreescribe)
+#   [[/FILE_WRITE]]
+#
+# Reglas:
+#   - Las rutas son siempre relativas al WORKSPACE o absolutas dentro de él.
+#   - Path traversal y ficheros protegidos (.env, privkey, agent.py…) se
+#     bloquean a nivel de validación.
+#   - FILE_EDIT requiere que `OLD` sea único en el archivo (anti-ambigüedad).
+#   - Antes de aplicar EDIT/WRITE se muestra un panel diff coloreado al
+#     operador. Si AUTO_EXECUTE=True se aplica directo; si no, se pide y/n.
+#   - FILE_READ inyecta el contenido al history con líneas numeradas para
+#     que el modelo lo "vea" en el siguiente turno.
+# ============================================================
+
+FILE_READ_PATTERN = re.compile(
+    r"\[\[FILE_READ:\s*([^\]]+?)\]\]",
+    re.IGNORECASE,
+)
+
+FILE_EDIT_PATTERN = re.compile(
+    r"\[\[FILE_EDIT:\s*([^\]]+?)\]\]\s*\n"
+    r"\s*<<<OLD\s*\n(.*?)\n\s*OLD>>>\s*\n"
+    r"\s*<<<NEW\s*\n(.*?)\n\s*NEW>>>\s*\n?"
+    r"\s*\[\[/FILE_EDIT\]\]",
+    re.DOTALL | re.IGNORECASE,
+)
+
+FILE_WRITE_PATTERN = re.compile(
+    r"\[\[FILE_WRITE:\s*([^\]]+?)\]\]\s*\n"
+    r"(.*?)"
+    r"\n?\[\[/FILE_WRITE\]\]",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Rutas y nombres que el modelo NUNCA puede tocar — defensa contra prompt
+# injection y errores. Match exacto contra el basename O prefijo de path
+# normalizado relativo al WORKSPACE.
+FILE_PROTECTED_BASENAMES = {
+    ".env", ".env.local", "privkey.pem", "id_rsa", "id_rsa.pub",
+    "id_ed25519", "id_ed25519.pub",
+}
+FILE_PROTECTED_PREFIXES = (
+    ".git/", "venv/", ".venv/", "__pycache__/",
+    "memory/sessions/",  # las sesiones las gestiona el agente
+)
+
+# Tamaño máximo razonable para leer al contexto (evita inundar el LLM).
+FILE_READ_MAX_BYTES = 200_000
+FILE_READ_MAX_LINES = 2000
+
+
+def _validate_workspace_path(path):
+    """Resuelve `path` dentro del WORKSPACE y comprueba protecciones.
+    Devuelve (ok, absolute_path_or_error_msg, relative_or_error_msg).
+    """
+    if not path or not isinstance(path, str):
+        return (False, "ruta vacía", "")
+    raw = path.strip()
+    if not raw:
+        return (False, "ruta vacía", "")
+    # Soportar tanto rutas relativas (al workspace) como absolutas dentro
+    # del workspace. Path traversal y simlinks se cortan con realpath.
+    if os.path.isabs(raw):
+        full = os.path.realpath(raw)
+    else:
+        full = os.path.realpath(os.path.join(WORKSPACE, raw))
+    workspace_root = os.path.realpath(WORKSPACE)
+    if not (full == workspace_root or full.startswith(workspace_root + os.sep)):
+        return (False, f"ruta fuera del workspace: {raw}", "")
+    rel = os.path.relpath(full, workspace_root)
+    # Protecciones
+    base = os.path.basename(full)
+    if base in FILE_PROTECTED_BASENAMES:
+        return (False, f"archivo protegido: {base}", "")
+    rel_with_slash = rel.replace(os.sep, "/")
+    for pref in FILE_PROTECTED_PREFIXES:
+        if rel_with_slash == pref.rstrip("/") or rel_with_slash.startswith(pref):
+            return (False, f"ruta protegida: {pref}", "")
+    # agent.py: el modelo no se modifica a sí mismo.
+    if rel_with_slash == "agent.py":
+        return (False, "agent.py es modificable solo por el operador, no por el modelo", "")
+    return (True, full, rel_with_slash)
+
+
+def extract_file_reads(text):
+    """Devuelve lista de strings con las rutas a leer."""
+    if not text:
+        return []
+    return [m.group(1).strip() for m in FILE_READ_PATTERN.finditer(text)]
+
+
+def extract_file_edits(text):
+    """Devuelve lista de tuplas (path, old_string, new_string)."""
+    if not text:
+        return []
+    return [
+        (m.group(1).strip(), m.group(2), m.group(3))
+        for m in FILE_EDIT_PATTERN.finditer(text)
+    ]
+
+
+def extract_file_writes(text):
+    """Devuelve lista de tuplas (path, content)."""
+    if not text:
+        return []
+    return [
+        (m.group(1).strip(), m.group(2))
+        for m in FILE_WRITE_PATTERN.finditer(text)
+    ]
+
+
+def strip_file_blocks(text):
+    """Elimina los bloques FILE_* del texto (para no meterlos en el history
+    como ruido — los resultados se inyectan aparte)."""
+    if not text:
+        return text
+    out = FILE_EDIT_PATTERN.sub("", text)
+    out = FILE_WRITE_PATTERN.sub("", out)
+    out = FILE_READ_PATTERN.sub("", out)
+    return out.strip()
+
+
+def _guess_syntax_lexer(path):
+    """Devuelve el nombre de lexer Pygments según extensión (para syntax
+    highlight). None si no se conoce — se mostrará como texto plano."""
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    mapping = {
+        "py": "python", "c": "c", "cpp": "cpp", "cc": "cpp", "h": "c",
+        "hpp": "cpp", "rs": "rust", "go": "go", "js": "javascript",
+        "ts": "typescript", "tsx": "tsx", "jsx": "jsx",
+        "sh": "bash", "bash": "bash", "zsh": "bash",
+        "rb": "ruby", "pl": "perl", "java": "java", "kt": "kotlin",
+        "cs": "csharp", "php": "php", "swift": "swift",
+        "html": "html", "xml": "xml", "css": "css", "scss": "scss",
+        "yml": "yaml", "yaml": "yaml", "toml": "toml", "ini": "ini",
+        "json": "json", "md": "markdown", "sql": "sql",
+        "Dockerfile": "dockerfile",
+    }
+    return mapping.get(ext)
+
+
+def _read_file_with_line_numbers(full_path, max_lines=FILE_READ_MAX_LINES,
+                                  max_bytes=FILE_READ_MAX_BYTES):
+    """Lee el archivo y devuelve dict {ok, content, total_lines, truncated, error}.
+    El contenido viene con líneas numeradas estilo `cat -n` (ancho 5)."""
+    try:
+        st = os.stat(full_path)
+    except OSError as e:
+        return {"ok": False, "error": f"stat: {e}"}
+    if st.st_size > max_bytes:
+        return {"ok": False, "error": f"archivo demasiado grande ({st.st_size} bytes, máx {max_bytes})"}
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return {"ok": False, "error": f"read: {e}"}
+    total = len(lines)
+    truncated = False
+    if total > max_lines:
+        lines = lines[:max_lines]
+        truncated = True
+    numbered = "".join(
+        f"{i+1:>5}\t{line.rstrip(chr(10))}\n" for i, line in enumerate(lines)
+    )
+    return {
+        "ok": True,
+        "content": numbered,
+        "total_lines": total,
+        "shown_lines": len(lines),
+        "truncated": truncated,
+    }
+
+
+def apply_file_read(path):
+    """Lee el archivo y devuelve un dict con el contenido numerado para
+    inyectarlo al history. NO ejecuta side-effects aparte de stat/read."""
+    ok, full, rel = _validate_workspace_path(path)
+    if not ok:
+        return {"ok": False, "path": path, "error": full}
+    if not os.path.isfile(full):
+        return {"ok": False, "path": path, "error": "no es un archivo regular o no existe"}
+    res = _read_file_with_line_numbers(full)
+    if not res["ok"]:
+        return {"ok": False, "path": path, "error": res["error"]}
+    return {
+        "ok": True,
+        "path": rel,
+        "abs_path": full,
+        "content": res["content"],
+        "total_lines": res["total_lines"],
+        "shown_lines": res["shown_lines"],
+        "truncated": res["truncated"],
+    }
+
+
+def _count_occurrences(haystack, needle):
+    """Cuenta cuántas veces aparece needle (substring exacto) en haystack."""
+    if not needle:
+        return 0
+    return haystack.count(needle)
+
+
+def apply_file_edit(path, old_string, new_string):
+    """Sustitución quirúrgica de `old_string` por `new_string` en el archivo.
+    Requiere que old_string aparezca EXACTAMENTE UNA VEZ en el archivo
+    (anti-ambigüedad, igual que el Edit de Claude Code).
+
+    Devuelve dict {ok, path, error, old_string, new_string, diff_lines}.
+    """
+    ok, full, rel = _validate_workspace_path(path)
+    if not ok:
+        return {"ok": False, "path": path, "error": full}
+    if not os.path.isfile(full):
+        return {"ok": False, "path": path, "error": "no existe; usa FILE_WRITE para crearlo"}
+    if old_string == new_string:
+        return {"ok": False, "path": rel, "error": "OLD y NEW son idénticos"}
+    try:
+        with open(full, "r", encoding="utf-8") as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        return {"ok": False, "path": rel, "error": f"read: {e}"}
+    n = _count_occurrences(content, old_string)
+    if n == 0:
+        return {
+            "ok": False, "path": rel,
+            "error": "OLD no se encuentra en el archivo (revisa whitespace exacto)",
+        }
+    if n > 1:
+        return {
+            "ok": False, "path": rel,
+            "error": f"OLD aparece {n} veces; añade más contexto para que sea único",
+        }
+    new_content = content.replace(old_string, new_string, 1)
+    try:
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError as e:
+        return {"ok": False, "path": rel, "error": f"write: {e}"}
+    diff_lines = list(difflib.unified_diff(
+        content.splitlines(keepends=False),
+        new_content.splitlines(keepends=False),
+        fromfile=f"a/{rel}", tofile=f"b/{rel}", n=3,
+    ))
+    return {
+        "ok": True, "path": rel, "abs_path": full,
+        "old_string": old_string, "new_string": new_string,
+        "diff_lines": diff_lines,
+        "old_content": content, "new_content": new_content,
+    }
+
+
+def apply_file_write(path, content):
+    """Crea o sobreescribe el archivo entero. Útil para archivos nuevos o
+    reescrituras grandes donde un EDIT sería poco práctico.
+
+    Devuelve dict {ok, path, created, error, diff_lines}."""
+    ok, full, rel = _validate_workspace_path(path)
+    if not ok:
+        return {"ok": False, "path": path, "error": full}
+    pre_exists = os.path.exists(full)
+    old_content = ""
+    if pre_exists:
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                old_content = f.read()
+        except (OSError, UnicodeDecodeError):
+            old_content = ""
+    parent = os.path.dirname(full)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return {"ok": False, "path": rel, "error": f"mkdir: {e}"}
+    # Normalizamos: el contenido siempre acaba con \n (UNIX-friendly)
+    body = content if content.endswith("\n") else content + "\n"
+    try:
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(body)
+    except OSError as e:
+        return {"ok": False, "path": rel, "error": f"write: {e}"}
+    diff_lines = list(difflib.unified_diff(
+        old_content.splitlines(keepends=False),
+        body.splitlines(keepends=False),
+        fromfile=f"a/{rel}" if pre_exists else "/dev/null",
+        tofile=f"b/{rel}", n=3,
+    ))
+    return {
+        "ok": True, "path": rel, "abs_path": full,
+        "created": not pre_exists,
+        "diff_lines": diff_lines,
+        "old_content": old_content, "new_content": body,
+    }
+
+
+def render_file_diff_panel(path, diff_lines, kind="edit"):
+    """Pinta un panel rich con el diff unificado coloreado.
+    `kind` ∈ {'edit', 'write', 'create'} solo afecta al título.
+    """
+    if not diff_lines:
+        body = Text("(sin cambios visibles)", style="grey50")
+    else:
+        body = Text()
+        for line in diff_lines:
+            if line.startswith("+++") or line.startswith("---"):
+                body.append(line + "\n", style=f"bold {WHITE}")
+            elif line.startswith("@@"):
+                body.append(line + "\n", style=f"bold {CYAN}")
+            elif line.startswith("+"):
+                body.append(line + "\n", style=GREEN)
+            elif line.startswith("-"):
+                body.append(line + "\n", style=RED)
+            else:
+                body.append(line + "\n", style="grey50")
+    label = {"edit": "FILE_EDIT", "write": "FILE_WRITE",
+             "create": "FILE_WRITE (nuevo)"}.get(kind, "FILE_*")
+    title = f"[bold {ORANGE}]{label}[/]  ·  [{WHITE}]{path}[/]"
+    return Panel(body, title=title, border_style=ORANGE, box=ROUNDED, padding=(1, 2))
+
+
+def process_file_blocks(answer):
+    """Procesa todos los bloques FILE_READ/FILE_EDIT/FILE_WRITE de la
+    respuesta del modelo. Renderiza paneles, pide confirmación si AUTO_EXECUTE
+    es False, aplica las operaciones, y devuelve dict con:
+
+      - any:            True si había al menos un bloque FILE_*
+      - read_messages:  lista de strings para inyectar al history (uno por
+                        FILE_READ exitoso) con el contenido del archivo.
+      - op_summary:     string con el resumen de EDITs/WRITEs (errores y
+                        confirmaciones) para inyectar al history y que el
+                        modelo lo vea en el próximo turno.
+    """
+    reads = extract_file_reads(answer)
+    edits = extract_file_edits(answer)
+    writes = extract_file_writes(answer)
+    if not (reads or edits or writes):
+        return {"any": False, "read_messages": [], "op_summary": ""}
+
+    read_messages = []
+    op_lines = []
+
+    # --- FILE_READ: sin confirmación, solo lectura ---
+    for raw_path in reads:
+        r = apply_file_read(raw_path)
+        if r["ok"]:
+            console.print()
+            console.print(Panel(
+                Text(f"{r['shown_lines']}/{r['total_lines']} líneas"
+                     + (" (truncado)" if r["truncated"] else ""), style="grey50"),
+                title=f"[bold {ORANGE}]FILE_READ[/]  ·  [{WHITE}]{r['path']}[/]",
+                border_style=ORANGE, box=ROUNDED, padding=(0, 2),
+            ))
+            read_messages.append(
+                f"[FILE_READ: {r['path']}  ({r['shown_lines']}/{r['total_lines']} líneas"
+                + (", truncado" if r["truncated"] else "") + ")]\n"
+                + r["content"]
+                + f"[/FILE_READ: {r['path']}]"
+            )
+            op_lines.append(f"✓ FILE_READ {r['path']} → {r['shown_lines']} líneas inyectadas al contexto")
+        else:
+            console.print()
+            console.print(Panel(
+                f"[{RED}]error:[/] {r['error']}",
+                title=f"[bold {RED}]FILE_READ FAILED[/]  ·  [{WHITE}]{raw_path}[/]",
+                border_style=RED, box=ROUNDED, padding=(0, 2),
+            ))
+            op_lines.append(f"✗ FILE_READ {raw_path} → {r['error']}")
+
+    # --- FILE_EDIT: preview + confirmación + apply ---
+    for raw_path, old_s, new_s in edits:
+        # Pre-validación SIN escribir: comprobamos path y unicidad.
+        ok_path, full_or_err, rel = _validate_workspace_path(raw_path)
+        if not ok_path:
+            console.print(Panel(
+                f"[{RED}]ruta inválida:[/] {full_or_err}",
+                title=f"[bold {RED}]FILE_EDIT REJECTED[/]  ·  [{WHITE}]{raw_path}[/]",
+                border_style=RED, box=ROUNDED,
+            ))
+            op_lines.append(f"✗ FILE_EDIT {raw_path} → {full_or_err}")
+            continue
+
+        # Generar diff preview SIN escribir todavía.
+        try:
+            with open(full_or_err, "r", encoding="utf-8") as f:
+                pre_content = f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            console.print(Panel(
+                f"[{RED}]no se puede leer el archivo:[/] {e}",
+                title=f"[bold {RED}]FILE_EDIT REJECTED[/]  ·  [{WHITE}]{rel}[/]",
+                border_style=RED, box=ROUNDED,
+            ))
+            op_lines.append(f"✗ FILE_EDIT {rel} → read: {e}")
+            continue
+        n = pre_content.count(old_s) if old_s else 0
+        if n == 0:
+            console.print(Panel(
+                f"[{RED}]OLD no se encuentra en el archivo[/] (revisa whitespace).",
+                title=f"[bold {RED}]FILE_EDIT REJECTED[/]  ·  [{WHITE}]{rel}[/]",
+                border_style=RED, box=ROUNDED,
+            ))
+            op_lines.append(f"✗ FILE_EDIT {rel} → OLD no encontrado")
+            continue
+        if n > 1:
+            console.print(Panel(
+                f"[{RED}]OLD aparece {n} veces — añade más contexto para que sea único.[/]",
+                title=f"[bold {RED}]FILE_EDIT REJECTED[/]  ·  [{WHITE}]{rel}[/]",
+                border_style=RED, box=ROUNDED,
+            ))
+            op_lines.append(f"✗ FILE_EDIT {rel} → OLD ambiguo ({n} matches)")
+            continue
+        post_content = pre_content.replace(old_s, new_s, 1)
+        diff_lines = list(difflib.unified_diff(
+            pre_content.splitlines(keepends=False),
+            post_content.splitlines(keepends=False),
+            fromfile=f"a/{rel}", tofile=f"b/{rel}", n=3,
+        ))
+        console.print()
+        console.print(render_file_diff_panel(rel, diff_lines, kind="edit"))
+
+        # Confirmación
+        if AUTO_EXECUTE:
+            console.print(f"[dim]» AUTOPILOT — aplicando edit sin confirmación[/]")
+            apply = True
+        else:
+            try:
+                resp = input(f"[?] aplicar este FILE_EDIT a {rel}? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                resp = "n"
+            apply = resp in ("", "y", "yes", "s", "si", "sí")
+
+        if not apply:
+            console.print(f"[dim]cancelado por el operador[/]")
+            op_lines.append(f"✗ FILE_EDIT {rel} → cancelado por operador")
+            continue
+
+        r = apply_file_edit(rel, old_s, new_s)
+        if r["ok"]:
+            console.print(f"[bold {GREEN}]✓ aplicado[/] {rel}")
+            op_lines.append(f"✓ FILE_EDIT {rel} aplicado")
+        else:
+            console.print(f"[bold {RED}]✗ fallo:[/] {r['error']}")
+            op_lines.append(f"✗ FILE_EDIT {rel} → {r['error']}")
+
+    # --- FILE_WRITE: preview + confirmación + apply ---
+    for raw_path, content in writes:
+        ok_path, full_or_err, rel = _validate_workspace_path(raw_path)
+        if not ok_path:
+            console.print(Panel(
+                f"[{RED}]ruta inválida:[/] {full_or_err}",
+                title=f"[bold {RED}]FILE_WRITE REJECTED[/]  ·  [{WHITE}]{raw_path}[/]",
+                border_style=RED, box=ROUNDED,
+            ))
+            op_lines.append(f"✗ FILE_WRITE {raw_path} → {full_or_err}")
+            continue
+        pre_exists = os.path.exists(full_or_err)
+        old_content = ""
+        if pre_exists:
+            try:
+                with open(full_or_err, "r", encoding="utf-8") as f:
+                    old_content = f.read()
+            except (OSError, UnicodeDecodeError):
+                old_content = ""
+        body = content if content.endswith("\n") else content + "\n"
+        diff_lines = list(difflib.unified_diff(
+            old_content.splitlines(keepends=False),
+            body.splitlines(keepends=False),
+            fromfile=f"a/{rel}" if pre_exists else "/dev/null",
+            tofile=f"b/{rel}", n=3,
+        ))
+        console.print()
+        kind = "write" if pre_exists else "create"
+        console.print(render_file_diff_panel(rel, diff_lines, kind=kind))
+
+        if AUTO_EXECUTE:
+            console.print(f"[dim]» AUTOPILOT — aplicando write sin confirmación[/]")
+            apply = True
+        else:
+            verb = "sobreescribir" if pre_exists else "crear"
+            try:
+                resp = input(f"[?] {verb} {rel}? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                resp = "n"
+            apply = resp in ("", "y", "yes", "s", "si", "sí")
+
+        if not apply:
+            console.print(f"[dim]cancelado por el operador[/]")
+            op_lines.append(f"✗ FILE_WRITE {rel} → cancelado por operador")
+            continue
+
+        r = apply_file_write(rel, content)
+        if r["ok"]:
+            label = "creado" if r["created"] else "sobreescrito"
+            console.print(f"[bold {GREEN}]✓ {label}[/] {rel}")
+            op_lines.append(f"✓ FILE_WRITE {rel} {label}")
+        else:
+            console.print(f"[bold {RED}]✗ fallo:[/] {r['error']}")
+            op_lines.append(f"✗ FILE_WRITE {rel} → {r['error']}")
+
+    op_summary = ""
+    if op_lines:
+        op_summary = "[FILE_OPS_RESULT]\n" + "\n".join(op_lines) + "\n[/FILE_OPS_RESULT]"
+
+    return {
+        "any": True,
+        "read_messages": read_messages,
+        "op_summary": op_summary,
+    }
+
+
 def unload_target():
     """Elimina del history el bloque del target activo y limpia el marcador."""
     global ACTIVE_TARGET
@@ -5236,11 +5806,31 @@ def ask_model(user_input):
             # actualizados en el siguiente turno.
             load_target(ACTIVE_TARGET)
 
+    # ────────────────────────────────────────────────────────
+    # Procesar bloques FILE_READ / FILE_EDIT / FILE_WRITE
+    # ────────────────────────────────────────────────────────
+    file_results = process_file_blocks(answer)
+    if file_results["any"]:
+        # Limpiar bloques del answer guardado (igual que TARGET_UPDATE).
+        answer = strip_file_blocks(answer)
+
     history.append({"role": "assistant", "content": answer})
     save_session()
 
     if applied:
         _print_target_updates_panel(applied)
+
+    # Inyectar resultados de FILE_READ al history para que el modelo "vea"
+    # los archivos en el próximo turno.
+    if file_results["read_messages"]:
+        for msg in file_results["read_messages"]:
+            history.append({"role": "system", "content": msg})
+        save_session()
+
+    # Inyectar feedback de FILE_EDIT/WRITE al history (errores + confirmaciones)
+    if file_results["op_summary"]:
+        history.append({"role": "system", "content": file_results["op_summary"]})
+        save_session()
 
     return answer
 
@@ -8324,6 +8914,119 @@ def main():
 
         if cmd_lower in ("tools", "herramientas"):
             print_tools()
+            continue
+
+        # Comandos de edición de archivos (operador) — `view`, `edit`, `diff`.
+        # Las tres operaciones que el modelo puede hacer vía FILE_*, ahora
+        # también disponibles para el operador desde el REPL.
+        if first_word in ("view", "ver", "cat"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print(f"[{ORANGE}]uso: view <ruta>[/]")
+                continue
+            r = apply_file_read(parts[1].strip())
+            if r["ok"]:
+                lexer = _guess_syntax_lexer(r["path"]) or "text"
+                # Reconstruir contenido sin las líneas numeradas (Syntax las pone)
+                lines = [
+                    ln.split("\t", 1)[1] if "\t" in ln else ln
+                    for ln in r["content"].splitlines()
+                ]
+                console.print(Panel(
+                    Syntax("\n".join(lines), lexer, line_numbers=True,
+                           theme="dracula", word_wrap=False),
+                    title=f"[bold {ORANGE}]view[/]  ·  [{WHITE}]{r['path']}[/]  "
+                          f"[grey50]({r['shown_lines']}/{r['total_lines']} líneas"
+                          + (", truncado" if r["truncated"] else "") + ")[/]",
+                    border_style=ORANGE, box=ROUNDED, padding=(0, 0),
+                ))
+            else:
+                console.print(f"[bold {RED}]✗[/] {r['error']}")
+            continue
+
+        if first_word in ("diff",):
+            # diff <path1> <path2>: diff entre dos archivos del workspace
+            parts = user_input.split()
+            if len(parts) != 3:
+                console.print(f"[{ORANGE}]uso: diff <ruta1> <ruta2>[/]")
+                continue
+            ok1, full1, rel1 = _validate_workspace_path(parts[1])
+            ok2, full2, rel2 = _validate_workspace_path(parts[2])
+            if not ok1:
+                console.print(f"[bold {RED}]✗[/] {full1}"); continue
+            if not ok2:
+                console.print(f"[bold {RED}]✗[/] {full2}"); continue
+            try:
+                with open(full1, encoding="utf-8") as f: c1 = f.read()
+                with open(full2, encoding="utf-8") as f: c2 = f.read()
+            except (OSError, UnicodeDecodeError) as e:
+                console.print(f"[bold {RED}]✗[/] read: {e}"); continue
+            dl = list(difflib.unified_diff(
+                c1.splitlines(), c2.splitlines(),
+                fromfile=f"a/{rel1}", tofile=f"b/{rel2}", n=3,
+            ))
+            console.print(render_file_diff_panel(f"{rel1} ↔ {rel2}", dl, kind="edit"))
+            continue
+
+        if first_word in ("edit", "editar"):
+            # edit <ruta>: prompt interactivo old/new (multilínea con `EOF`)
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print(f"[{ORANGE}]uso: edit <ruta>  (luego pegas OLD, EOF, NEW, EOF)[/]")
+                continue
+            path = parts[1].strip()
+            console.print(f"[dim]» pega el texto OLD (línea con solo 'EOF' para terminar):[/]")
+            old_lines = []
+            try:
+                while True:
+                    line = input()
+                    if line.strip() == "EOF": break
+                    old_lines.append(line)
+            except (EOFError, KeyboardInterrupt):
+                console.print(f"[dim]cancelado[/]"); continue
+            console.print(f"[dim]» pega el texto NEW (línea con solo 'EOF' para terminar):[/]")
+            new_lines = []
+            try:
+                while True:
+                    line = input()
+                    if line.strip() == "EOF": break
+                    new_lines.append(line)
+            except (EOFError, KeyboardInterrupt):
+                console.print(f"[dim]cancelado[/]"); continue
+            old_s = "\n".join(old_lines)
+            new_s = "\n".join(new_lines)
+            # Reutilizamos el wire-up del modelo: construimos un answer "ficticio"
+            # con el bloque FILE_EDIT y lo procesamos.
+            synthetic = (
+                f"[[FILE_EDIT: {path}]]\n"
+                f"<<<OLD\n{old_s}\nOLD>>>\n"
+                f"<<<NEW\n{new_s}\nNEW>>>\n"
+                f"[[/FILE_EDIT]]"
+            )
+            process_file_blocks(synthetic)
+            continue
+
+        if first_word in ("write", "escribir"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print(f"[{ORANGE}]uso: write <ruta>  (luego pegas contenido, EOF para terminar)[/]")
+                continue
+            path = parts[1].strip()
+            console.print(f"[dim]» pega el contenido (línea con solo 'EOF' para terminar):[/]")
+            lines = []
+            try:
+                while True:
+                    line = input()
+                    if line.strip() == "EOF": break
+                    lines.append(line)
+            except (EOFError, KeyboardInterrupt):
+                console.print(f"[dim]cancelado[/]"); continue
+            synthetic = (
+                f"[[FILE_WRITE: {path}]]\n"
+                + "\n".join(lines) + "\n"
+                + f"[[/FILE_WRITE]]"
+            )
+            process_file_blocks(synthetic)
             continue
 
         if first_word in ("sudo", "sudopass", "password"):

@@ -149,6 +149,39 @@ containers, code metrics. No marques la fase como completa hasta haber
 ejecutado al menos: secrets scan + SAST genérico (semgrep) + SAST de
 lenguaje principal + SCA de dependencias.
 
+## Aplicar fixes con FILE_EDIT
+
+Después de identificar una vuln SAST, puedes proponer y aplicar el fix
+con `FILE_EDIT` en lugar de solo describirlo. El operador ve el diff y
+aprueba. Ejemplos:
+
+```
+[[FILE_READ: src/orders.py]]
+```
+
+Tras revisar el contexto exacto:
+
+```
+[[FILE_EDIT: src/orders.py]]
+<<<OLD
+query = f"SELECT * FROM orders WHERE user_id = {user_id}"
+db.execute(query)
+OLD>>>
+<<<NEW
+query = text("SELECT * FROM orders WHERE user_id = :uid")
+db.execute(query, {"uid": user_id})
+NEW>>>
+[[/FILE_EDIT]]
+```
+
+Reglas:
+- Solo aplica el fix si has VISTO el archivo en este turno (FILE_READ
+  antes). No edites a ciegas.
+- Un fix por bloque. Si la misma vuln aparece en N sitios, emite N
+  bloques FILE_EDIT (cada uno con OLD único por contexto).
+- Después del fix, recomienda al operador re-ejecutar el escáner
+  estático sobre el archivo modificado para validar.
+
 ## Skills relacionadas
 
 - `secret_scanning` — solapamiento parcial; aquí el foco es review

