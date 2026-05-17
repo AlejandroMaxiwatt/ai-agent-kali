@@ -445,9 +445,24 @@ EOF
 install_system_extras() {
     [[ "$CFG_INSTALL_EXTRAS" == "y" ]] || return 0
     section "Instalando extras del sistema (chafa, kitty)"
-    log "Vas a necesitar sudo..."
-    sudo apt-get update -qq
-    sudo apt-get install -y chafa kitty || warn "Algún paquete falló; continúo."
+
+    # Eres root → no necesitas sudo. No eres root pero hay sudo → usar sudo.
+    # No eres root y no hay sudo → saltar el paso con un warn.
+    local apt_prefix=""
+    if [[ "$EUID" -eq 0 ]]; then
+        apt_prefix=""
+        log "Ya eres root, instalando directamente con apt..."
+    elif command -v sudo >/dev/null 2>&1; then
+        apt_prefix="sudo"
+        log "Vas a necesitar sudo..."
+    else
+        warn "No eres root y no hay sudo instalado. Saltando extras."
+        warn "Instálalos a mano cuando puedas: apt install chafa kitty"
+        return 0
+    fi
+
+    $apt_prefix apt-get update -qq || warn "apt-get update falló."
+    $apt_prefix apt-get install -y chafa kitty || warn "Algún paquete falló; continúo."
     ok "Extras instalados (los que se hayan podido)"
 }
 
@@ -456,7 +471,15 @@ install_system_extras() {
 # ────────────────────────────────────────────────────────────
 install_launcher() {
     section "Instalando launcher 'maxiwatt'"
-    local bindir="$HOME/.local/bin"
+
+    # Si eres root, /usr/local/bin (siempre en PATH para root, sin tener que
+    # tocar .bashrc). Si no, ~/.local/bin (no requiere privilegios).
+    local bindir
+    if [[ "$EUID" -eq 0 ]]; then
+        bindir="/usr/local/bin"
+    else
+        bindir="$HOME/.local/bin"
+    fi
     local launcher="$bindir/maxiwatt"
     mkdir -p "$bindir"
 

@@ -3869,6 +3869,90 @@ def get_mullvad_status():
         return "No se pudo consultar Mullvad"
 
 
+def get_tailscale_status():
+    """Devuelve un string corto con el estado del cliente Tailscale.
+
+    Estados posibles:
+      - "no instalado"
+      - "detenido / sin login"
+      - "conectado · <ip> (<hostname>)"            ← caso normal
+      - "conectado · <ip> · LM Studio en tailnet ✓" ← si la URL de LM Studio
+                                                     apunta a un peer del tailnet
+    """
+    if shutil.which("tailscale") is None:
+        return "no instalado"
+
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return "detenido / sin login"
+
+        data = json.loads(result.stdout)
+
+        backend = data.get("BackendState", "")
+        if backend != "Running":
+            # NeedsLogin, NoState, Stopped, Starting, ...
+            return f"{backend.lower() or 'desconocido'} (sin conexión al tailnet)"
+
+        self_node = data.get("Self") or {}
+        ips = self_node.get("TailscaleIPs") or []
+        ipv4 = next((ip for ip in ips if ":" not in ip), ips[0] if ips else "?")
+        dns_name = (self_node.get("DNSName") or "").rstrip(".")
+        # Acorta hostname.tailXXXX.ts.net → hostname.ts.net si es muy largo.
+        short_host = dns_name.split(".")[0] if dns_name else (self_node.get("HostName") or "")
+
+        # ¿El LM Studio configurado vive dentro del tailnet?
+        lm_in_tailnet = _lmstudio_in_tailnet(data)
+
+        suffix = "LM Studio en tailnet ✓" if lm_in_tailnet else short_host
+        if suffix:
+            return f"conectado · {ipv4} · {suffix}"
+        return f"conectado · {ipv4}"
+
+    except Exception:
+        return "no disponible"
+
+
+def _lmstudio_in_tailnet(ts_data: dict) -> bool:
+    """True si LMSTUDIO_BASE_URL apunta a una IP/hostname dentro del tailnet
+    descrito por `ts_data` (output de `tailscale status --json`)."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(LMSTUDIO_BASE_URL).hostname or ""
+        if not host:
+            return False
+        host = host.lower()
+
+        # Conjuntos de IPs y nombres del tailnet (Self + Peers).
+        nodes = [ts_data.get("Self") or {}]
+        nodes.extend((ts_data.get("Peer") or {}).values())
+
+        tailnet_ips = set()
+        tailnet_names = set()
+        for n in nodes:
+            for ip in n.get("TailscaleIPs") or []:
+                tailnet_ips.add(ip.lower())
+            dns = (n.get("DNSName") or "").rstrip(".").lower()
+            if dns:
+                tailnet_names.add(dns)
+            hn = (n.get("HostName") or "").lower()
+            if hn:
+                tailnet_names.add(hn)
+
+        if host in tailnet_ips or host in tailnet_names:
+            return True
+        # Match parcial por hostname corto (kali-pc vs kali-pc.tailXXXX.ts.net)
+        host_short = host.split(".")[0]
+        return any(host_short == n.split(".")[0] for n in tailnet_names if n)
+    except Exception:
+        return False
+
+
 TOOL_CATALOG = [
     ("Port scan & host discovery", [
         "nmap", "masscan", "rustscan", "naabu", "unicornscan", "zmap",
@@ -4382,6 +4466,7 @@ def show_splash():
     models = get_lmstudio_models()
     active_model = models[0] if models else MODEL_NAME_FALLBACK
     vpn_status = get_mullvad_status()
+    tailscale_status = get_tailscale_status()
     installed_tools, missing_tools = detect_installed_tools()
 
     skills = detect_folders("~/ai-agent-kali/skills")
@@ -4432,6 +4517,7 @@ def show_splash():
         ("Models exposed", format_list(models, 4)),
         ("Backend", LMSTUDIO_BASE_URL),
         ("VPN", vpn_status),
+        ("Tailscale", tailscale_status),
         ("Scope Memory", "Enabled"),
     ])
 
