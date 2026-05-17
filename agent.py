@@ -9040,40 +9040,27 @@ def maybe_install_vscode_extension():
     except (subprocess.TimeoutExpired, OSError):
         return
 
-    # Confirmar con el operador (es código que correrá en su editor).
+    # Instalación automática SIN preguntar — es una mejora core del bridge
+    # VSCode/Cursor, no una opción. El operador siempre puede desinstalar
+    # luego con `code --uninstall-extension maxiwatt.maxiwatt-agent`.
     console.print()
-    console.print(Panel(
-        f"[bold {CYAN}]MAXIWATT detecta que estás en un terminal de "
-        f"VSCode/Cursor.[/]\n\n"
-        f"Hay una extensión opcional ([bold]{_VSCODE_EXTENSION_ID}[/]) que "
-        f"hace que el agente vea automáticamente qué archivo tienes abierto "
-        f"y qué tienes seleccionado — igual que Claude Code muestra "
-        f"'📎 In file.py' y '📋 N lines selected'.\n\n"
-        f"[dim]Se descarga e instala UNA SOLA VEZ. Sin telemetría, sin "
-        f"acceso a red. Solo escribe un JSON en .maxiwatt/ del workspace.[/]",
-        title=f"[bold {ORANGE}]Extensión VSCode/Cursor[/]",
-        border_style=ORANGE, box=ROUNDED, padding=(1, 2),
-    ))
-    try:
-        resp = input("[?] Instalar maxiwatt-agent? [Y/n] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        resp = "n"
-    # Marker se crea pase lo que pase para no volver a preguntar.
+    console.print(
+        f"[dim]› terminal VSCode/Cursor detectado · instalando bridge "
+        f"[bold]{_VSCODE_EXTENSION_ID}[/] automáticamente...[/]"
+    )
+
+    # Marcamos como intentada ANTES del fetch para que un Ctrl+C en mitad
+    # no haga que volvamos a intentarlo en cada arranque.
     try:
         open(_VSCODE_INSTALL_MARKER, "a").close()
     except OSError:
         pass
-    if resp not in ("", "y", "yes", "s", "si", "sí"):
-        console.print(f"[dim]› skip (puedes instalarla más tarde con: "
-                      f"code --install-extension <vsix>)[/]")
-        return
 
     # Descargar el .vsix a /tmp e instalar
     import tempfile, urllib.request
     try:
         with tempfile.NamedTemporaryFile(suffix=".vsix", delete=False) as f:
             vsix_path = f.name
-        console.print(f"[dim]› descargando {_VSCODE_EXTENSION_VSIX_URL}[/]")
         urllib.request.urlretrieve(_VSCODE_EXTENSION_VSIX_URL, vsix_path)
         proc = subprocess.run(
             [code_bin, "--install-extension", vsix_path],
@@ -9081,16 +9068,14 @@ def maybe_install_vscode_extension():
         )
         if proc.returncode == 0:
             console.print(
-                f"[bold {GREEN}]✓ extensión instalada[/] "
-                f"({_VSCODE_EXTENSION_ID})"
-            )
-            console.print(
-                f"[dim]   Recarga la ventana de VSCode (Ctrl+Shift+P → "
-                f"'Reload Window') para activarla.[/]"
+                f"[bold {GREEN}]✓ bridge VSCode/Cursor instalado[/] "
+                f"({_VSCODE_EXTENSION_ID}). "
+                f"[dim]Recarga la ventana (Ctrl+Shift+P → 'Reload Window') "
+                f"para activarlo.[/]"
             )
         else:
             console.print(
-                f"[bold {RED}]✗ fallo instalando la extensión[/] "
+                f"[bold {RED}]✗ fallo instalando el bridge[/] "
                 f"(rc={proc.returncode}): {proc.stderr.strip()[:200]}"
             )
         try:
@@ -9098,7 +9083,7 @@ def maybe_install_vscode_extension():
         except OSError:
             pass
     except Exception as e:
-        console.print(f"[bold {RED}]✗ no se pudo descargar/instalar:[/] {e}")
+        console.print(f"[bold {RED}]✗ no se pudo descargar/instalar bridge:[/] {e}")
 
 
 def vscode_auto_attach(user_input):
