@@ -5839,10 +5839,11 @@ def _try_install_tool(tool):
     if not re.match(r"^[A-Za-z0-9._\-]+$", tool or ""):
         return {"ok": False, "log": f"nombre de herramienta no válido: {tool!r}"}
 
+    install_cmd = f"apt-get install -y {tool}" if _running_as_root() \
+        else f"sudo apt-get install -y {tool}"
     _q_print()
     _q_print(Panel(
-        f"[bold {ORANGE}]Auto-install[/]  ·  "
-        f"[{WHITE}]sudo apt-get install -y {tool}[/]",
+        f"[bold {ORANGE}]Auto-install[/]  ·  [{WHITE}]{install_cmd}[/]",
         border_style=ORANGE,
         box=ROUNDED,
     ))
@@ -6236,8 +6237,14 @@ def _command_uses_sudo(command):
     """True si el comando ejecuta `sudo` como binario (no como argumento).
     Cubre `sudo X`, `... && sudo X`, `; sudo X`, `| sudo X`, además de
     asignaciones de entorno previas (`VAR=val sudo X`).
+
+    Si el agente corre como root, devolvemos False: no hay sudo que gestionar,
+    el comando se ejecutará directamente (y se le quitará el prefijo `sudo`
+    si lo tuviera, vía `_strip_sudo_prefix`).
     """
     if not command:
+        return False
+    if _running_as_root():
         return False
     parts = re.split(r"(?:&&|\|\||;|\|)", command)
     for p in parts:
@@ -6259,6 +6266,65 @@ def _command_uses_sudo(command):
 # de sudo de forma no-interactiva (útil para subagentes y autopilot).
 _STORED_SUDO_PASSWORD = None
 _sudo_password_lock = threading.Lock()
+
+
+def _running_as_root():
+    """True si el proceso del agente corre como root (uid 0).
+    Caso típico: VPS donde la cuenta es root y sudo ni está instalado."""
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False  # No-Unix (no debería pasar, agente es Linux-only)
+
+
+def _strip_sudo_prefix(command):
+    """Devuelve el comando sin el prefijo `sudo` (y sus flags) de cada
+    subcomando. Útil cuando ya eres root: `sudo apt install foo` → `apt
+    install foo`. Maneja también flags comunes de sudo: -E, -H, -u user, -k.
+
+    Cubre comandos compuestos con &&, ||, ;, | tratando cada parte por
+    separado.
+    """
+    if not command or "sudo" not in command:
+        return command
+
+    def _strip_one(part):
+        # Preservar el whitespace de inicio para no perder formato.
+        leading = len(part) - len(part.lstrip())
+        prefix = part[:leading]
+        tokens = part.split()
+        # Recopilar asignaciones de entorno previas (VAR=val) — hay que
+        # mantenerlas, son semánticas (DEBIAN_FRONTEND=noninteractive, etc.).
+        i = 0
+        assignments = []
+        while i < len(tokens) and "=" in tokens[i].split("/")[-1] \
+                and not tokens[i].startswith("-"):
+            assignments.append(tokens[i])
+            i += 1
+        if i >= len(tokens):
+            return part
+        if tokens[i] != "sudo" and not tokens[i].endswith("/sudo"):
+            return part
+        # Saltar el binario sudo
+        i += 1
+        # Saltar flags de sudo: -E, -H, -k, -i, -s, -n
+        while i < len(tokens) and tokens[i] in {"-E", "-H", "-k", "-i", "-s", "-n"}:
+            i += 1
+        # Saltar -u USER y -g GROUP (consumen el siguiente token)
+        while i < len(tokens) and tokens[i] in {"-u", "-g"} and i + 1 < len(tokens):
+            i += 2
+        # Reconstruir: asignaciones preservadas + resto sin sudo.
+        return prefix + " ".join(assignments + tokens[i:])
+
+    # Separar por &&, ||, ;, | preservando los separadores.
+    parts = re.split(r"(\s*(?:&&|\|\||;|\|)\s*)", command)
+    out = []
+    for chunk in parts:
+        if re.match(r"^\s*(?:&&|\|\||;|\|)\s*$", chunk):
+            out.append(chunk)
+        else:
+            out.append(_strip_one(chunk))
+    return "".join(out)
 
 
 def _sudo_cache_valid():
@@ -6341,6 +6407,21 @@ def _sudo_run(sudo_args, timeout=60, allow_tty_fallback=True):
         return (1, "", "_sudo_run: sudo_args vacío")
     args = list(sudo_args)
 
+    # Si somos root, no necesitamos sudo: ejecutamos el binario directo.
+    if _running_as_root():
+        try:
+            proc = subprocess.run(
+                args,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return (proc.returncode,
+                    (proc.stdout or "").rstrip(),
+                    (proc.stderr or "").rstrip())
+        except subprocess.TimeoutExpired:
+            return (124, "", f"timeout ({timeout}s)")
+        except Exception as e:
+            return (1, "", str(e))
+
     if _sudo_cache_valid():
         try:
             proc = subprocess.run(
@@ -6406,12 +6487,15 @@ def _clear_stored_sudo_password():
 def _ensure_sudo_credentials():
     """Asegura caché de sudo vigente antes de ejecutar un comando con sudo.
     Orden de intentos:
+      0. Si somos root → True inmediato (no hay sudo que gestionar).
       1. Si el caché ya es válido → True.
       2. Si hay password almacenada (`sudo set`) → refresca con ella.
       3. Si estamos en main thread → prompt interactivo `sudo -v`.
       4. Si estamos en subagente y todo lo anterior falla → False (el
          comando se aborta limpiamente, el subagente busca alternativa).
     """
+    if _running_as_root():
+        return True
     if _sudo_cache_valid():
         return True
 
@@ -7171,6 +7255,11 @@ def run_command(command, auto=False):
             box=ROUNDED,
             padding=(1, 2),
         ))
+
+    # Si somos root, quitar el prefijo `sudo` del comando (en VPS minimalistas
+    # `sudo` ni está instalado; siempre que somos root es redundante).
+    if _running_as_root():
+        command = _strip_sudo_prefix(command)
 
     # Envolver con proxy si aplica (a menos que sea single-shot bypass).
     if no_proxy_single:
