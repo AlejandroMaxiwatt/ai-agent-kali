@@ -5,10 +5,10 @@
 # ============================================================
 #
 #   Instalación (usuario final):
-#       curl -fsSL https://raw.githubusercontent.com/tawkali/ai-agent-kali/main/install.sh | bash
+#       curl -fsSL https://raw.githubusercontent.com/AlejandroMaxiwatt/ai-agent-kali/main/install.sh | bash
 #
 #   o con wget:
-#       wget -qO- https://raw.githubusercontent.com/tawkali/ai-agent-kali/main/install.sh | bash
+#       wget -qO- https://raw.githubusercontent.com/AlejandroMaxiwatt/ai-agent-kali/main/install.sh | bash
 #
 #   El script:
 #     1. Comprueba dependencias del sistema (Python 3.11+, venv, pip, git/curl).
@@ -23,7 +23,7 @@
 # ============================================================
 #   CONFIG DEL MANTENEDOR · edita estas dos líneas antes de publicar.
 # ============================================================
-REPO="${MAXIWATT_REPO:-tawkali/ai-agent-kali}"
+REPO="${MAXIWATT_REPO:-AlejandroMaxiwatt/ai-agent-kali}"
 BRANCH="${MAXIWATT_BRANCH:-main}"
 # Para test local SIN descarga remota:
 #   INSTALL_FROM_LOCAL=/ruta/al/proyecto bash install.sh
