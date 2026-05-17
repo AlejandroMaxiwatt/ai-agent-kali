@@ -5030,6 +5030,95 @@ def build_commands_panel():
     )
 
 
+# Por debajo de este ancho de columnas, el banner "MAXIWATT AGENT" en
+# ansi_shadow + el panel "Cyber Emblem" no caben y la pantalla queda
+# rota. En ese caso usamos un splash compacto: solo "MAXIWATT" pequeño,
+# Agent Runtime panel y commands panel — sin skull/shield ni paneles
+# tools/skills (que ya son consultables con `tools`, `skills`).
+SPLASH_LITE_THRESHOLD_COLS = 130
+
+
+def _render_lite_title(cols):
+    """Devuelve un Text/Align con solo 'MAXIWATT' en figlet, eligiendo la
+    fuente más grande que quepa cómodamente en `cols`."""
+    fonts_by_max_cols = (
+        # (cols mínimas, fuente pyfiglet)
+        (100, "small"),       # ~47 chars
+        (60,  "cybermedium"), # ~36 chars
+        (0,   "mini"),        # ~27 chars (cabe en pantallas de ~30)
+    )
+    rendered = None
+    for min_cols, font in fonts_by_max_cols:
+        if cols >= min_cols:
+            try:
+                fig = Figlet(font=font, width=max(cols, 32))
+                rendered = fig.renderText("MAXIWATT").rstrip("\n")
+                break
+            except Exception:
+                continue
+    if rendered is None:
+        rendered = "MAXIWATT"
+    txt = Text()
+    for line in rendered.split("\n"):
+        txt.append(line + "\n", style=f"bold {CYAN}")
+    return Align.center(txt)
+
+
+def _render_splash_lite(active_model, vpn_status, tailscale_status,
+                       session_id, workspace, cols):
+    """Splash compacto para pantallas estrechas (IDE side-panel, ventanas
+    SSH pequeñas). Sin emblema, sin skull/shield, sin paneles tools/skills.
+    Sólo: título 'MAXIWATT', subtítulo, Agent Runtime panel, commands panel,
+    footer minimalista."""
+    console.print(_render_lite_title(cols))
+
+    subtitle = (
+        f"[bold {ORANGE}]Offensive Security[/]  "
+        f"[{WHITE}]·[/]  "
+        f"[bold {ORANGE}]Local LLM[/]  "
+        f"[{WHITE}]·[/]  "
+        f"[bold {ORANGE}]Kali[/]"
+    )
+    console.print(Align.center(subtitle))
+    console.print()
+
+    # Runtime info esencial — sin tools/skills (consultables con `tools`,
+    # `skills`) y sin format_list de "Models exposed" para ahorrar líneas.
+    runtime_section = make_section([
+        ("Model",        active_model),
+        ("Backend",      LMSTUDIO_BASE_URL),
+        ("VPN",          vpn_status),
+        ("Tailscale",    tailscale_status),
+        ("Scope Memory", "Enabled"),
+    ])
+    console.print(Panel(
+        runtime_section,
+        title=f"[bold {ORANGE}]Agent Runtime[/]",
+        border_style=ORANGE, box=ROUNDED, padding=(1, 2),
+        width=min(cols - 2, 100),
+    ))
+    console.print()
+
+    # Quick panel de comandos
+    console.print(build_commands_panel())
+    console.print()
+
+    # Footer en una sola línea (sin panel ni columnas — caben pocas cols)
+    console.print(
+        f"[bold {ORANGE}]Session[/] {session_id}  "
+        f"[{WHITE}]·[/]  "
+        f"[bold {WHITE}]Workspace[/] {workspace}  "
+        f"[{WHITE}]·[/]  "
+        f"[bold {GREEN}]Ready[/]"
+    )
+    console.print()
+    console.print(
+        f"[bold {ORANGE}]>_[/]  "
+        f"[{WHITE}]maxiwatt-agent initialized successfully.[/]"
+    )
+    console.print()
+
+
 def show_splash():
     console.clear()
 
@@ -5037,17 +5126,24 @@ def show_splash():
     active_model = models[0] if models else MODEL_NAME_FALLBACK
     vpn_status = get_mullvad_status()
     tailscale_status = get_tailscale_status()
-    installed_tools, missing_tools = detect_installed_tools()
-
-    skills = detect_folders("~/ai-agent-kali/skills")
-    plugins = detect_folders("~/ai-agent-kali/plugins")
-    hooks = detect_folders("~/ai-agent-kali/hooks")
 
     session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     workspace = os.getcwd()
 
     term = shutil.get_terminal_size((160, 45))
     cols = term.columns
+
+    # Pantalla estrecha → splash lite (sin skull/shield ni paneles laterales).
+    if cols < SPLASH_LITE_THRESHOLD_COLS:
+        _render_splash_lite(active_model, vpn_status, tailscale_status,
+                            session_id, workspace, cols)
+        return
+
+    # Pantalla amplia: ruta original (con todos los paneles).
+    installed_tools, missing_tools = detect_installed_tools()
+    skills = detect_folders("~/ai-agent-kali/skills")
+    plugins = detect_folders("~/ai-agent-kali/plugins")
+    hooks = detect_folders("~/ai-agent-kali/hooks")
 
     # Título
     console.print(render_title(cols))
