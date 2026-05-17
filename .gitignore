@@ -1,0 +1,49 @@
+# Secretos — NUNCA subir
+.env
+.env.local
+.env.*.local
+privkey.pem
+*.pem
+*.key
+id_rsa
+id_rsa.*
+*.p12
+*.pfx
+
+# Entorno virtual Python
+venv/
+.venv/
+
+# Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sesiones, scans, evidence, reports — datos sensibles del cliente
+memory/sessions/
+memory/subagents/
+memory/lessons/
+scans/
+evidence/
+reports/
+logs/
+
+# Datos de targets (alcance del cliente)
+targets/*/
+!targets/README.md
+
+# Backups y outputs sueltos
+agent_old.py
+theharvester_*
+*.bak
+*.old
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
