@@ -1,0 +1,64 @@
+{
+  "name": "maxiwatt-agent",
+  "displayName": "MAXIWATT Agent",
+  "description": "Editor bridge for the MAXIWATT AI agent. Sends the active file and selection to a running MAXIWATT instance so it knows what you're looking at — like Claude Code does.",
+  "version": "0.3.0",
+  "publisher": "maxiwatt",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "maxiwatt",
+    "pentesting",
+    "ai",
+    "agent",
+    "claude-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AlejandroMaxiwatt/ai-agent-kali"
+  },
+  "license": "SEE LICENSE IN LICENSE.md",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "MAXIWATT Agent",
+      "properties": {
+        "maxiwatt.stateFileDir": {
+          "type": "string",
+          "default": ".maxiwatt",
+          "description": "Carpeta (relativa al workspace) donde se escribe state.json. El agente MAXIWATT lee ese archivo para saber qué tienes seleccionado."
+        },
+        "maxiwatt.updateThrottleMs": {
+          "type": "number",
+          "default": 200,
+          "description": "Throttle en ms para evitar escribir state.json en cada keystroke."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "maxiwatt.showStatus",
+        "title": "MAXIWATT: Show bridge status"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.70.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^2.24.0"
+  }
+}

@@ -8921,6 +8921,208 @@ def _load_mention_content(path):
     return text, truncated, None
 
 
+# ============================================================
+# VSCode/Cursor bridge — `<WORKSPACE>/.maxiwatt/state.json`
+# ============================================================
+# La extensión `maxiwatt-agent` para VSCode/Cursor escribe el estado del
+# editor (archivo activo + selección) en ese JSON cada vez que cambia.
+# El agente lo lee ANTES de cada prompt para:
+#   1. Mostrar un badge "📎 In foo.py" o "📋 N líneas seleccionadas".
+#   2. Auto-prepender la selección como contexto al enviar al modelo
+#      (equivalente a haber escrito @foo.py:L43-L45 a mano).
+# Si la extensión no está instalada el archivo simplemente no existe y
+# todo el bloque es no-op — sin overhead, sin warnings.
+
+_VSCODE_STATE_FILENAME = os.path.join(".maxiwatt", "state.json")
+_VSCODE_STATE_MAX_AGE_S = 120  # info más vieja que esto se ignora
+
+
+def _read_vscode_state(max_age_seconds=_VSCODE_STATE_MAX_AGE_S):
+    """Devuelve el dict del state.json escrito por la extensión, o None si
+    no existe, está caducado o está malformado."""
+    path = os.path.join(WORKSPACE, _VSCODE_STATE_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    updated = data.get("updatedAt") or ""
+    if updated:
+        try:
+            from datetime import datetime, timezone
+            # ISO 8601 con o sin 'Z'
+            ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age > max_age_seconds:
+                return None
+        except (ValueError, TypeError):
+            return None
+    return data
+
+
+def render_vscode_badge():
+    """Devuelve un string rich-friendly con el badge a pintar antes del
+    prompt `Tú >`. Vacío si no hay info útil."""
+    state = _read_vscode_state()
+    if not state:
+        return ""
+    rel = state.get("relativeFile") or state.get("activeFile")
+    sel = state.get("selection") or {}
+    if rel and sel and not sel.get("empty"):
+        ln_a = sel.get("startLine")
+        ln_b = sel.get("endLine")
+        count = sel.get("lineCount") or 1
+        range_str = f"L{ln_a}" if ln_a == ln_b else f"L{ln_a}-L{ln_b}"
+        return (
+            f"  [bold {ORANGE}]📋 {count} línea{'' if count == 1 else 's'} "
+            f"seleccionada{'' if count == 1 else 's'}[/]  "
+            f"[{CYAN}]en[/] [bold]{rel}:{range_str}[/]"
+        )
+    if rel:
+        return (
+            f"  [bold {CYAN}]📎 In[/]  [bold]{rel}[/]  "
+            f"[dim](sin selección activa)[/]"
+        )
+    return ""
+
+
+# Marcador local: una vez intentada la instalación, no la reintentamos
+# en subsiguientes arranques. Vive en ~/.maxiwatt-vscode-install.marker
+_VSCODE_INSTALL_MARKER = os.path.expanduser("~/.maxiwatt-vscode-install.marker")
+# Nombre completo de la extensión en VSCode (publisher.name)
+_VSCODE_EXTENSION_ID = "maxiwatt.maxiwatt-agent"
+# URL del .vsix dentro del repo (versionada — se actualiza en cada release)
+_VSCODE_EXTENSION_VSIX_URL = (
+    "https://github.com/AlejandroMaxiwatt/ai-agent-kali/raw/main/"
+    "vscode-extension/maxiwatt-agent-0.3.0.vsix"
+)
+
+
+def _in_vscode_terminal():
+    """True si el agente corre dentro de un terminal integrado de
+    VSCode/Cursor/Codium (detectado por env vars que setean al lanzar
+    el terminal)."""
+    return os.environ.get("TERM_PROGRAM", "").lower() in {"vscode", "cursor"}
+
+
+def maybe_install_vscode_extension():
+    """Instala la extensión maxiwatt-agent en VSCode/Cursor si:
+      - estamos en un terminal de VSCode/Cursor, Y
+      - la extensión NO está instalada todavía, Y
+      - no la hemos intentado instalar antes (marker file).
+    No bloquea ni revienta si algo falla — la instalación es opcional."""
+    if not _in_vscode_terminal():
+        return
+    if os.path.exists(_VSCODE_INSTALL_MARKER):
+        return  # ya intentamos antes; no spammear al usuario
+    code_bin = shutil.which("code") or shutil.which("cursor") or shutil.which("codium")
+    if not code_bin:
+        return  # sin CLI no podemos instalar
+
+    # ¿Ya instalada?
+    try:
+        proc = subprocess.run(
+            [code_bin, "--list-extensions"],
+            capture_output=True, text=True, timeout=10,
+        )
+        installed = [line.strip() for line in (proc.stdout or "").splitlines()]
+        if _VSCODE_EXTENSION_ID in installed:
+            # Crear marker para no volver a listar en cada arranque.
+            try:
+                open(_VSCODE_INSTALL_MARKER, "a").close()
+            except OSError:
+                pass
+            return
+    except (subprocess.TimeoutExpired, OSError):
+        return
+
+    # Confirmar con el operador (es código que correrá en su editor).
+    console.print()
+    console.print(Panel(
+        f"[bold {CYAN}]MAXIWATT detecta que estás en un terminal de "
+        f"VSCode/Cursor.[/]\n\n"
+        f"Hay una extensión opcional ([bold]{_VSCODE_EXTENSION_ID}[/]) que "
+        f"hace que el agente vea automáticamente qué archivo tienes abierto "
+        f"y qué tienes seleccionado — igual que Claude Code muestra "
+        f"'📎 In file.py' y '📋 N lines selected'.\n\n"
+        f"[dim]Se descarga e instala UNA SOLA VEZ. Sin telemetría, sin "
+        f"acceso a red. Solo escribe un JSON en .maxiwatt/ del workspace.[/]",
+        title=f"[bold {ORANGE}]Extensión VSCode/Cursor[/]",
+        border_style=ORANGE, box=ROUNDED, padding=(1, 2),
+    ))
+    try:
+        resp = input("[?] Instalar maxiwatt-agent? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        resp = "n"
+    # Marker se crea pase lo que pase para no volver a preguntar.
+    try:
+        open(_VSCODE_INSTALL_MARKER, "a").close()
+    except OSError:
+        pass
+    if resp not in ("", "y", "yes", "s", "si", "sí"):
+        console.print(f"[dim]› skip (puedes instalarla más tarde con: "
+                      f"code --install-extension <vsix>)[/]")
+        return
+
+    # Descargar el .vsix a /tmp e instalar
+    import tempfile, urllib.request
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".vsix", delete=False) as f:
+            vsix_path = f.name
+        console.print(f"[dim]› descargando {_VSCODE_EXTENSION_VSIX_URL}[/]")
+        urllib.request.urlretrieve(_VSCODE_EXTENSION_VSIX_URL, vsix_path)
+        proc = subprocess.run(
+            [code_bin, "--install-extension", vsix_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode == 0:
+            console.print(
+                f"[bold {GREEN}]✓ extensión instalada[/] "
+                f"({_VSCODE_EXTENSION_ID})"
+            )
+            console.print(
+                f"[dim]   Recarga la ventana de VSCode (Ctrl+Shift+P → "
+                f"'Reload Window') para activarla.[/]"
+            )
+        else:
+            console.print(
+                f"[bold {RED}]✗ fallo instalando la extensión[/] "
+                f"(rc={proc.returncode}): {proc.stderr.strip()[:200]}"
+            )
+        try:
+            os.unlink(vsix_path)
+        except OSError:
+            pass
+    except Exception as e:
+        console.print(f"[bold {RED}]✗ no se pudo descargar/instalar:[/] {e}")
+
+
+def vscode_auto_attach(user_input):
+    """Si hay selección activa en VSCode y el operador NO ha mencionado ya
+    ese archivo con `@`, auto-prepende la mención al user_input.
+    Devuelve (effective_input, attached_bool)."""
+    state = _read_vscode_state()
+    if not state:
+        return user_input, False
+    rel = state.get("relativeFile")
+    sel = state.get("selection") or {}
+    if not rel or not sel or sel.get("empty"):
+        return user_input, False
+    # Si ya está mencionado a mano, no duplicamos.
+    if f"@{rel}" in (user_input or ""):
+        return user_input, False
+    ln_a = sel.get("startLine")
+    ln_b = sel.get("endLine")
+    range_str = f"L{ln_a}" if ln_a == ln_b else f"L{ln_a}-L{ln_b}"
+    auto_mention = f"@{rel}:{range_str}"
+    new_input = f"{auto_mention} {user_input}".strip()
+    return new_input, True
+
+
 def resolve_at_mentions(user_input):
     """Detecta menciones `@token` en `user_input`, busca archivos coincidentes
     en el workspace y resuelve cada una a un archivo (o la omite). Devuelve
@@ -9120,6 +9322,14 @@ def main():
     _ensure_lessons_dir()
     _rebuild_system_message()
 
+    # Auto-instalación de la extensión VSCode/Cursor (one-time, no-op si
+    # ya está instalada o si no estamos dentro de un terminal de editor).
+    try:
+        maybe_install_vscode_extension()
+    except Exception as e:
+        # Nunca abortar el agente por un fallo del bridge — es opcional.
+        console.print(f"[dim]› bridge VSCode auto-install: omitido ({e})[/]")
+
     show_splash()
 
     # Detectar goals que quedaron en estado "running"/"pending" por
@@ -9132,6 +9342,11 @@ def main():
             _check_subagent_notifications()
             _check_goal_notifications()
             console.print(render_context_bar())
+            # Badge de archivo/selección activa en VSCode/Cursor (si la
+            # extensión maxiwatt-agent está instalada y activa).
+            vbadge = render_vscode_badge()
+            if vbadge:
+                console.print(vbadge)
             console.print()
             user_input = input("Tú > ").strip()
         except KeyboardInterrupt:
@@ -10201,6 +10416,17 @@ def main():
             continue
 
         try:
+            # Auto-attach de la selección activa en VSCode/Cursor (si la
+            # extensión maxiwatt-agent está corriendo y hay selección
+            # fresca <120s). Equivale a haber escrito `@archivo:L43-L45`
+            # a mano. Solo se aplica si el operador no lo mencionó ya.
+            user_input, _auto_attached = vscode_auto_attach(user_input)
+            if _auto_attached:
+                console.print(
+                    f"[dim]› auto-attached: selección actual del editor "
+                    f"como contexto[/]"
+                )
+
             # Resolver menciones @archivo (selector de contexto). Si el usuario
             # escribió @<nombre>, buscamos en el workspace y, si hay varias,
             # le preguntamos cuál usar. El contenido de los archivos elegidos
