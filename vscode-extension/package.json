@@ -26,6 +26,9 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
   "contributes": {
     "configuration": {
       "title": "MAXIWATT Agent",
