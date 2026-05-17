@@ -432,6 +432,7 @@ rich>=15.0.0
 pyfiglet>=1.0.4
 requests>=2.33.0
 python-dotenv>=1.2.0
+prompt_toolkit>=3.0.0
 EOF
         log "requirements.txt no estaba, lo he generado."
     fi

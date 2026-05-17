@@ -8990,6 +8990,28 @@ def render_vscode_badge():
     return ""
 
 
+def _vscode_toolbar_plain():
+    """Devuelve el badge como TEXTO PLANO (sin markup rich) para usar como
+    bottom_toolbar de prompt_toolkit, que se refresca cada segundo y permite
+    al operador ver en tiempo real lo que está seleccionado en el editor
+    mientras escribe."""
+    state = _read_vscode_state()
+    if not state:
+        return ""
+    rel = state.get("relativeFile") or state.get("activeFile")
+    sel = state.get("selection") or {}
+    if rel and sel and not sel.get("empty"):
+        ln_a = sel.get("startLine")
+        ln_b = sel.get("endLine")
+        count = sel.get("lineCount") or 1
+        plural = "" if count == 1 else "s"
+        range_str = f"L{ln_a}" if ln_a == ln_b else f"L{ln_a}-L{ln_b}"
+        return f" 📋 {count} línea{plural} seleccionada{plural} en {rel}:{range_str} "
+    if rel:
+        return f" 📎 In {rel}  (sin selección) "
+    return ""
+
+
 # Marcador local: una vez intentada la instalación, no la reintentamos
 # en subsiguientes arranques. Vive en ~/.maxiwatt-vscode-install.marker
 _VSCODE_INSTALL_MARKER = os.path.expanduser("~/.maxiwatt-vscode-install.marker")
@@ -9321,19 +9343,41 @@ def main():
     # un cierre anterior del agente y avisar al operador.
     check_orphan_goals_at_startup()
 
+    # PromptSession con bottom_toolbar dinámico (se refresca cada segundo)
+    # para mostrar 📋 N líneas seleccionadas en X mientras el operador
+    # escribe. Si prompt_toolkit no está disponible, hacemos fallback
+    # silencioso a input() (sin toolbar live, pero auto-attach sigue OK).
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.formatted_text import ANSI
+        _pt_session = PromptSession()
+        _pt_available = True
+    except ImportError:
+        _pt_session = None
+        _pt_available = False
+
     while True:
         try:
             # Notificación de subagentes y goal-orchestrator terminados
             _check_subagent_notifications()
             _check_goal_notifications()
             console.print(render_context_bar())
-            # Badge de archivo/selección activa en VSCode/Cursor (si la
-            # extensión maxiwatt-agent está instalada y activa).
-            vbadge = render_vscode_badge()
-            if vbadge:
-                console.print(vbadge)
             console.print()
-            user_input = input("Tú > ").strip()
+            if _pt_available:
+                # Toolbar inferior dinámico — prompt_toolkit la repinta cada
+                # segundo, así si seleccionas en el editor mientras escribes,
+                # el badge se actualiza en vivo igual que Claude Code.
+                user_input = _pt_session.prompt(
+                    "Tú > ",
+                    bottom_toolbar=_vscode_toolbar_plain,
+                    refresh_interval=1.0,
+                ).strip()
+            else:
+                # Fallback: input() clásico + badge estático arriba.
+                vbadge = render_vscode_badge()
+                if vbadge:
+                    console.print(vbadge)
+                user_input = input("Tú > ").strip()
         except KeyboardInterrupt:
             print()
             break
@@ -10407,9 +10451,13 @@ def main():
             # a mano. Solo se aplica si el operador no lo mencionó ya.
             user_input, _auto_attached = vscode_auto_attach(user_input)
             if _auto_attached:
+                # Sacar archivo:rango del input modificado para feedback claro
+                import re as _re
+                _m = _re.match(r"@(\S+)\s", user_input)
+                _ref = _m.group(1) if _m else "selección actual"
                 console.print(
-                    f"[dim]› auto-attached: selección actual del editor "
-                    f"como contexto[/]"
+                    f"[dim]› auto-attached: [bold]@{_ref}[/] "
+                    f"(selección actual del editor)[/]"
                 )
 
             # Resolver menciones @archivo (selector de contexto). Si el usuario
