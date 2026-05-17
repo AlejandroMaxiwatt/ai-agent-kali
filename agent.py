@@ -604,6 +604,36 @@ tipo `sed -i`, `cat > file <<EOF` o `echo >> file`. El agente los procesa, muest
 diff coloreado al operador, pide confirmación (o aplica auto si AUTO_EXECUTE=True) y
 te reporta el resultado en el próximo turno.
 
+REGLA DE ORO — CUÁNDO USAR CADA BLOQUE:
+- ¿Vas a tocar 1-20 líneas de un archivo que ya existe?  → FILE_EDIT (siempre)
+- ¿Vas a tocar >50% del archivo o cambiar su estructura? → FILE_EDIT (varios bloques, uno por cambio)
+- ¿Vas a crear un archivo nuevo desde cero?              → FILE_WRITE
+- ¿El archivo NO existe todavía?                         → FILE_WRITE
+- ¿Estás pensando en sobrescribir un archivo existente?  → STOP — usa FILE_EDIT en su lugar
+
+NUNCA uses FILE_WRITE para "modificar" un archivo que ya existe. El agente RECHAZARÁ
+automáticamente un FILE_WRITE sobre archivo existente si el cambio toca <30% de líneas
+(es señal de que querías un EDIT y elegiste mal la herramienta).
+
+DISCIPLINA DE EDICIÓN — REGLAS DURAS:
+1. Si el operador pide "modifica la línea X" o "cambia esa función", tocas SÓLO eso.
+   NO refactorizas el resto del archivo, NO añades imports nuevos, NO renombras variables,
+   NO añades funciones auxiliares. Una sola petición = una sola modificación quirúrgica.
+2. Si el operador NO te pide cambios, NO los hagas aunque "queden mejor". El operador no
+   te ha pedido tu opinión sobre el estilo del código.
+3. Antes de un FILE_EDIT, EMITE SIEMPRE un FILE_READ del archivo en el turno anterior (o
+   en el mismo turno si todavía no lo has leído). Editar a ciegas = OLD wrong = rechazo.
+4. El bloque OLD del FILE_EDIT debe ser el TEXTO LITERAL del archivo (con whitespace e
+   indentación EXACTOS). No paráfrasis, no aproximaciones, no "más o menos así".
+
+SELECCIÓN DEL OPERADOR (equivalente a "lo que tengo seleccionado en el editor"):
+Si el operador menciona algo con `@archivo:L43` o `@archivo:L40-L50`, está señalando
+LÍNEAS CONCRETAS de ese archivo (las que tiene marcadas en su editor). Recibirás un
+bloque [[SELECCIÓN DEL OPERADOR EN EL EDITOR · archivo · líneas L40-L50]] con ese
+extracto numerado. Cuando emitas un FILE_EDIT en respuesta, edita SÓLO sobre las
+líneas señaladas — el operador te está apuntando dónde, no dándote licencia para
+tocar el resto del archivo.
+
   [[FILE_READ: ruta/al/archivo.c]]
 
     → Lee el archivo y lo inyecta al contexto con líneas numeradas. Úsalo SIEMPRE antes
@@ -3972,6 +4002,10 @@ def process_file_blocks(answer):
         r = apply_file_edit(rel, old_s, new_s)
         if r["ok"]:
             console.print(f"[bold {GREEN}]✓ aplicado[/] {rel}")
+            console.print(
+                f"[dim]   ↺ si tu editor (VSCode/Cursor/...) no refresca, "
+                f"usa Ctrl+Shift+P → 'Revert File' o cierra y reabre la pestaña[/]"
+            )
             op_lines.append(f"✓ FILE_EDIT {rel} aplicado")
         else:
             console.print(f"[bold {RED}]✗ fallo:[/] {r['error']}")
@@ -3997,6 +4031,42 @@ def process_file_blocks(answer):
             except (OSError, UnicodeDecodeError):
                 old_content = ""
         body = content if content.endswith("\n") else content + "\n"
+
+        # GUARDRAIL: si el archivo existe Y el cambio toca <30% de líneas,
+        # esto es señal de que el modelo eligió mal la herramienta — debería
+        # haber usado FILE_EDIT. Rechazamos automáticamente para forzarle a
+        # razonar mejor y evitar reescrituras enteras con cambios "fantasma"
+        # que el operador no ha pedido.
+        if pre_exists and old_content:
+            old_lines = old_content.splitlines()
+            new_lines = body.splitlines()
+            sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+            ratio_unchanged = sm.ratio()  # 0..1, 1 = idénticos
+            ratio_changed = 1.0 - ratio_unchanged
+            FILE_WRITE_MIN_CHANGE_RATIO = 0.30
+            if ratio_changed < FILE_WRITE_MIN_CHANGE_RATIO:
+                pct = int(ratio_changed * 100)
+                console.print(Panel(
+                    f"[{RED}]FILE_WRITE rechazado por guardrail anti-reescritura.[/]\n\n"
+                    f"El archivo [bold]{rel}[/] ya existe y el cambio propuesto sólo "
+                    f"toca el [bold]{pct}%[/] de las líneas (umbral: "
+                    f"{int(FILE_WRITE_MIN_CHANGE_RATIO*100)}%).\n\n"
+                    f"Para cambios pequeños usa [bold]FILE_EDIT[/] con bloques "
+                    f"<<<OLD/<<<NEW. FILE_WRITE es sólo para crear archivos nuevos "
+                    f"o sustituirlos por completo.\n\n"
+                    f"[dim]Razón: una reescritura completa con un cambio pequeño suele "
+                    f"introducir modificaciones que el operador no ha pedido.[/]",
+                    title=f"[bold {RED}]GUARDRAIL · FILE_WRITE REJECTED[/]  ·  "
+                          f"[{WHITE}]{rel}[/]",
+                    border_style=RED, box=ROUNDED, padding=(1, 2),
+                ))
+                op_lines.append(
+                    f"✗ FILE_WRITE {rel} → REJECTED por guardrail "
+                    f"(cambio {pct}% < {int(FILE_WRITE_MIN_CHANGE_RATIO*100)}%); "
+                    f"usa FILE_EDIT en su lugar"
+                )
+                continue
+
         diff_lines = list(difflib.unified_diff(
             old_content.splitlines(keepends=False),
             body.splitlines(keepends=False),
@@ -4007,16 +4077,25 @@ def process_file_blocks(answer):
         kind = "write" if pre_exists else "create"
         console.print(render_file_diff_panel(rel, diff_lines, kind=kind))
 
-        if AUTO_EXECUTE:
-            console.print(f"[dim]» AUTOPILOT — aplicando write sin confirmación[/]")
+        # FILE_WRITE sobre archivo existente SIEMPRE pide confirmación,
+        # incluso con AUTO_EXECUTE=True. Es destructivo (sobreescribe) y
+        # merece más cuidado que un EDIT. Archivos nuevos sí pueden ir auto.
+        if AUTO_EXECUTE and not pre_exists:
+            console.print(f"[dim]» AUTOPILOT — creando archivo sin confirmación[/]")
             apply = True
         else:
-            verb = "sobreescribir" if pre_exists else "crear"
+            verb = "sobrescribir (archivo EXISTE)" if pre_exists else "crear"
+            extra = f" [{ORANGE}](confirmación obligatoria por sobrescritura)[/]" if pre_exists and AUTO_EXECUTE else ""
             try:
-                resp = input(f"[?] {verb} {rel}? [Y/n] ").strip().lower()
+                resp = input(f"[?] {verb} {rel}?{extra} [y/N] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 resp = "n"
-            apply = resp in ("", "y", "yes", "s", "si", "sí")
+            # Para WRITE sobre existente, el default seguro es 'n'.
+            default_safe = pre_exists
+            if default_safe:
+                apply = resp in ("y", "yes", "s", "si", "sí")
+            else:
+                apply = resp in ("", "y", "yes", "s", "si", "sí")
 
         if not apply:
             console.print(f"[dim]cancelado por el operador[/]")
@@ -4027,6 +4106,10 @@ def process_file_blocks(answer):
         if r["ok"]:
             label = "creado" if r["created"] else "sobreescrito"
             console.print(f"[bold {GREEN}]✓ {label}[/] {rel}")
+            console.print(
+                f"[dim]   ↺ si tu editor (VSCode/Cursor/...) no refresca, "
+                f"usa Ctrl+Shift+P → 'Revert File' o cierra y reabre la pestaña[/]"
+            )
             op_lines.append(f"✓ FILE_WRITE {rel} {label}")
         else:
             console.print(f"[bold {RED}]✗ fallo:[/] {r['error']}")
@@ -8690,6 +8773,15 @@ def _build_hook_ctx(**extra):
 # emails). Token = chars de path razonables.
 _AT_MENTION_RE = re.compile(r"(?<!\S)@([\w./\-]+)")
 
+# Sintaxis extendida: `@archivo:L43` o `@archivo:L40-L50` para señalar un
+# rango específico de líneas (equivalente a "lo que tengo seleccionado en
+# el editor"). Compatible con la forma `@archivo` simple — si no hay rango,
+# se adjunta el archivo entero.
+_AT_MENTION_RANGE_RE = re.compile(
+    r"(?<!\S)@([\w./\-]+):L(\d+)(?:-L?(\d+))?(?!\w)",
+    re.IGNORECASE,
+)
+
 # Directorios que NO recorremos al buscar coincidencias (ruido o muy grandes).
 _AT_MENTION_EXCLUDE_DIRS = {
     ".git", ".hg", ".svn",
@@ -8844,32 +8936,63 @@ def resolve_at_mentions(user_input):
     if not user_input or "@" not in user_input:
         return user_input, []
 
-    tokens = []
-    seen_tokens = set()
-    for m in _AT_MENTION_RE.finditer(user_input):
+    # Primero: detectamos rangos `@archivo:L43-L50` para excluir las posiciones
+    # cubiertas del barrido genérico de _AT_MENTION_RE (que cortaría el token
+    # justo en `:` y trataría el archivo entero).
+    range_matches = []  # lista de (token, line_start, line_end_or_none, span)
+    consumed_spans = []
+    for m in _AT_MENTION_RANGE_RE.finditer(user_input):
         tok = m.group(1)
-        if tok in seen_tokens:
+        ln_a = int(m.group(2))
+        ln_b = int(m.group(3)) if m.group(3) else ln_a
+        if ln_a > ln_b:
+            ln_a, ln_b = ln_b, ln_a
+        range_matches.append((tok, ln_a, ln_b, m.span()))
+        consumed_spans.append(m.span())
+
+    # Tokens "archivo entero" — los que NO están dentro de un span ya consumido
+    # por una mención de rango.
+    tokens = []  # lista de (token, line_start_or_None, line_end_or_None)
+    seen = set()
+    for tok, a, b, _span in range_matches:
+        key = (tok, a, b)
+        if key in seen:
             continue
-        seen_tokens.add(tok)
-        tokens.append(tok)
+        seen.add(key)
+        tokens.append((tok, a, b))
+
+    for m in _AT_MENTION_RE.finditer(user_input):
+        # Saltar si está dentro de un rango ya capturado
+        ms, me = m.span()
+        inside_range = any(s <= ms and me <= e for (s, e) in consumed_spans)
+        if inside_range:
+            continue
+        tok = m.group(1)
+        key = (tok, None, None)
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append((tok, None, None))
 
     if not tokens:
         return user_input, []
 
     attachments = []
-    for tok in tokens:
+    for tok, ln_a, ln_b in tokens:
         matches = _search_files_for_mention(tok)
+        display_mention = f"@{tok}" + (f":L{ln_a}" + (f"-L{ln_b}" if ln_b and ln_b != ln_a else "") if ln_a else "")
         if not matches:
             console.print(
-                f"[bold {RED}]@{tok}[/] · sin coincidencias en el workspace; "
-                f"se ignora la mención."
+                f"[bold {RED}]{display_mention}[/] · sin coincidencias en el "
+                f"workspace; se ignora la mención."
             )
             continue
         if len(matches) == 1:
             chosen = matches[0]
             rel = os.path.relpath(chosen, WORKSPACE)
             console.print(
-                f"[dim]› [bold]@{tok}[/] → {rel} (única coincidencia)[/]"
+                f"[dim]› [bold]{display_mention}[/] → {rel} "
+                f"(única coincidencia)[/]"
             )
         else:
             chosen = _prompt_pick_file(tok, matches)
@@ -8877,23 +9000,54 @@ def resolve_at_mentions(user_input):
                 continue
         content, truncated, err = _load_mention_content(chosen)
         if err:
-            console.print(f"[bold {RED}]@{tok}[/] · {err}; se omite.")
+            console.print(f"[bold {RED}]{display_mention}[/] · {err}; se omite.")
             continue
+
+        # Si hay rango, recortamos solo esas líneas con numeración estilo
+        # `cat -n`, igual que FILE_READ — así el modelo puede luego emitir
+        # un FILE_EDIT preciso sobre lo que el operador estaba mirando.
+        is_selection = ln_a is not None
+        if is_selection:
+            all_lines = content.splitlines()
+            start = max(1, ln_a) - 1
+            end = (ln_b or ln_a)
+            sel_lines = all_lines[start:end]
+            numbered = "".join(
+                f"{(start + i + 1):>5}\t{line}\n"
+                for i, line in enumerate(sel_lines)
+            )
+            content = numbered
+            truncated = False  # ya está acotado al rango
+
         attachments.append({
-            "mention": f"@{tok}",
+            "mention": display_mention,
             "path": chosen,
             "rel": os.path.relpath(chosen, WORKSPACE),
             "content": content,
             "truncated": truncated,
+            "is_selection": is_selection,
+            "line_start": ln_a,
+            "line_end": ln_b,
         })
 
     if not attachments:
         return user_input, []
 
     blocks = []
+    any_selection = False
     for a in attachments:
-        header = f"[[ARCHIVO ADJUNTO · {a['mention']} → {a['rel']}]]"
-        footer = f"[[FIN ARCHIVO · {a['rel']}]]"
+        if a.get("is_selection"):
+            any_selection = True
+            ln_a = a["line_start"]; ln_b = a["line_end"] or ln_a
+            range_label = f"L{ln_a}" if ln_a == ln_b else f"L{ln_a}-L{ln_b}"
+            header = (
+                f"[[SELECCIÓN DEL OPERADOR EN EL EDITOR · "
+                f"{a['rel']} · líneas {range_label}]]"
+            )
+            footer = f"[[FIN SELECCIÓN · {a['rel']}]]"
+        else:
+            header = f"[[ARCHIVO ADJUNTO · {a['mention']} → {a['rel']}]]"
+            footer = f"[[FIN ARCHIVO · {a['rel']}]]"
         body = a["content"]
         if a["truncated"]:
             body += (
@@ -8902,10 +9056,18 @@ def resolve_at_mentions(user_input):
             )
         blocks.append(f"{header}\n{body}\n{footer}")
 
-    intro = (
-        "El usuario ha referenciado los siguientes archivos del workspace "
-        "como contexto. Léelos y trabaja sobre ellos en tu respuesta:"
-    )
+    if any_selection:
+        intro = (
+            "El operador te está SEÑALANDO líneas concretas de archivos "
+            "(equivalente a 'esto que tengo seleccionado en el editor'). "
+            "Cuando emitas un FILE_EDIT, edita SOLO sobre las líneas señaladas "
+            "salvo que el operador pida lo contrario explícitamente."
+        )
+    else:
+        intro = (
+            "El usuario ha referenciado los siguientes archivos del workspace "
+            "como contexto. Léelos y trabaja sobre ellos en tu respuesta:"
+        )
     effective = (
         f"{intro}\n\n"
         + "\n\n".join(blocks)
@@ -8914,11 +9076,11 @@ def resolve_at_mentions(user_input):
     )
 
     # Panel de resumen para el usuario
-    rows = "\n".join(
-        f"  · [bold]{a['mention']}[/] → {a['rel']}"
-        + (" [dim](truncado)[/]" if a["truncated"] else "")
-        for a in attachments
-    )
+    def _row(a):
+        marker = "⟫ selección" if a.get("is_selection") else "archivo"
+        suffix = " [dim](truncado)[/]" if a["truncated"] else ""
+        return f"  · [bold]{a['mention']}[/] → {a['rel']} [dim]({marker})[/]{suffix}"
+    rows = "\n".join(_row(a) for a in attachments)
     console.print()
     console.print(Panel(
         f"[bold {GREEN}]Contexto adjuntado[/]\n{rows}",
