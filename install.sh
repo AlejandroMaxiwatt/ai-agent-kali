@@ -197,11 +197,14 @@ wizard() {
 
     echo
     log "Herramientas opcionales del sistema (mejoran el render del splash):"
+    log "  · chafa       — ASCII de colores (fallback universal)"
+    log "  · kitty       — terminal con graphics protocol (solo útil en local con display)"
+    log "  · imagemagick — necesario para que kitten icat renderice el emblema"
     if [[ "$PKG_MGR" == "apt" ]]; then
-        ask_yesno "  ¿Instalar chafa + kitty con apt? (necesita sudo)" "n" CFG_INSTALL_EXTRAS
+        ask_yesno "  ¿Instalar chafa + kitty + imagemagick con apt?" "y" CFG_INSTALL_EXTRAS
     else
         CFG_INSTALL_EXTRAS="n"
-        warn "  Sin apt; salta la instalación de chafa/kitty."
+        warn "  Sin apt; salta la instalación de extras."
     fi
 
     echo
@@ -444,7 +447,7 @@ EOF
 # ────────────────────────────────────────────────────────────
 install_system_extras() {
     [[ "$CFG_INSTALL_EXTRAS" == "y" ]] || return 0
-    section "Instalando extras del sistema (chafa, kitty)"
+    section "Instalando extras del sistema (chafa, kitty, imagemagick)"
 
     # Eres root → no necesitas sudo. No eres root pero hay sudo → usar sudo.
     # No eres root y no hay sudo → saltar el paso con un warn.
@@ -462,7 +465,8 @@ install_system_extras() {
     fi
 
     $apt_prefix apt-get update -qq || warn "apt-get update falló."
-    $apt_prefix apt-get install -y chafa kitty || warn "Algún paquete falló; continúo."
+    $apt_prefix apt-get install -y chafa kitty imagemagick \
+        || warn "Algún paquete falló; continúo."
     ok "Extras instalados (los que se hayan podido)"
 }
 
