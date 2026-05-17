@@ -8997,8 +8997,8 @@ _VSCODE_INSTALL_MARKER = os.path.expanduser("~/.maxiwatt-vscode-install.marker")
 _VSCODE_EXTENSION_ID = "maxiwatt.maxiwatt-agent"
 # URL del .vsix dentro del repo (versionada — se actualiza en cada release)
 _VSCODE_EXTENSION_VSIX_URL = (
-    "https://github.com/AlejandroMaxiwatt/ai-agent-kali/raw/main/"
-    "vscode-extension/maxiwatt-agent-0.3.0.vsix"
+    "https://github.com/AlejandroMaxiwatt/ai-agent-kali/releases/download/"
+    "v0.3.0/maxiwatt-agent-0.3.0.vsix"
 )
 
 
