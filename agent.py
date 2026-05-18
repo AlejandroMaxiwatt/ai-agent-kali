@@ -34,10 +34,8 @@ from pyfiglet import Figlet
 # CONFIGURACIÓN GENERAL
 # ============================================================
 
-# DESDE EMPRESA
-#LMSTUDIO_BASE_URL = "http://192.168.1.20:1234/v1"
-# DESDE CASA
-LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
+LMSTUDIO_BASE_URL = "http://lmstudio-oficina:1234/v1"
+
 MODEL_NAME_FALLBACK = "qwen/qwen3.6-27b"
 #MODEL_NAME_FALLBACK = "qwen3-coder-30b-a3b-instruct"
 
@@ -6855,6 +6853,122 @@ def _describe_command(command):
     return f"{base}…"
 
 
+# Patrones de comandos que típicamente requieren input interactivo del
+# operador (password, host key fingerprint, "[Y/n]?", etc.) y que en modo
+# stdin=DEVNULL se quedan colgados. Cuando se detecta uno, run_command
+# promueve la ejecución a modo interactivo (TTY real con script(1)).
+_INTERACTIVE_PATTERNS = [
+    re.compile(r"\bssh-copy-id\b"),
+    re.compile(r"\bpasswd\b"),
+    re.compile(r"\bgpg\s+(--gen-key|--full-generate-key|--edit-key)\b"),
+    re.compile(r"\bmysql\s+.*-p\b(?!\s)"),     # mysql -p (sin password inline)
+    re.compile(r"\bpsql\s+.*-W\b"),
+    # apt sin -y / --yes: probable confirmación
+    re.compile(r"\b(apt|apt-get)\s+(install|upgrade|dist-upgrade|remove|purge)"
+               r"(?!.*\s(-y|--yes|--assume-yes))"),
+    # ssh interactivo (sin -N para tunel, sin BatchMode)
+    re.compile(r"\bssh\s+(?!.*\s-N\b)(?!.*BatchMode=yes)(?!.*-o\s+BatchMode=yes)"
+               r"[^\s]+@[^\s]+\b"),
+    # bash <script> / sh <script> / ./<script>.sh: el script puede contener
+    # cualquiera de los anteriores. Lo marcamos como potencialmente interactivo.
+    re.compile(r"(^|[\s;&|])(bash|sh)\s+\.\/[^\s]+\.sh\b"),
+    re.compile(r"(^|[\s;&|])\.\/[^\s]+\.sh\b"),
+]
+
+
+def _command_needs_interactive_tty(command):
+    """True si el comando matchea algún patrón conocido que requiere TTY
+    interactivo. Heurística — el operador siempre puede forzarlo con la
+    opción [i] del prompt de confirmación."""
+    if not command:
+        return False
+    if _running_as_root():
+        # Como root, sudo no entra en el match — quitarlo del análisis
+        # para no clasificar `sudo X` como interactivo cuando X no lo es.
+        scrubbed = _strip_sudo_prefix(command)
+    else:
+        scrubbed = command
+    for pat in _INTERACTIVE_PATTERNS:
+        if pat.search(scrubbed):
+            return True
+    return False
+
+
+def _execute_shell_interactive(command, timeout=1800):
+    """Ejecuta `command` dándole el TTY del agente: el operador puede
+    responder a prompts (password, host key, apt confirmación, etc.) como
+    si estuviera en una terminal normal. La sesión queda capturada con
+    `script(1)` para que el agente reciba el output completo al final.
+
+    Devuelve (stdout, stderr, returncode). stderr siempre vuelve vacío
+    (script mezcla ambos en el typescript). El returncode es el del
+    comando (no de script) gracias al flag -e.
+    """
+    if not shutil.which("script"):
+        return ("", "modo interactivo no disponible: falta `script` "
+                "(util-linux). Instala con: apt install util-linux", 1)
+
+    import tempfile
+    fd, log_path = tempfile.mkstemp(suffix=".typescript", prefix="maxiwatt-")
+    os.close(fd)
+
+    # Aviso visual antes de ceder el tty
+    console.print()
+    console.print(Panel(
+        f"[bold {WHITE}]MODO INTERACTIVO[/]\n\n"
+        f"El comando se ejecuta directamente en tu terminal. Puedes responder "
+        f"a prompts (passwords, host keys, confirmaciones [Y/n], ...) como si "
+        f"fuera una terminal normal.\n\n"
+        f"[dim]Ctrl+C para abortar. El output completo se enviará al agente "
+        f"cuando termine.[/]",
+        title=f"[bold {ORANGE}]⚡ TTY cedido al comando[/]",
+        border_style=ORANGE, box=ROUNDED, padding=(1, 2),
+    ))
+    # Una línea de separación para que el output del comando empiece limpio
+    console.print()
+
+    try:
+        # script -q (quiet), -e (return exit code del comando), -f (flush)
+        # -c <cmd> → ejecuta cmd en un pty con I/O completa.
+        # El typescript queda guardado en log_path.
+        proc = subprocess.run(
+            ["script", "-q", "-e", "-f", "-c", command, log_path],
+            timeout=timeout,
+            # NO redirigimos stdin/stdout/stderr — heredan del terminal del
+            # agente, dando control total al comando interactivo.
+        )
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except KeyboardInterrupt:
+        console.print(f"\n[bold {RED}]✗ comando interrumpido por el operador[/]")
+        rc = 130
+    except Exception as e:
+        return ("", f"error en modo interactivo: {e}", 1)
+
+    # Leer y limpiar el typescript
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    except OSError as e:
+        raw = f"(no se pudo leer el log de la sesión: {e})"
+    finally:
+        try:
+            os.unlink(log_path)
+        except OSError:
+            pass
+
+    # `script` mete una primera línea "Script started ..." y al final
+    # "Script done ..." si no usamos -q. Con -q ya no, pero igual filtramos
+    # caracteres de control que pty mete (^M, etc.).
+    cleaned = raw.replace("\r\n", "\n").replace("\r", "\n")
+    # Quitar secuencias ANSI de cursor más comunes (back-spaces, etc.)
+    cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", cleaned)
+    cleaned = cleaned.strip()
+
+    return (cleaned, "", rc)
+
+
 def _execute_shell(command, timeout=300, stream=None):
     """Ejecuta `command` con shell=True y devuelve (stdout, stderr, returncode).
     Si `stream` es True (o STREAM_OUTPUT True por defecto), imprime stdout/stderr
@@ -8062,30 +8176,55 @@ def run_command(command, auto=False):
     # autopilot, donde el bucle de troubleshooting puede legítimamente reintentar).
     duplicate_block_auto = (bool(duplicate_runs) or bool(saturated_tool)) and not auto
 
+    # ¿Necesita TTY interactivo? Heurística: ssh-copy-id, ssh+host,
+    # apt sin -y, passwd, bash <script>, etc. Si sí, lo ejecutamos con
+    # _execute_shell_interactive (script(1) cede el TTY al comando).
+    auto_interactive = _command_needs_interactive_tty(command)
+    use_interactive = auto_interactive  # puede sobreescribirse desde el prompt
+
     if (auto or (AUTO_EXECUTE and category == "safe")) and not duplicate_block_auto:
         msg = "auto-ejecutando (autopilot)" if auto else f"Auto-ejecutando (categoría: seguro)"
+        if auto_interactive:
+            msg += " · TTY cedido (comando interactivo detectado)"
         _q_print(f"[bold {GREEN}]» {msg}…[/]")
     else:
+        # Sufijo del prompt: añadimos `i` cuando hay modo interactivo
+        # disponible para que el operador pueda forzarlo aunque la
+        # heurística no lo haya detectado.
+        opts_label = "[s/i/N]"
         if duplicate_runs:
             prompt_msg = (
                 "⚠ El escaneo ya está hecho según _runs.md. "
-                "¿Re-ejecutar de todos modos? [s/N]: "
+                f"¿Re-ejecutar de todos modos? {opts_label}: "
             )
         elif saturated_tool:
             prompt_msg = (
                 f"⚠ `{saturated_tool}` saturada ({saturated_count} runs). "
-                f"¿Ejecutar de todos modos? [s/N]: "
+                f"¿Ejecutar de todos modos? {opts_label}: "
             )
         elif category == "destructive":
-            prompt_msg = f"⚠ Comando DESTRUCTIVO. ¿Estás seguro? [s/N]: "
+            prompt_msg = f"⚠ Comando DESTRUCTIVO. ¿Estás seguro? {opts_label}: "
         elif category == "intrusive":
-            prompt_msg = "Comando intrusivo. ¿Ejecutar? [s/N]: "
+            prompt_msg = f"Comando intrusivo. ¿Ejecutar? {opts_label}: "
         else:
-            prompt_msg = "¿Ejecutar este comando? [s/N]: "
+            prompt_msg = f"¿Ejecutar este comando? {opts_label}: "
+        if auto_interactive:
+            prompt_msg = (
+                f"[dim]› comando interactivo detectado — usa "
+                f"[bold]i[/] para ejecutar con TTY cedido (default si "
+                f"pulsas [bold]s[/])[/]\n" + prompt_msg
+            )
+            _q_print(f"[dim]› {prompt_msg.split(chr(10))[0]}[/]")
+            prompt_msg = prompt_msg.split("\n")[-1]
         confirm = input(prompt_msg).strip().lower()
-        if confirm != "s":
+        if confirm not in ("s", "i"):
             LAST_COMMAND_RC = -1  # cancelado
             return "Comando cancelado por el usuario."
+        # i (explícito) o s con auto_interactive=True → modo interactivo.
+        if confirm == "i":
+            use_interactive = True
+        elif confirm == "s" and auto_interactive:
+            use_interactive = True
 
     # HOOK before_command — puede abortar la ejecución vía HookAbort.
     try:
@@ -8108,8 +8247,20 @@ def run_command(command, auto=False):
         """Lanza _execute_shell con spinner descriptivo si NO hay streaming.
         En threads de subagente, salta el spinner y la cabecera dim para no
         ensuciar la salida del operador principal.
+        Si use_interactive=True, usa _execute_shell_interactive() en vez del
+        camino normal — el operador interactúa con el comando como si fuera
+        una terminal normal (puede responder passwords, host keys, etc.).
         Devuelve (stdout, stderr, rc)."""
         in_sub = _is_subagent_thread()
+        # Modo interactivo: el comando recibe el TTY del agente. No tiene
+        # sentido en threads de subagente (no hay operador para responder),
+        # así que en ese caso caemos al camino normal con stdin=DEVNULL.
+        if use_interactive and not in_sub:
+            # Para interactivo, el timeout es más largo (el operador puede
+            # tardar en responder a un prompt). Mínimo 30 min.
+            return _execute_shell_interactive(
+                eff_cmd, timeout=max(timeout_s, 1800)
+            )
         if STREAM_COMMAND_OUTPUT and not in_sub:
             # Modo streaming (sólo en main): cabecera dim + _execute_shell
             # pinta las líneas en directo.
