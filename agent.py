@@ -619,10 +619,29 @@ DISCIPLINA DE EDICIÓN — REGLAS DURAS:
    NO añades funciones auxiliares. Una sola petición = una sola modificación quirúrgica.
 2. Si el operador NO te pide cambios, NO los hagas aunque "queden mejor". El operador no
    te ha pedido tu opinión sobre el estilo del código.
-3. Antes de un FILE_EDIT, EMITE SIEMPRE un FILE_READ del archivo en el turno anterior (o
-   en el mismo turno si todavía no lo has leído). Editar a ciegas = OLD wrong = rechazo.
-4. El bloque OLD del FILE_EDIT debe ser el TEXTO LITERAL del archivo (con whitespace e
+3. Antes de un FILE_EDIT necesitas haber visto el contenido del archivo. Si NO lo has
+   visto todavía: emite FILE_READ + FILE_EDIT EN EL MISMO TURNO (el agente procesa
+   ambos: primero inyecta el contenido, luego aplica el edit). NO esperes a otro turno.
+4. Si en el HISTORY tienes ya un bloque `[FILE_READ: <ruta>]` reciente con el contenido
+   del archivo (escrito por el agente en el turno anterior), úsalo — NO vuelvas a emitir
+   FILE_READ del mismo archivo, procede DIRECTAMENTE con FILE_EDIT.
+5. El bloque OLD del FILE_EDIT debe ser el TEXTO LITERAL del archivo (con whitespace e
    indentación EXACTOS). No paráfrasis, no aproximaciones, no "más o menos así".
+
+PROHIBIDO MENTIR SOBRE EDICIONES — REGLA INVIOLABLE:
+- NUNCA digas "modifico", "he modificado", "voy a cambiar", "actualizo", "edito",
+  "añado", "sustituyo", "reemplazo", "fix aplicado" SIN emitir en el MISMO mensaje un
+  bloque FILE_EDIT o FILE_WRITE que haga ese cambio real.
+- Si emites solo un FILE_READ y nada más, NO digas que has modificado nada. Lo único
+  que está pasando es que el agente está cargando el archivo para que tú puedas verlo.
+  En ese caso responde explícitamente: "leyendo <archivo>; los cambios irán en el
+  siguiente turno cuando tenga el contenido".
+- El operador NO ve los bloques [[FILE_*]] crudos — los procesa el agente. Lo que el
+  operador SÍ ve es la prosa del modelo. Si tu prosa dice "modifico X" y no hay bloque
+  FILE_EDIT en tu mensaje, el operador percibe que MIENTES.
+- Antes de cerrar tu respuesta, verifica: ¿he prometido cambios en prosa? ¿He emitido
+  el bloque FILE_EDIT/FILE_WRITE correspondiente? Si la respuesta es "sí" y "no",
+  añade el bloque ANTES de enviar.
 
 SELECCIÓN DEL OPERADOR (equivalente a "lo que tengo seleccionado en el editor"):
 Si el operador menciona algo con `@archivo:L43` o `@archivo:L40-L50`, está señalando
@@ -5633,6 +5652,43 @@ _REGURGITATION_MARKERS = [
 ]
 
 
+# Verbos en presente/pasado/futuro que indican que el modelo está prometiendo
+# una edición de archivo. Si aparecen sin un bloque FILE_EDIT/FILE_WRITE
+# acompañante, es alucinación — el modelo "dice que modifica" pero el agente
+# no recibe ningún bloque que aplicar. Avisamos al operador.
+_FILE_EDIT_PROMISE_RE = re.compile(
+    r"\b(?:modific[ao]|modific\w*?\s+(?:el|la|los|las)\s+archi?vo|"
+    r"cambi[oa]\s+(?:la\s+l[íi]nea|el\s+c[óo]digo|en|de)|"
+    r"actualiz[oa]|edit[oa]\s+(?:el|la)|"
+    r"a[ñn]ad[oae]\s+(?:la|el|una|un)|sustituy[oae]|reemplaz[oae]|"
+    r"fix\s+aplicado|cambio\s+aplicado|patch\s+aplicado|"
+    r"voy\s+a\s+(?:modific|cambi|edit|actualiz|a[ñn]ad|sustitu|reemplaz)|"
+    r"he\s+(?:modific|cambi|edit|actualiz|a[ñn]ad|sustitu|reemplaz))",
+    re.IGNORECASE,
+)
+
+
+def _detect_unfulfilled_edit_promise(answer):
+    """True si el answer contiene una promesa de edición pero NO un bloque
+    FILE_EDIT o FILE_WRITE que cumpla esa promesa. Devuelve (bool, snippet)."""
+    if not answer:
+        return False, ""
+    # Si ya hay un bloque FILE_EDIT o FILE_WRITE en el answer, el modelo
+    # cumplió su promesa.
+    has_edit = bool(FILE_EDIT_PATTERN.search(answer)) or \
+               bool(FILE_WRITE_PATTERN.search(answer))
+    if has_edit:
+        return False, ""
+    m = _FILE_EDIT_PROMISE_RE.search(answer)
+    if not m:
+        return False, ""
+    # Extraer un snippet de contexto para mostrar al operador
+    start = max(0, m.start() - 30)
+    end = min(len(answer), m.end() + 60)
+    snippet = answer[start:end].replace("\n", " ")
+    return True, snippet
+
+
 def _strip_context_regurgitation(answer):
     """Trunca el answer desde la primera marca de regurgitación del contexto
     system. Devuelve (answer_truncado, n_marcas_detectadas).
@@ -5982,6 +6038,26 @@ def ask_model(user_input):
             # Recargamos el target para que el contexto refleje los archivos
             # actualizados en el siguiente turno.
             load_target(ACTIVE_TARGET)
+
+    # ────────────────────────────────────────────────────────
+    # GUARDRAIL anti-promesa-vacía: el modelo dijo "modifico/cambio/..."
+    # pero NO emitió un bloque FILE_EDIT/FILE_WRITE para cumplir la promesa.
+    # Avisamos al operador con un panel rojo antes de procesar nada.
+    # ────────────────────────────────────────────────────────
+    unfulfilled, snippet = _detect_unfulfilled_edit_promise(answer)
+    if unfulfilled:
+        console.print()
+        console.print(Panel(
+            f"[bold {RED}]El modelo prometió un cambio en prosa pero NO emitió "
+            f"ningún bloque FILE_EDIT/FILE_WRITE para cumplirlo.[/]\n\n"
+            f"[{WHITE}]Snippet detectado:[/]\n"
+            f"  [dim]\"...{snippet}...\"[/]\n\n"
+            f"[bold]Qué hacer:[/] pídele explícitamente que [bold]"
+            f"emita el bloque FILE_EDIT[/] (o re-formula con `@archivo:L<a>-L<b>` "
+            f"para señalar dónde quieres el cambio).",
+            title=f"[bold {RED}]⚠ Promesa de edición sin cumplir[/]",
+            border_style=RED, box=ROUNDED, padding=(1, 2),
+        ))
 
     # ────────────────────────────────────────────────────────
     # Procesar bloques FILE_READ / FILE_EDIT / FILE_WRITE
