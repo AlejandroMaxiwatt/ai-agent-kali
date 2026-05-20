@@ -8163,11 +8163,16 @@ def run_command(command, auto=False):
 
     auto_tag = f"\n[bold {ORANGE}]» AUTOPILOT — sin confirmación[/]" if auto else ""
 
+    # Guardamos el comando en el historial para que el operador pueda
+    # copiarlo al portapapeles con el comando `copy` del REPL.
+    _remember_proposed_command(command)
+    copy_hint = f"\n[dim]   📋 escribe [bold]copy[/] (o [bold]c[/]) para copiar este comando al portapapeles[/]"
+
     _q_print()
     _q_print(Panel(
-        f"[bold {ORANGE}]Comando propuesto[/bold {ORANGE}] "
+        f"[bold {ORANGE}]📋 Comando propuesto[/bold {ORANGE}] "
         f"[bold {color}]· {label}[/]\n\n[{WHITE}]{command}[/]"
-        f"{proxy_note}{auto_tag}",
+        f"{proxy_note}{auto_tag}{copy_hint}",
         border_style=color,
         box=ROUNDED
     ))
@@ -9259,6 +9264,93 @@ def maybe_install_vscode_extension():
         console.print(f"[bold {RED}]✗ no se pudo descargar/instalar bridge:[/] {e}")
 
 
+# ============================================================
+# Portapapeles: copiar el último comando propuesto al clipboard del SO
+# ============================================================
+# Mantenemos en memoria los últimos N comandos propuestos por el modelo.
+# El operador puede copiarlos al portapapeles con `copy` (último) o
+# `copy <n>` (n-ésimo desde el final).
+#
+# El método principal es OSC 52: un escape sequence que el terminal lee y
+# usa para escribir al clipboard del sistema. La ventaja: funciona sobre
+# SSH (el escape viaja del server al cliente, que es quien tiene
+# clipboard). Compatible con kitty, wezterm, alacritty, iTerm2, y con el
+# terminal de VSCode si la setting `terminal.integrated.enableClipboardWrite`
+# está activa (default en versiones recientes).
+#
+# Si OSC 52 no funciona (terminal lo ignora), fallback a binarios locales:
+# wl-copy, xclip, xsel, pbcopy, clip.exe.
+
+_PROPOSED_COMMAND_HISTORY = []        # lista LIFO, último al final
+_PROPOSED_COMMAND_HISTORY_MAX = 10
+
+
+def _remember_proposed_command(command):
+    """Guarda el comando en el historial de propuestos (para `copy`)."""
+    if not command:
+        return
+    _PROPOSED_COMMAND_HISTORY.append(command)
+    if len(_PROPOSED_COMMAND_HISTORY) > _PROPOSED_COMMAND_HISTORY_MAX:
+        del _PROPOSED_COMMAND_HISTORY[:-_PROPOSED_COMMAND_HISTORY_MAX]
+
+
+def _copy_to_clipboard_osc52(text):
+    """Escribe `text` al clipboard del terminal usando OSC 52. Funciona
+    remoto vía SSH. No hay forma de saber si el terminal lo aceptó —
+    devolvemos True si pudimos enviar el escape sequence."""
+    import base64
+    try:
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        # `\x1b]52;c;<b64>\x07` — `c` = system clipboard
+        seq = f"\x1b]52;c;{encoded}\x07"
+        sys.stdout.write(seq)
+        sys.stdout.flush()
+        return True
+    except Exception:
+        return False
+
+
+def _copy_to_clipboard_native(text):
+    """Intenta copiar usando un binario nativo del SO. Devuelve nombre del
+    binario que funcionó, o None si ninguno."""
+    candidates = [
+        ("wl-copy", []),                            # Wayland
+        ("xclip",   ["-selection", "clipboard"]),   # X11
+        ("xsel",    ["--clipboard", "--input"]),    # X11 alt
+        ("pbcopy",  []),                            # macOS
+        ("clip.exe", []),                           # WSL → Windows
+    ]
+    for bin_name, args in candidates:
+        if shutil.which(bin_name) is None:
+            continue
+        try:
+            proc = subprocess.run(
+                [bin_name] + args,
+                input=text, text=True, timeout=5,
+                capture_output=True,
+            )
+            if proc.returncode == 0:
+                return bin_name
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return None
+
+
+def copy_command_to_clipboard(text):
+    """Intenta copiar `text` al portapapeles usando OSC 52 (remoto/local) Y
+    un binario nativo si está disponible. Devuelve dict con info para
+    pintar feedback al operador."""
+    osc_ok = _copy_to_clipboard_osc52(text)
+    native = _copy_to_clipboard_native(text)
+    return {
+        "osc52": osc_ok,
+        "native": native,
+        # Cualquier método disponible se considera éxito desde la perspectiva
+        # del usuario; si nada funcionó devolvemos all=False.
+        "any": osc_ok or (native is not None),
+    }
+
+
 def vscode_auto_attach(user_input):
     """Si hay selección activa en VSCode y el operador NO ha mencionado ya
     ese archivo con `@`, auto-prepende la mención al user_input.
@@ -9567,6 +9659,48 @@ def main():
 
         if cmd_lower in ("tools", "herramientas"):
             print_tools()
+            continue
+
+        # `copy` / `c` [n]: copia al portapapeles el último comando
+        # propuesto (o el n-ésimo desde el final). Usa OSC 52 (funciona
+        # remoto vía SSH) + fallbacks nativos (xclip, wl-copy, pbcopy...).
+        if first_word in ("copy", "c", "copiar"):
+            if not _PROPOSED_COMMAND_HISTORY:
+                console.print(
+                    f"[{ORANGE}]no hay comandos propuestos todavía en esta sesión[/]"
+                )
+                continue
+            parts = user_input.split()
+            idx = 1
+            if len(parts) >= 2 and parts[1].isdigit():
+                idx = max(1, int(parts[1]))
+            if idx > len(_PROPOSED_COMMAND_HISTORY):
+                console.print(
+                    f"[{ORANGE}]solo hay {len(_PROPOSED_COMMAND_HISTORY)} "
+                    f"comando(s) en el historial; usa `copy 1`..`copy "
+                    f"{len(_PROPOSED_COMMAND_HISTORY)}`[/]"
+                )
+                continue
+            text = _PROPOSED_COMMAND_HISTORY[-idx]
+            res = copy_command_to_clipboard(text)
+            methods = []
+            if res["osc52"]:
+                methods.append("OSC 52 (terminal/SSH)")
+            if res["native"]:
+                methods.append(res["native"])
+            if methods:
+                console.print(
+                    f"[bold {GREEN}]✓ copiado al portapapeles[/]  "
+                    f"[dim](vía {', '.join(methods)})[/]"
+                )
+                preview = text if len(text) <= 80 else text[:77] + "..."
+                console.print(f"[dim]   {preview}[/]")
+            else:
+                console.print(
+                    f"[bold {RED}]✗ no se pudo copiar[/] "
+                    f"(sin OSC 52 ni binario nativo de clipboard disponible). "
+                    f"Instala uno de: xclip, wl-clipboard, xsel."
+                )
             continue
 
         # Comandos de edición de archivos (operador) — `view`, `edit`, `diff`.
