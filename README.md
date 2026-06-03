@@ -21,8 +21,10 @@ Agente de IA local para pentesting ofensivo en Kali Linux. Conecta con un LLM ex
   - [Generales](#generales)
   - [Skills](#skills)
   - [Targets](#targets-contexto-del-objetivo)
+  - [Edición de código por el modelo (FILE_*)](#edición-de-código-por-el-modelo-file_)
   - [Subagentes autónomos](#subagentes-autónomos)
   - [Goal-driven orchestration](#goal-driven-orchestration)
+  - [VSCode/Cursor bridge](#vscodecursor-bridge)
   - [Sesiones](#sesiones)
   - [Lecciones (memoria persistente)](#lecciones-memoria-persistente)
   - [Sudo, timeout, proxy](#sudo-timeout-proxy)
@@ -79,6 +81,18 @@ Edita las constantes al principio de `agent.py`:
 | `GOAL_PHASE_TIMEOUT_S` | `1800` | Timeout por fase del orquestador (s) |
 | `PROXY_MODE` | `"proxychains"` | Routing: `"proxychains"`, `"torify"`, `"off"` |
 | `STREAM_COMMAND_OUTPUT` | `False` | Stream línea a línea de stdout/stderr (vs panel al final) |
+| `TROUBLESHOOT_AUTOPILOT` | `True` | Auto-fix de comandos fallidos vía LLM (ver [auto-troubleshooting](#auto-troubleshooting-autopilot)) |
+
+#### Perfiles de inferencia (`_LLM_PROFILES`)
+
+Las cuatro vías que llaman al LLM (`main` / `subagent` / `orchestrator` / `report`) usan una **tabla única** de `temperature`, `max_tokens`, `frequency_penalty`, `presence_penalty`. Antes cada bucle pasaba sus propios kwargs hardcodeados — eso generaba drift entre llamadas con cada refactor. Si quieres tunear cómo responde cada bucle, edita `_LLM_PROFILES` (cerca del top de `agent.py`):
+
+| Perfil | temp | max_tokens | penalties |
+|---|---|---|---|
+| `main` | 0.1 | 4096 | freq=0.4, pres=0.2 |
+| `subagent` | 0.1 | 2048 | freq=0.4, pres=0.2 |
+| `orchestrator` | 0.2 | 2048 | sin penalties |
+| `report` | 0.3 | 6000 | sin penalties |
 
 ## Cómo arrancar
 
@@ -167,7 +181,31 @@ Indicadores extra:
 | `models` / `modelos` | Modelos expuestos por LM Studio |
 | `tools` / `herramientas` | Tabla categorizada de las **137 herramientas** que el agente reconoce (17 categorías) con instaladas/faltantes |
 | `compact` / `compactar` | Compacta history (acelera prefill del modelo en sesiones largas) |
+| `copy [n]` / `c [n]` / `copiar [n]` | Copia el último comando propuesto (o el n-ésimo desde el final) al portapapeles vía OSC 52 + fallbacks nativos (xclip, wl-copy, pbcopy) |
 | `salir` / `exit` / `quit` | Cierra el agente |
+
+#### Edición de archivos desde el REPL (operador)
+
+Las mismas operaciones que el modelo puede hacer vía bloques `FILE_*` están disponibles para ti directamente. Útil para preparar contenido cuando el modelo se queda atascado o cuando quieres tocar tú mismo.
+
+| Comando | Acción |
+|---|---|
+| `view <ruta>` / `ver <ruta>` / `cat <ruta>` | Lee el archivo con líneas numeradas + syntax highlight |
+| `edit <ruta>` / `editar <ruta>` | Prompt interactivo: pegas el bloque OLD, `EOF`, el bloque NEW, `EOF` |
+| `diff <ruta1> <ruta2>` | Diff coloreado entre dos archivos del workspace |
+| `write <ruta>` / `escribir <ruta>` | Prompt interactivo: pegas contenido, `EOF`. Crea o sobreescribe |
+
+Las rutas pueden ser relativas (resueltas contra `WORKSPACE`) o absolutas. Los archivos protegidos (`.env`, `privkey.pem`, ssh keys, etc.) se bloquean en la validación.
+
+#### Menciones `@archivo` (inyección de contexto)
+
+Si escribes `@<ruta>` en tu prompt, el agente busca el archivo en el workspace y, si hay varias coincidencias, te pregunta cuál usar. El contenido se inyecta como bloque de contexto delante de tu petición, sin que tengas que copiar/pegar.
+
+```
+Tú > revisa @agent.py:L6321-L6500 y dime si la rama de stuck funciona
+```
+
+Acepta rango opcional `:L<inicio>-L<fin>` para inyectar sólo un fragmento. Si está activo el [bridge VSCode/Cursor](#vscodecursor-bridge), la selección actual del editor se auto-attachea sin tener que escribir `@…`.
 
 ### Skills
 
@@ -230,6 +268,37 @@ Tras cada `COMANDO:` ejecutado:
 - **`_timeline.md`** — bitácora cronológica con comando + output truncado.
 - **`_runs.md`** — checklist estructurada con UNA línea por scan, agrupada por herramienta. Anti-duplicación: si propones el mismo scan, el agente avisa.
 
+### Edición de código por el modelo (`FILE_*`)
+
+Aparte de `TARGET_UPDATE`, el modelo puede leer/editar/crear cualquier archivo del sistema usando tres tipos de bloque. Útil para que el agente arregle bugs en tus propios scripts, ajuste configs, o construya artefactos para el engagement.
+
+```
+[[FILE_READ: ruta/al/archivo.py]]               ← sin cuerpo (inyecta el contenido)
+[[FILE_READ: ruta/al/archivo.py L10-L40]]       ← rango opcional
+
+[[FILE_EDIT: ruta/al/archivo.py]]
+[[OLD]]
+texto exacto que existe en el archivo (debe ser único)
+[[/OLD]]
+[[NEW]]
+texto que lo sustituye
+[[/NEW]]
+[[/FILE_EDIT]]
+
+[[FILE_WRITE: ruta/al/archivo.py]]
+contenido entero (crea o sobreescribe)
+[[/FILE_WRITE]]
+```
+
+Detalles del wire:
+- Las rutas pueden ser **relativas** (resueltas contra `WORKSPACE`) o **absolutas en cualquier parte del sistema**. El acceso lo decide el SO según los permisos UNIX del usuario que corre el agente — no hay confinamiento al workspace.
+- **Archivos protegidos** (`.env`, `privkey.pem`, ssh keys, etc.) se bloquean a nivel de validación.
+- **FILE_EDIT** exige que el bloque OLD sea ÚNICO en el archivo (anti-ambigüedad). Para varios cambios en un archivo, varios bloques consecutivos.
+- Antes de aplicar EDIT/WRITE el agente muestra un **panel diff coloreado**. Si `AUTO_EXECUTE=True` se aplica directo; si no, pide `y/N`.
+- **FILE_READ inyecta** el contenido al history con líneas numeradas → el modelo lo "ve" en el siguiente turno.
+
+Sólo se soporta el formato V2 (`[[OLD]]/[[/OLD]]`). El antiguo `<<<OLD/OLD>>>` fue retirado (era propenso a errores en modelos locales).
+
 ### Subagentes autónomos
 
 Mini-agentes LLM independientes con su propia history pero compartiendo el target con el agente principal. Cada uno:
@@ -271,6 +340,11 @@ Orquestador que recibe un objetivo en lenguaje natural y lo ejecuta en fases ite
 | `goal status` | Estado actual (fase, subagentes lanzados, motivo) |
 | `goal show` | Panel-resumen completo |
 | `goal kill` | Detiene goal y subagentes de la fase actual |
+| `goal list` | Lista todos los goals persistidos en disco (incluyendo terminados) |
+| `goal resume [id]` | Reanuda un goal interrumpido desde la última fase completa. Sin `id` toma el huérfano más reciente |
+| `goal discard <id>` | Borra el estado persistido de un goal (el log de ejecución sigue en disco) |
+
+**Persistencia / resume**: el orquestador guarda un snapshot del estado (`memory/subagents/_goal-<id>.state.json`) tras cada fase completada. Si el agente se cierra a media fase, al arrancar avisa de "goals huérfanos" y puedes reanudar con `goal resume`. Las fases ya completadas no se repiten — la evidencia ya está en los archivos del target.
 
 **Flujo del orquestador**:
 
@@ -315,6 +389,22 @@ Terminal bell + panel grande con:
 - Detecta respuesta vacía y reporta causa específica (prompt grande / modelo sobrecargado).
 - Excluye `_timeline.md` del prompt del orquestador (160 kB típicos, no aporta a planificar).
 - El informe automático se genera incluso si el goal terminó EXHAUSTED — y se le pide al LLM que **rebata la decisión del orquestador** si hay un vector en `notes.md`.
+
+### VSCode/Cursor bridge
+
+Extensión opcional (`vscode-extension/`) que conecta el agente con tu editor para que **vea en directo qué archivo tienes abierto y qué selección tienes activa** — equivalente a escribir `@<archivo>:L<a>-L<b>` a mano pero sin tener que hacerlo.
+
+**Auto-instalación silenciosa**: al arrancar el agente desde el terminal integrado de VSCode/Cursor, intenta instalar la extensión (`maxiwatt-agent`) de forma idempotente. Si no estás en un terminal de editor, es un no-op silencioso. Compatible con **Remote SSH** (la extensión se fuerza a `extensionKind: workspace`).
+
+Lo que añade el bridge una vez instalado:
+- **Auto-attach**: si tienes una selección activa <120s antes de enviar tu prompt, el contenido del archivo+rango se inyecta automáticamente. Verás `› auto-attached: @archivo:L43-L45` confirmando.
+- **Badge en vivo** en la bottom toolbar de `prompt_toolkit`: `📋 N líneas seleccionadas en archivo.py` con refresh cada 1s mientras escribes.
+- **TTY interactivo** vía `script(1)` wrap (commit `4937c6d`) para que herramientas con TTY (vim, less, msfconsole) funcionen aunque el agente corra dentro de un side-panel.
+- **Splash modo lite** automático cuando el terminal mide < 130 columnas (paneles SSH/IDE estrechos).
+
+Si la extensión no carga, el agente funciona igual — solo pierdes auto-attach y el badge en vivo. Puedes seguir escribiendo `@archivo` a mano.
+
+Para desactivar la auto-instalación, edita `agent.py` y comenta la llamada a `maybe_install_vscode_extension()` en `main()`.
 
 ### Sesiones
 
@@ -435,6 +525,33 @@ El modelo a veces copiaba literalmente `[Scans en disco …]`, `[Target activo: 
 - **`_build_tool_runs_summary`**: ephemeral system message cada turno con uso acumulado por herramienta y marcador `⛔ SATURADA (≥3 runs)`.
 - **Regla "anti-loop por herramienta"**: ≥3 runs del mismo tool → siguiente COMANDO debe ser de OTRA categoría del tools_master.
 - **Regla "anti-repetición de análisis"**: si el análisis sería casi idéntico al turno anterior, decir "Sin novedades respecto al turno anterior" en lugar de regenerar.
+
+### Anti-loop en edición de archivos
+
+Detector `_detect_file_block_stuck_pattern` que clasifica tres atascos típicos del modelo cuando edita código y aplica un nudge específico en el siguiente turno:
+
+- **`reread_loop`**: el modelo ha emitido `[[FILE_READ: X]]` en ≥2 turnos consecutivos sin un solo `[[FILE_EDIT: X]]` → el contenido ya está en el history, releer no aporta. El agente filtra el history (drop assistant vacíos, colapsa lecturas duplicadas a placeholder), sube temperature a 0.7 y desactiva las penalties para romper el atractor.
+- **`malformed_edit`**: el modelo escribió `[[FILE_EDIT:` literal pero la sintaxis está rota (delimitadores inline, falta `[[/FILE_EDIT]]`, etc.) → el archivo NO se modificó. Panel rojo al operador + nudge correctivo.
+- **`no_block`**: el modelo habló de `FILE_READ`/`FILE_EDIT` en prosa pero NO emitió ningún bloque → typical "voy a editar el archivo" sin hacerlo. Nudge obligando al bloque ya.
+
+### Anti-promesa de edición sin cumplir
+
+Tras cada respuesta, si el modelo dijo en prosa "modifico/cambio/actualizo X" pero NO emitió un bloque `FILE_EDIT`/`FILE_WRITE` → panel rojo "⚠ Promesa de edición sin cumplir" con el snippet detectado. Si el bloque sí existe pero está malformado, se prioriza ese aviso (no se duplica).
+
+### Comandos quemados (autopilot burn list)
+
+Cuando el [troubleshoot autopilot](#auto-troubleshooting-autopilot) agota intentos contra un mismo comando, ese comando se añade a `_AUTOPILOT_BURNED_COMMANDS` y se inyecta como ephemeral system message: "NO VOLVER A PROPONER". Evita que el modelo proponga el mismo comando fallido turno tras turno (con cambios cosméticos en comillas o espacios).
+
+### Auto-troubleshooting (autopilot)
+
+Activable con `TROUBLESHOOT_AUTOPILOT = True` (default). Cuando un comando falla con rc≠0 (y NO es un rc benigno tipo `grep -q` sin matches), el agente entra en un bucle de auto-fix:
+
+1. Le pide al modelo un comando de diagnóstico (`--help`, `which`, `dpkg -l`, `ls /usr/share/…`, instalación de paquete, etc.).
+2. Lo ejecuta sin pedir confirmación.
+3. Hasta `TROUBLESHOOT_MAX_ATTEMPTS` intentos. Si en algún momento el modelo propone `noop` o se agota, se rinde y pasa al análisis con el output original.
+4. Soporta **meta-acciones del modelo**: `agent:proxy off`, `agent:proxy on`, `agent:tor restart` para resolver problemas de routing sin tocar shell.
+
+Los subagentes tienen su **propio recovery más simple** (sin LLM): `_subagent_try_recover` clasifica el fallo (`proxy` / `rate_limit` / `complexity` / `other`) y aplica heurísticas (`proxy off`, `_simplify_command`). Funciona en silencio dentro del thread del subagente sin contaminar la console del operador.
 
 ### Probe-list vs finding
 
@@ -600,6 +717,15 @@ Las faltantes se pueden auto-instalar cuando el modelo intente usarlas (auto-ins
 
 **El contexto llegó al 100% y el modelo se está perdiendo**
 > Ejecuta `compact` para forzar compactación adicional, o `new` para empezar sesión limpia. La evidencia en `targets/<nombre>/` está a salvo — el nuevo agente la carga al hacer `target <nombre>`.
+
+**El badge de selección de VSCode no aparece**
+> 1) Confirma que estás en un terminal *integrado* de VSCode/Cursor (no en uno externo). 2) Confirma que la extensión `maxiwatt-agent` está instalada y activa (`code --list-extensions | grep maxiwatt`). 3) Si vas por Remote SSH, la extensión debe estar instalada en el host **remoto** (la auto-install la fuerza). El bridge solo funciona si el editor y el agente comparten el mismo host. Sin él, sigues pudiendo usar `@archivo:L<a>-L<b>` a mano.
+
+**El modelo re-lee el mismo archivo turno tras turno sin editar**
+> Es el `reread_loop`. El agente lo detecta automáticamente, filtra el history y sube `temperature` para romper el atractor. Si aun así no edita, pídeselo más concreto (`@archivo:L43-L45 cambia X por Y`) — el bloque `[[FILE_EDIT:]]` necesita un `OLD` único en el archivo.
+
+**El comando `edit <ruta>` se queda esperando**
+> Espera la marca `EOF` en una línea sola tras pegar el bloque OLD, luego pegas NEW, luego `EOF` otra vez. Si cancelas con Ctrl+C en mitad, no se aplica nada al archivo.
 
 ---
 

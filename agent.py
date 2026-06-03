@@ -19,6 +19,7 @@ from openai import OpenAI
 
 from rich.console import Console, Group
 from rich.markdown import Markdown
+from rich.markup import escape as rich_escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -36,7 +37,8 @@ from pyfiglet import Figlet
 
 LMSTUDIO_BASE_URL = "http://lmstudio-oficina:1234/v1"
 
-MODEL_NAME_FALLBACK = "qwen/qwen3.6-27b"
+#MODEL_NAME_FALLBACK = "qwen/qwen3.6-27b"
+MODEL_NAME_FALLBACK = "qwen3.6-27b-heretic-uncensored-finetune-neo-code-di-imatrix-max"
 #MODEL_NAME_FALLBACK = "qwen3-coder-30b-a3b-instruct"
 
 WORKSPACE = os.path.expanduser("~/ai-agent-kali")
@@ -115,9 +117,46 @@ WORDLIST_MEDIUM_THRESHOLD_LINES = 5000
 # si tu hardware está más justo.
 LLM_REQUEST_TIMEOUT = 1800.0
 
+# Perfiles de inferencia. Cada bucle (main / subagente / orquestador /
+# report) elige su perfil aquí en vez de pasar temperature / max_tokens /
+# penalties hardcodeados a `client.chat.completions.create`. Una sola
+# tabla = un solo lugar donde tunear, sin drift entre llamadas.
+_LLM_PROFILES = {
+    # Bucle principal (ask_model): respuesta conversacional + bloques FILE_*.
+    # Penalties fuertes para evitar repetición/atracción al patrón anterior.
+    "main":         {"temperature": 0.1, "max_tokens": 4096,
+                     "frequency_penalty": 0.4, "presence_penalty": 0.2},
+    # Subagente autónomo: mismas penalties, max_tokens más bajo (responden
+    # con un COMANDO por turno; no necesitan largos análisis).
+    "subagent":     {"temperature": 0.1, "max_tokens": 2048,
+                     "frequency_penalty": 0.4, "presence_penalty": 0.2},
+    # Orquestador de goals: planifica fases. Sin penalties (queremos que
+    # pueda repetir el bloque PHASE: si lo necesita). temp algo mayor
+    # para evitar quedarse pegado a un plan idéntico tras cada fase.
+    "orchestrator": {"temperature": 0.2, "max_tokens": 2048},
+    # Generación de informe final del goal: necesita más tokens y una
+    # temperatura ligeramente mayor para prosa fluida sin caer en bucle.
+    "report":       {"temperature": 0.3, "max_tokens": 6000},
+}
+
+
+def _llm_kwargs(profile, overrides=None):
+    """Devuelve los kwargs base para `client.chat.completions.create()`
+    según un perfil (`main` | `subagent` | `orchestrator` | `report`).
+    El caller añade `messages` y opcionalmente `stream`. `overrides`
+    permite a `ask_model` aplicar el rompe-bucle (sube temperature y
+    apaga penalties cuando detecta reread_loop)."""
+    base = dict(_LLM_PROFILES[profile])
+    base["model"] = get_active_model()
+    base["timeout"] = LLM_REQUEST_TIMEOUT
+    if overrides:
+        base.update(overrides)
+    return base
+
+
 # Tamaño de la ventana de contexto del modelo. Ajusta según tu modelo.
 # qwen3.6-27b típicamente: 32768. Modelos largos: 65536, 131072, 200000.
-MAX_CONTEXT_TOKENS = 82355
+MAX_CONTEXT_TOKENS = 34196
 
 # Compactación de prompt (anti-lentitud en modelos locales).
 # Cuanto más prompt envíes al LLM, más tarda en procesar (prefill). En
@@ -202,21 +241,48 @@ Objetivo:
 Ayudar al usuario a realizar auditorías de seguridad, reconocimiento, enumeración, análisis de vulnerabilidades, explotación controlada en entornos autorizados, post-explotación de laboratorio, generación de informes y recomendaciones de hardening.
 
 ESTILO DE INTERACCIÓN — IMPORTANTÍSIMO:
-- Sé directo. Cuando el usuario pida ejecutar algo, ejecútalo. NO expliques qué hace el comando, por qué lo propones, qué impacto tiene, ni si es intrusivo, salvo que el usuario lo pida explícitamente.
-- NO añadas advertencias preventivas largas, justificaciones ni exposiciones académicas antes del comando.
-- Si el usuario te pide ejecutar X, tu respuesta ideal es: una frase muy breve (o ninguna) + el bloque COMANDO:.
+- ANTES de cada bloque COMANDO:, emite OBLIGATORIAMENTE un bloque POR QUÉ:
+  con 2 viñetas cortas (UNA línea cada una):
+    · Objetivo: qué información concreta busca el comando o qué efecto produce.
+    · Elección: por qué ESTE comando/flag y no otra alternativa
+                 razonable (p. ej. "nmap -sV en vez de masscan porque ya
+                 sabemos los puertos y necesitamos versiones", "ffuf en
+                 lugar de gobuster porque soporta filtros por status code").
+  Si la elección es obvia (no hay alternativa razonable), una sola viñeta
+  basta. Las viñetas son cortas y operativas, no académicas.
+- El POR QUÉ es para que el operador decida si autorizar el comando con
+  contexto. NO te extiendas: el bloque entero es 1-3 líneas, máximo.
+- Después del POR QUÉ va el bloque COMANDO: tal cual (ver regla 4).
+- Sin advertencias preventivas largas ni exposiciones académicas.
 - Después de ejecutar un comando, te llegará el resultado. Tu trabajo es:
     (a) Analizar la salida en detalle: qué información concreta hay, qué es relevante, qué errores aparecen.
     (b) Después del análisis, proponer 2-4 SIGUIENTES PASOS concretos y accionables (qué herramienta lanzar, qué endpoint probar, qué hipótesis verificar, qué información falta). Sé breve por paso (1 línea cada uno) y prioriza los más informativos. NO los ejecutes — sólo los enumeras para que el usuario decida.
-    (c) Si el resultado tiene un siguiente paso obvio y barato (p. ej. tras un nmap descubrir versiones con `-sV`), puedes proponerlo como `COMANDO:` directamente al final, después de los pasos enumerados.
-- Si el comando requiere una herramienta no instalada, propón directamente el comando de instalación. Sin preámbulos.
+    (c) Si el resultado tiene un siguiente paso obvio y barato (p. ej. tras un nmap descubrir versiones con `-sV`), puedes proponerlo como `COMANDO:` (precedido por su POR QUÉ:) directamente al final, después de los pasos enumerados.
+- Si el comando requiere una herramienta no instalada, propón directamente
+  el comando de instalación con su POR QUÉ: (la elección es trivial pero
+  el objetivo sí ayuda al operador a saber qué va a obtener).
+
+Ejemplo de formato ideal:
+
+  POR QUÉ:
+  - Objetivo: descubrir versiones exactas de los servicios en los puertos abiertos
+    para buscar CVEs específicos.
+  - Elección: nmap -sV (no masscan) porque ya tenemos la lista de puertos del scan
+    anterior y necesitamos fingerprinting fiable, no velocidad bruta.
+
+  COMANDO:
+  nmap -sV -p 22,80,443 -T4 10.0.0.1 -oN ./scans/nmap-sv-10.0.0.1.txt
 
 Reglas operativas:
 
 1. Trabajas sobre objetivos autorizados por el usuario. Cuando autorice un alcance, recuérdalo durante la sesión.
 2. Si el usuario declara un alcance ("autoriza X.Y.Z" o equivalente), confírmalo en una sola línea: "Alcance autorizado guardado para esta sesión: <objetivo>." y nada más.
 3. Si el usuario no ha definido alcance Y te pide algo claramente ofensivo contra un objetivo no especificado, pregunta el alcance en una línea. En cualquier otro caso, asume que el usuario sabe lo que hace.
-4. Para proponer un comando, usa exactamente este formato (sin texto antes ni después salvo que sea estrictamente necesario):
+4. Para proponer un comando, usa exactamente este formato. SIEMPRE precede el COMANDO con un bloque POR QUÉ (ver "ESTILO DE INTERACCIÓN" arriba):
+
+POR QUÉ:
+- Objetivo: <qué información busca o qué efecto produce>
+- Elección: <por qué este comando frente a alternativas razonables>
 
 COMANDO:
 <comando aquí>
@@ -287,7 +353,8 @@ Bloques DIAGNÓSTICO al final del resultado:
   · rc != 0 + stderr indica "argumento no válido / unknown flag" → la
     versión de la herramienta tiene flags distintos a los que recuerdas.
     Investiga: `tool --help` o `tool -h` para ver los flags reales y
-    propón el comando corregido.
+    emite el bloque `COMANDO:` con la versión corregida (NO escribas la
+    corrección en prosa tipo "Comando corregido: …"; eso NO se ejecuta).
   · tool NO instalada (según DIAGNÓSTICO) → `sudo apt install -y X` o
     pídelo al usuario.
 
@@ -314,8 +381,8 @@ Persistencia / autopilot — investigación, no especulación:
   Para descubrir scripts NSE concretos también puede servir:
     · `nmap --script-help='*<keyword>*'`
     · `grep -lir '<keyword>' /usr/share/nmap/scripts/ | head`
-  Sólo después de buscar y confirmar el nombre real, propón el comando
-  corregido.
+  Sólo después de buscar y confirmar el nombre real, emite el bloque
+  `COMANDO:` con la versión corregida (no la describas en prosa).
 
 META-ACCIONES del agente (disponibles EN CUALQUIER TURNO, no sólo autopilot):
 Cuando emitas un bloque COMANDO con uno de estos strings, el agente NO ejecuta
@@ -657,17 +724,30 @@ tocar el resto del archivo.
       de proponer un FILE_EDIT, para tener el texto exacto que vas a sustituir.
 
   [[FILE_EDIT: ruta/al/archivo.c]]
-  <<<OLD
+  [[OLD]]
   texto exacto que existe en el archivo (debe ser único)
-  OLD>>>
-  <<<NEW
+  [[/OLD]]
+  [[NEW]]
   texto que lo sustituye
-  NEW>>>
+  [[/NEW]]
   [[/FILE_EDIT]]
 
     → Sustitución quirúrgica. OLD debe coincidir EXACTAMENTE (incluyendo whitespace e
       indentación) y aparecer UNA SOLA VEZ en el archivo. Si aparece varias veces, añade
       contexto (más líneas alrededor) hasta que sea único. NO uses regex — es match literal.
+
+    REGLAS DE FORMATO (críticas — sin esto el agente NO aplica el edit):
+    - Cada delimitador `[[FILE_EDIT:]]`, `[[OLD]]`, `[[/OLD]]`, `[[NEW]]`, `[[/NEW]]`,
+      `[[/FILE_EDIT]]` va en SU PROPIA LÍNEA. NO los pongas inline con el contenido.
+    - El contenido OLD y NEW va ENTRE los delimitadores, no en la misma línea.
+    - Usa SIEMPRE los delimitadores `[[OLD]]`, `[[/OLD]]`, `[[NEW]]`, `[[/NEW]]`.
+      NO inventes `<<<OLD`, `OLD>>>`, `<<>>`, `<<<NEW>>>` ni variantes con `<` / `>` —
+      en modelos pequeños esa sintaxis se confunde y produce bloques que el parser
+      rechaza. Los `[[ ]]` son los mismos corchetes que usas para `[[FILE_READ:]]` y
+      `[[FILE_WRITE:]]`, así que no hay que aprender nada nuevo.
+
+    Si vas a hacer VARIOS cambios en el mismo archivo, emite varios bloques FILE_EDIT
+    SEPARADOS (uno por cada cambio), no metas múltiples OLD/NEW dentro de un solo bloque.
 
   [[FILE_WRITE: ruta/al/archivo_nuevo.c]]
   contenido entero del archivo (crea o sobreescribe)
@@ -676,10 +756,17 @@ tocar el resto del archivo.
     → Para archivos nuevos o reescrituras completas donde un EDIT sería poco práctico.
 
 Reglas duras:
-- Rutas relativas al workspace (./skills/foo.md) o absolutas dentro de él. Path traversal
-  (..) se bloquea automáticamente.
-- Archivos protegidos NO se pueden tocar: .env, *.pem, id_rsa*, agent.py, memory/sessions/.
-  Si el operador quiere cambiar esos, lo hace él.
+- Rutas: relativas (se resuelven contra el workspace, p. ej. `./skills/foo.md`) o
+  absolutas EN CUALQUIER PARTE del sistema de archivos (p. ej. `/etc/postfix/main.cf`,
+  `/var/log/auth.log`, `/home/<otro>/...`). El agente corre con los permisos UNIX del
+  operador; el SO decide qué puede leer/escribir. NO te excuses con "está fuera del
+  workspace": ESO YA NO ES UNA RESTRICCIÓN. Si una ruta absoluta es válida, úsala.
+- Si ya leíste un archivo con FILE_READ en un turno anterior y el bloque
+  `[FILE_READ: <ruta>] ... [/FILE_READ]` sigue visible en el HISTORY, NO vuelvas a
+  emitir FILE_READ — emite directamente el FILE_EDIT. Repetir el FILE_READ sin emitir
+  el EDIT es el bug clásico que deja al operador en bucle.
+- Archivos protegidos NO se pueden tocar: .env, *.pem, id_rsa*, id_ed25519*,
+  agent.py, memory/sessions/. Si el operador quiere cambiar esos, lo hace él.
 - NO mezcles edición con shell. Si vas a tocar payload.c, emite el bloque FILE_EDIT, no
   un `sed -i`. La razón: el operador ve el diff antes de aplicar, hay rollback implícito,
   y se valida que OLD sea único (evita corromper el archivo si te confundes de match).
@@ -723,6 +810,10 @@ LESSONS_DIR = os.path.join(WORKSPACE, "memory", "lessons")
 LESSONS_INDEX_PATH = os.path.join(LESSONS_DIR, "INDEX.md")
 ACTIVE_SKILLS = []
 ACTIVE_TARGET = None  # nombre del target cargado en el contexto, o None
+
+# Centinela para distinguir "no se pasó target" de "target explícito None"
+# en spawn_subagent (un goal sin target activo pasa None a propósito).
+_NO_TARGET_SENTINEL = object()
 
 # Extensiones de archivo que se consideran texto legible al cargar un target
 TARGET_TEXT_EXTS = {
@@ -816,6 +907,10 @@ def resume_session(session_id):
     ACTIVE_TARGET = data.get("active_target")
     SESSION_ID = data.get("session_id", session_id)
     SESSION_FILE = path
+    # El SYSTEM_PROMPT puede haber evolucionado desde que se guardó la
+    # sesión (reglas nuevas, lecciones añadidas). Sustituimos history[0]
+    # por la versión actual para que el modelo no opere con reglas viejas.
+    _rebuild_system_message()
     # Reset del contador de tokens: el response previo era de OTRA sesión
     # corriendo en esta misma instancia del agente. La barra mostrará
     # "(est.)" hasta que llegue el primer response de la nueva sesión.
@@ -1541,16 +1636,10 @@ def _subagent_build_init_history(sub):
 def _subagent_call_llm(sub):
     """Una llamada LLM. Devuelve answer (str) o None si error."""
     msgs = _compact_messages_for_call(list(sub.history))
+    kwargs = _llm_kwargs("subagent")
+    kwargs["messages"] = msgs
     try:
-        resp = client.chat.completions.create(
-            model=get_active_model(),
-            messages=msgs,
-            temperature=0.1,
-            max_tokens=2048,
-            frequency_penalty=0.4,
-            presence_penalty=0.2,
-            timeout=LLM_REQUEST_TIMEOUT,
-        )
+        resp = client.chat.completions.create(**kwargs)
         answer = (resp.choices[0].message.content or "") if resp.choices else ""
     except Exception as e:
         sub.log(f"ERROR LLM: {e}")
@@ -1562,24 +1651,21 @@ def _subagent_call_llm(sub):
     if regurg_cuts:
         sub.log(f"  ⚠ recortados {regurg_cuts} bloque(s) regurgitados")
 
-    # Aplicar TARGET_UPDATE bloques (thread-safe sobre archivos del target)
+    # Aplicar TARGET_UPDATE bloques (thread-safe sobre archivos del target).
+    # Pasamos `target=sub.target` explícito; antes se hacía swap del global
+    # ACTIVE_TARGET — fragil y race-condition-prone con varios subagentes
+    # en paralelo aunque hubiera lock.
     if sub.target:
         with _subagent_io_lock:
             updates = extract_target_updates(answer)
             for fname, content in updates:
-                global ACTIVE_TARGET
-                saved_active = ACTIVE_TARGET
-                ACTIVE_TARGET = sub.target
-                try:
-                    result = apply_target_update(fname, content)
-                    if result.get("ok"):
-                        sub.target_updates_applied.append(fname)
-                        sub.log(f"  ✓ TARGET_UPDATE → {fname}")
-                    else:
-                        sub.log(f"  ✗ TARGET_UPDATE FAILED → {fname}: "
-                                f"{result.get('error', '?')}")
-                finally:
-                    ACTIVE_TARGET = saved_active
+                result = apply_target_update(fname, content, target=sub.target)
+                if result.get("ok"):
+                    sub.target_updates_applied.append(fname)
+                    sub.log(f"  ✓ TARGET_UPDATE → {fname}")
+                else:
+                    sub.log(f"  ✗ TARGET_UPDATE FAILED → {fname}: "
+                            f"{result.get('error', '?')}")
             if updates:
                 answer = strip_target_updates(answer)
 
@@ -1588,6 +1674,109 @@ def _subagent_call_llm(sub):
     preview = answer[:400].replace("\n", " ⤶ ")
     sub.log(f"ANSWER: {preview}{'…' if len(answer) > 400 else ''}")
     return answer
+
+
+def _subagent_try_recover(sub, command, rc, result, current_tool):
+    """Auto-recovery escalonado del subagente: clasifica el fallo y reintenta
+    con `proxy off` / `_simplify_command` según el tipo. NO usa LLM (a
+    diferencia del `troubleshoot_loop` interactivo del main agent).
+
+    Devuelve `(new_result, new_rc, recovery_log)` — el caller los usa para
+    actualizar el feedback al modelo del subagente. Si no se intenta
+    recovery, devuelve `(result, rc, "")` sin cambios.
+    """
+    if rc in (0, -1) or not current_tool:
+        return result, rc, ""
+    tools_lower = [t.lower() for t in sub.tools_available]
+    if current_tool not in tools_lower or current_tool in sub.tools_failed_perm:
+        return result, rc, ""
+
+    attempts_done = sub.recovery_attempts.get(current_tool, 0)
+    failure_kind = _classify_command_failure(result, rc)
+    sub.log(
+        f"  ⚠ tool '{current_tool}' falló (rc={rc}, kind={failure_kind}). "
+        f"Auto-recovery attempt {attempts_done+1}/"
+        f"{SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS}"
+    )
+
+    # Elegir estrategia por tipo de fallo
+    recovery_cmd = None
+    recovery_action = None
+    if failure_kind == "proxy" and not sub.proxy_was_disabled:
+        global PROXY_MODE
+        prev_proxy = PROXY_MODE
+        PROXY_MODE = "off"
+        sub.proxy_was_disabled = True
+        recovery_action = f"proxy off (era {prev_proxy}) · reintento mismo cmd"
+        recovery_cmd = command
+    elif (failure_kind in ("rate_limit", "other")
+            and attempts_done < SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS):
+        simplified = _simplify_command(command, attempts_done + 1)
+        if simplified and simplified != command:
+            recovery_action = (
+                f"simplify cmd (attempt {attempts_done+1}): "
+                f"{simplified[:100]}"
+            )
+            recovery_cmd = simplified
+    elif (failure_kind == "complexity"
+            and attempts_done < SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS):
+        # Simplificar agresivamente saltando al attempt 2
+        simplified = _simplify_command(command, max(2, attempts_done + 1))
+        if simplified and simplified != command:
+            recovery_action = f"complexity simplify: {simplified[:100]}"
+            recovery_cmd = simplified
+
+    if not recovery_cmd:
+        return result, rc, ""
+
+    sub.recovery_attempts[current_tool] = attempts_done + 1
+    sub.log(f"  ↻ auto-recovery: {recovery_action}")
+    t1 = time.time()
+    retry_result = run_command(recovery_cmd, auto=True)
+    retry_rc = LAST_COMMAND_RC
+    retry_duration = time.time() - t1
+    sub.commands_run.append({
+        "cmd": recovery_cmd, "rc": retry_rc,
+        "duration_s": round(retry_duration, 1),
+        "tool": current_tool, "recovery": True,
+    })
+    sub.log(f"  ↻ recovery rc={retry_rc} duration={retry_duration:.1f}s")
+
+    if retry_rc == 0:
+        sub.tools_used.add(current_tool)
+        recovery_log = (
+            f"\n\n[AUTO-RECOVERY EXITOSA] El comando original falló pero "
+            f"el sistema lo recuperó: {recovery_action}. Resultado del "
+            f"retry abajo.\n"
+        )
+        new_result = (
+            f"[ORIGINAL CMD FAILED rc={rc} · recovered with: "
+            f"{recovery_action}]\n\n{retry_result}"
+        )
+        return new_result, 0, recovery_log
+
+    # Retry tampoco funcionó → ¿se agotaron los intentos?
+    if sub.recovery_attempts[current_tool] >= SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS:
+        sub.tools_failed_perm[current_tool] = (
+            f"Falló {SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS} recoveries "
+            f"(último: {failure_kind}, rc={retry_rc})"
+        )
+        recovery_log = (
+            f"\n\n[AUTO-RECOVERY AGOTADA] tool '{current_tool}' marcada "
+            f"como PERMANENTEMENTE FALLIDA tras "
+            f"{SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS} intentos. Pasa a otra "
+            f"herramienta.\n"
+        )
+        sub.log(f"  ✗ tool '{current_tool}' marcada perm-failed")
+    else:
+        remaining = (SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS
+                     - sub.recovery_attempts[current_tool])
+        recovery_log = (
+            f"\n\n[AUTO-RECOVERY INTENTO {attempts_done+1} FALLIDO] "
+            f"Quedan {remaining} intentos antes de marcar como permanente. "
+            f"Puedes proponer otra variante o pasar a otra tool.\n"
+        )
+    return result, rc, recovery_log
 
 
 def _subagent_loop(sub):
@@ -1743,123 +1932,23 @@ def _subagent_loop(sub):
             if rc == 0 and current_tool in [t.lower() for t in sub.tools_available]:
                 sub.tools_used.add(current_tool)
 
-            # AUTO-RECOVERY: si el comando falló (rc != 0, !=-1) y el tool
-            # está en la checklist, intentamos rescate escalonado.
-            recovery_log = ""
-            if (rc not in (0, -1) and current_tool
-                    and current_tool in [t.lower() for t in sub.tools_available]
-                    and current_tool not in sub.tools_failed_perm):
-                attempts_done = sub.recovery_attempts.get(current_tool, 0)
-                # Extraer stderr aproximado del result (formato del agente)
-                stderr_text = result
-                failure_kind = _classify_command_failure(stderr_text, rc)
-                sub.log(
-                    f"  ⚠ tool '{current_tool}' falló (rc={rc}, "
-                    f"kind={failure_kind}). Auto-recovery attempt "
-                    f"{attempts_done+1}/{SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS}"
-                )
+            # AUTO-RECOVERY heurístico (sin LLM): clasifica el fallo y
+            # reintenta con proxy off / simplify_command si aplica. La
+            # lógica entera vive en `_subagent_try_recover` para no
+            # ensuciar este bucle.
+            result, rc, recovery_log = _subagent_try_recover(
+                sub, command, rc, result, current_tool,
+            )
 
-                recovery_cmd = None
-                recovery_action = None
-
-                # Estrategia por tipo
-                if failure_kind == "proxy" and not sub.proxy_was_disabled:
-                    # Desactivar proxy global y reintentar el mismo comando
-                    global PROXY_MODE
-                    prev_proxy = PROXY_MODE
-                    PROXY_MODE = "off"
-                    sub.proxy_was_disabled = True
-                    recovery_action = (
-                        f"proxy off (era {prev_proxy}) · reintento mismo cmd"
-                    )
-                    recovery_cmd = command
-                elif failure_kind in ("rate_limit", "other") and attempts_done < SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS:
-                    # Simplificar el comando
-                    simplified = _simplify_command(command, attempts_done + 1)
-                    if simplified and simplified != command:
-                        recovery_action = (
-                            f"simplify cmd (attempt {attempts_done+1}): "
-                            f"{simplified[:100]}"
-                        )
-                        recovery_cmd = simplified
-                elif failure_kind == "complexity" and attempts_done < SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS:
-                    # Simplificar agresivamente saltando al attempt 2 directamente
-                    simplified = _simplify_command(command, max(2, attempts_done + 1))
-                    if simplified and simplified != command:
-                        recovery_action = f"complexity simplify: {simplified[:100]}"
-                        recovery_cmd = simplified
-
-                if recovery_cmd:
-                    sub.recovery_attempts[current_tool] = attempts_done + 1
-                    sub.log(f"  ↻ auto-recovery: {recovery_action}")
-                    t1 = time.time()
-                    retry_result = run_command(recovery_cmd, auto=True)
-                    retry_rc = LAST_COMMAND_RC
-                    retry_duration = time.time() - t1
-                    sub.commands_run.append({
-                        "cmd": recovery_cmd, "rc": retry_rc,
-                        "duration_s": round(retry_duration, 1),
-                        "tool": current_tool, "recovery": True,
-                    })
-                    sub.log(
-                        f"  ↻ recovery rc={retry_rc} "
-                        f"duration={retry_duration:.1f}s"
-                    )
-                    if retry_rc == 0:
-                        sub.tools_used.add(current_tool)
-                        recovery_log = (
-                            f"\n\n[AUTO-RECOVERY EXITOSA] El comando "
-                            f"original falló pero el sistema lo "
-                            f"recuperó: {recovery_action}. Resultado "
-                            f"del retry abajo.\n"
-                        )
-                        # Sustituir el result por el del retry
-                        result = (
-                            f"[ORIGINAL CMD FAILED rc={rc} · "
-                            f"recovered with: {recovery_action}]\n\n"
-                            f"{retry_result}"
-                        )
-                        rc = 0
-                    else:
-                        # Si llegamos al límite, marcar como permanente
-                        if sub.recovery_attempts[current_tool] >= SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS:
-                            sub.tools_failed_perm[current_tool] = (
-                                f"Falló {SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS} "
-                                f"recoveries (último: {failure_kind}, rc={retry_rc})"
-                            )
-                            recovery_log = (
-                                f"\n\n[AUTO-RECOVERY AGOTADA] tool "
-                                f"'{current_tool}' marcada como "
-                                f"PERMANENTEMENTE FALLIDA tras "
-                                f"{SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS} "
-                                f"intentos. Pasa a otra herramienta.\n"
-                            )
-                            sub.log(
-                                f"  ✗ tool '{current_tool}' marcada perm-failed"
-                            )
-                        else:
-                            recovery_log = (
-                                f"\n\n[AUTO-RECOVERY INTENTO "
-                                f"{attempts_done+1} FALLIDO] "
-                                f"Quedan {SUBAGENT_AUTO_RECOVERY_MAX_ATTEMPTS - sub.recovery_attempts[current_tool]} "
-                                f"intentos antes de marcar como permanente. "
-                                f"Puedes proponer otra variante o pasar a "
-                                f"otra tool.\n"
-                            )
-
-            # Persistir en timeline y runs del target (con lock)
+            # Persistir en timeline y runs del target (con lock). Pasamos
+            # `target=sub.target` explícito en vez de swap del global.
             if sub.target:
                 with _subagent_io_lock:
-                    global ACTIVE_TARGET
-                    saved = ACTIVE_TARGET
-                    ACTIVE_TARGET = sub.target
-                    try:
-                        append_timeline_entry(
-                            f"[subagente {sub.name}] {command}", result
-                        )
-                        append_runs_entry(command, rc)
-                    finally:
-                        ACTIVE_TARGET = saved
+                    append_timeline_entry(
+                        f"[subagente {sub.name}] {command}", result,
+                        target=sub.target,
+                    )
+                    append_runs_entry(command, rc, target=sub.target)
 
             # Mensaje de feedback con estado de cobertura
             cov_str = sub.coverage_summary_str()
@@ -1895,8 +1984,13 @@ def _subagent_loop(sub):
         _subagent_thread_marker.active = False
 
 
-def spawn_subagent(name, skill, task):
-    """Crea y lanza un subagente. Devuelve (Subagent, None) o (None, error)."""
+def spawn_subagent(name, skill, task, target=_NO_TARGET_SENTINEL):
+    """Crea y lanza un subagente. Devuelve (Subagent, None) o (None, error).
+
+    `target` puede pasarse explícitamente (incluido None para modo sin
+    target, p.ej. desde un goal sin target activo). Si no se pasa, se usa
+    el ACTIVE_TARGET global y se exige que exista (comando `subagent`
+    directo)."""
     if not name or not name.replace("_", "").replace("-", "").isalnum():
         return None, "el nombre debe ser alfanumérico (con - y _ permitidos)"
     with _subagents_lock:
@@ -1912,9 +2006,12 @@ def spawn_subagent(name, skill, task):
                 return None, f"ya hay un subagente activo llamado '{name}'"
         if not load_skill_content(skill):
             return None, f"skill '{skill}' no existe (mira con `skills`)"
-        if not ACTIVE_TARGET:
-            return None, "no hay target activo (carga uno con `target <nombre>`)"
-        sub = Subagent(name=name, skill=skill, task=task, target=ACTIVE_TARGET)
+        if target is _NO_TARGET_SENTINEL:
+            target = ACTIVE_TARGET
+            if not target:
+                return None, ("no hay target activo (carga uno con "
+                              "`target <nombre>`)")
+        sub = Subagent(name=name, skill=skill, task=task, target=target)
         _subagents_registry[name] = sub
     sub.thread = threading.Thread(
         target=_subagent_loop, args=(sub,),
@@ -2337,7 +2434,7 @@ def _goal_orchestrator_prompt(goal_run, available_skills, max_per_phase,
 GOAL DEL OPERADOR:
 {goal_run.goal}
 
-TARGET ACTIVO: {goal_run.target}
+TARGET ACTIVO: {goal_run.target or '(sin target — modo ad-hoc, sin workspace compartido)'}
 
 SKILLS DISPONIBLES para asignar a subagentes: {skills_str}
 
@@ -2435,13 +2532,9 @@ def _goal_request_plan(goal_run, available_skills, max_attempts=3):
                      f"prompt={prompt_chars} chars · "
                      f"minimal={use_minimal} · reinforced={attempt > 0} ---")
         try:
-            resp = client.chat.completions.create(
-                model=get_active_model(),
-                messages=msgs,
-                temperature=0.2,
-                max_tokens=2048,
-                timeout=LLM_REQUEST_TIMEOUT,
-            )
+            kwargs = _llm_kwargs("orchestrator")
+            kwargs["messages"] = msgs
+            resp = client.chat.completions.create(**kwargs)
             text = (resp.choices[0].message.content or "") if resp.choices else ""
         except Exception as e:
             goal_run.log(f"ERROR llamada LLM-orquestador attempt {attempt+1}: {e}")
@@ -2592,7 +2685,10 @@ def _goal_run_loop(goal_run):
             for spec in subs_spec:
                 # nombre único: prefijo con fase para evitar colisiones
                 name = f"p{phase_n}-{spec['name']}"[:48]
-                _sub, err = spawn_subagent(name, spec["skill"], spec["task"])
+                _sub, err = spawn_subagent(
+                    name, spec["skill"], spec["task"],
+                    target=goal_run.target,
+                )
                 if err:
                     errors.append((name, err))
                     goal_run.log(f"  ✗ spawn fail '{name}': {err}")
@@ -2720,10 +2816,11 @@ def start_goal(goal_text, max_phases=GOAL_MAX_PHASES):
                 f"{_active_goal_orch.max_phases}). "
                 f"`goal kill` para detenerlo antes de lanzar otro"
             )
-        if not ACTIVE_TARGET:
-            return None, "no hay target activo (carga con `target <nombre>`)"
         if not goal_text or len(goal_text.strip()) < 8:
             return None, "describe el goal en al menos 8 caracteres"
+        # El target es opcional: si no hay uno activo, el goal corre en
+        # modo ad-hoc (sin workspace compartido; los subagentes no escriben
+        # TARGET_UPDATEs ni se genera informe automático).
         goal_run = GoalRun(goal_text=goal_text.strip(),
                            target=ACTIVE_TARGET,
                            max_phases=max_phases)
@@ -3134,16 +3231,12 @@ def _generate_goal_report(goal_run):
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=get_active_model(),
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=6000,
-            timeout=LLM_REQUEST_TIMEOUT,
-        )
+        kwargs = _llm_kwargs("report")
+        kwargs["messages"] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        resp = client.chat.completions.create(**kwargs)
         content = (resp.choices[0].message.content or "") if resp.choices else ""
     except Exception as e:
         goal_run.log(f"ERROR generando informe: {e}")
@@ -3502,11 +3595,14 @@ def strip_target_updates(text):
     return TARGET_UPDATE_PATTERN.sub("", text).strip()
 
 
-def apply_target_update(filename, content):
-    """Append `content` al archivo targets/<ACTIVE_TARGET>/<filename>.
-    Devuelve dict con resultado: ok, file (ruta absoluta) o error.
+def apply_target_update(filename, content, target=None):
+    """Append `content` al archivo targets/<target>/<filename>. Si `target`
+    no se pasa, usa el `ACTIVE_TARGET` global (modo agente principal).
+    Subagentes y goal-orchestrator deben pasar `target=` explícito para
+    evitar swap del global (no race-safe). Devuelve dict {ok, file, …}.
     """
-    if not ACTIVE_TARGET:
+    effective_target = target if target is not None else ACTIVE_TARGET
+    if not effective_target:
         return {"ok": False, "filename": filename, "error": "no hay target activo"}
 
     fname = (filename or "").strip()
@@ -3524,7 +3620,7 @@ def apply_target_update(filename, content):
     if base in TARGET_PROTECTED_FILES:
         return {"ok": False, "filename": fname, "error": f"archivo protegido ({base})"}
 
-    target_root = os.path.realpath(os.path.join(TARGETS_DIR, ACTIVE_TARGET))
+    target_root = os.path.realpath(os.path.join(TARGETS_DIR, effective_target))
     full = os.path.realpath(os.path.join(target_root, fname))
     # Verificar que el path resuelto sigue dentro de la carpeta del target
     if not (full == target_root or full.startswith(target_root + os.sep)):
@@ -3573,12 +3669,12 @@ def apply_target_update(filename, content):
 #   [[FILE_READ: ruta/al/archivo.c L10-L40]]       ← rango opcional
 #
 #   [[FILE_EDIT: ruta/al/archivo.c]]
-#   <<<OLD
+#   [[OLD]]
 #   texto exacto que existe en el archivo (debe ser único)
-#   OLD>>>
-#   <<<NEW
+#   [[/OLD]]
+#   [[NEW]]
 #   texto que lo sustituye
-#   NEW>>>
+#   [[/NEW]]
 #   [[/FILE_EDIT]]
 #
 #   [[FILE_WRITE: ruta/al/archivo.c]]
@@ -3586,9 +3682,12 @@ def apply_target_update(filename, content):
 #   [[/FILE_WRITE]]
 #
 # Reglas:
-#   - Las rutas son siempre relativas al WORKSPACE o absolutas dentro de él.
-#   - Path traversal y ficheros protegidos (.env, privkey, agent.py…) se
-#     bloquean a nivel de validación.
+#   - Rutas: relativas (resueltas contra WORKSPACE) o absolutas en cualquier
+#     parte del sistema. El acceso real lo decide el SO según los permisos
+#     UNIX del usuario que corre el agente — no hay confinamiento al
+#     workspace.
+#   - Ficheros protegidos (.env, privkey, ssh keys, agent.py, memory/sessions/)
+#     se bloquean a nivel de validación.
 #   - FILE_EDIT requiere que `OLD` sea único en el archivo (anti-ambigüedad).
 #   - Antes de aplicar EDIT/WRITE se muestra un panel diff coloreado al
 #     operador. Si AUTO_EXECUTE=True se aplica directo; si no, se pide y/n.
@@ -3601,13 +3700,34 @@ FILE_READ_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-FILE_EDIT_PATTERN = re.compile(
-    r"\[\[FILE_EDIT:\s*([^\]]+?)\]\]\s*\n"
-    r"\s*<<<OLD\s*\n(.*?)\n\s*OLD>>>\s*\n"
-    r"\s*<<<NEW\s*\n(.*?)\n\s*NEW>>>\s*\n?"
-    r"\s*\[\[/FILE_EDIT\]\]",
+# V2 — sintaxis preferida (todo `[[ ]]`, consistente con FILE_READ/WRITE).
+# El modelo ya emite `[[FILE_READ:]]` y `[[FILE_WRITE:]]/[[/FILE_WRITE]]`
+# correctamente, así que un edit con `[[OLD]]/[[/OLD]]/[[NEW]]/[[/NEW]]`
+# le resulta mucho más fácil que la sintaxis con `<<<OLD/OLD>>>` original.
+#
+# El regex es TOLERANTE a 1 ó 2 corchetes (`[OLD]` / `[[OLD]]` /
+# `[/OLD]` / `[[/OLD]]`) porque los modelos locales se confunden con
+# el doble corchete y a menudo emiten uno solo. Aceptamos cualquier
+# combinación — el parser hace lo correcto en todos los casos.
+FILE_EDIT_PATTERN_V2 = re.compile(
+    r"\[\[FILE_EDIT:\s*([^\]]+?)\]\]\s*"
+    r"\[{1,2}OLD\]{1,2}\s*\n?(.*?)\n?\s*\[{1,2}/OLD\]{1,2}\s*"
+    r"\[{1,2}NEW\]{1,2}\s*\n?(.*?)\n?\s*\[{1,2}/NEW\]{1,2}"
+    r"(?:\s*\[\[/FILE_EDIT\]\])?",
     re.DOTALL | re.IGNORECASE,
 )
+
+# Alias mantenido por compatibilidad con código que solo necesita "alguna
+# versión válida" en `.search()`. V1 (`<<<OLD/OLD>>>`) fue retirada — el
+# system prompt + nudges al modelo prohíben esa sintaxis y el REPL ahora
+# construye sus bloques en V2 también.
+FILE_EDIT_PATTERN = FILE_EDIT_PATTERN_V2
+
+# Detector laxo: marca presencia de `[[FILE_EDIT:` literal aunque el
+# bloque entero no matchee. Sirve para avisar al operador cuando el
+# modelo emite un FILE_EDIT incompleto/mal formado.
+_FILE_EDIT_LITERAL_RE = re.compile(r"\[\[FILE_EDIT:", re.IGNORECASE)
+_FILE_WRITE_LITERAL_RE = re.compile(r"\[\[FILE_WRITE:", re.IGNORECASE)
 
 FILE_WRITE_PATTERN = re.compile(
     r"\[\[FILE_WRITE:\s*([^\]]+?)\]\]\s*\n"
@@ -3634,36 +3754,46 @@ FILE_READ_MAX_LINES = 2000
 
 
 def _validate_workspace_path(path):
-    """Resuelve `path` dentro del WORKSPACE y comprueba protecciones.
-    Devuelve (ok, absolute_path_or_error_msg, relative_or_error_msg).
+    """Resuelve `path` y comprueba protecciones.
+    El acceso se rige por los permisos UNIX del usuario que ejecuta el
+    agente: no se confina al WORKSPACE. Las rutas relativas se resuelven
+    contra el WORKSPACE; las absolutas se aceptan tal cual.
+    Devuelve (ok, absolute_path_or_error_msg, display_path_or_error_msg).
     """
     if not path or not isinstance(path, str):
         return (False, "ruta vacía", "")
     raw = path.strip()
     if not raw:
         return (False, "ruta vacía", "")
-    # Soportar tanto rutas relativas (al workspace) como absolutas dentro
-    # del workspace. Path traversal y simlinks se cortan con realpath.
+    # Path traversal y symlinks se normalizan con realpath. Sin frontera
+    # de workspace: el SO decide qué puede leer/escribir el usuario.
     if os.path.isabs(raw):
         full = os.path.realpath(raw)
     else:
         full = os.path.realpath(os.path.join(WORKSPACE, raw))
     workspace_root = os.path.realpath(WORKSPACE)
-    if not (full == workspace_root or full.startswith(workspace_root + os.sep)):
-        return (False, f"ruta fuera del workspace: {raw}", "")
-    rel = os.path.relpath(full, workspace_root)
-    # Protecciones
+    # Display: ruta relativa si cae dentro del workspace; absoluta si no.
+    if full == workspace_root or full.startswith(workspace_root + os.sep):
+        display = os.path.relpath(full, workspace_root).replace(os.sep, "/")
+        inside_workspace = True
+    else:
+        display = full
+        inside_workspace = False
+    # Protecciones de basename (aplican en cualquier ruta).
     base = os.path.basename(full)
     if base in FILE_PROTECTED_BASENAMES:
         return (False, f"archivo protegido: {base}", "")
-    rel_with_slash = rel.replace(os.sep, "/")
-    for pref in FILE_PROTECTED_PREFIXES:
-        if rel_with_slash == pref.rstrip("/") or rel_with_slash.startswith(pref):
-            return (False, f"ruta protegida: {pref}", "")
-    # agent.py: el modelo no se modifica a sí mismo.
-    if rel_with_slash == "agent.py":
+    # Protecciones de prefijo (.git/, venv/, memory/sessions/) — solo
+    # tienen sentido relativas al workspace.
+    if inside_workspace:
+        for pref in FILE_PROTECTED_PREFIXES:
+            if display == pref.rstrip("/") or display.startswith(pref):
+                return (False, f"ruta protegida: {pref}", "")
+    # agent.py: el modelo no se modifica a sí mismo (comparación robusta
+    # frente a rutas relativas, absolutas y symlinks).
+    if full == os.path.realpath(os.path.join(WORKSPACE, "agent.py")):
         return (False, "agent.py es modificable solo por el operador, no por el modelo", "")
-    return (True, full, rel_with_slash)
+    return (True, full, display)
 
 
 def extract_file_reads(text):
@@ -3674,12 +3804,14 @@ def extract_file_reads(text):
 
 
 def extract_file_edits(text):
-    """Devuelve lista de tuplas (path, old_string, new_string)."""
+    """Devuelve lista de tuplas (path, old_string, new_string) con los
+    matches de FILE_EDIT en `text`. Sólo sintaxis V2 (`[[OLD]]/[[/OLD]]`).
+    """
     if not text:
         return []
     return [
         (m.group(1).strip(), m.group(2), m.group(3))
-        for m in FILE_EDIT_PATTERN.finditer(text)
+        for m in FILE_EDIT_PATTERN_V2.finditer(text)
     ]
 
 
@@ -3698,7 +3830,7 @@ def strip_file_blocks(text):
     como ruido — los resultados se inyectan aparte)."""
     if not text:
         return text
-    out = FILE_EDIT_PATTERN.sub("", text)
+    out = FILE_EDIT_PATTERN_V2.sub("", text)
     out = FILE_WRITE_PATTERN.sub("", out)
     out = FILE_READ_PATTERN.sub("", out)
     return out.strip()
@@ -3784,6 +3916,74 @@ def _count_occurrences(haystack, needle):
     return haystack.count(needle)
 
 
+def _write_file_with_sudo_fallback(full_path, body):
+    """Escribe `body` en `full_path`. Si la escritura directa falla con
+    EACCES y hay password sudo almacenada (`sudo set`), reintenta vía
+    `sudo cp <tmp> <dst>` — esto preserva owner y permisos del destino
+    original (cp sobrescribe contenido, no metadatos del inode existente).
+
+    Devuelve (ok, used_sudo, error_msg).
+    """
+    import tempfile
+    try:
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return (True, False, "")
+    except PermissionError as e:
+        # Intentar fallback con sudo solo si está disponible.
+        with _sudo_password_lock:
+            has_pw = _STORED_SUDO_PASSWORD is not None
+        sudo_ready = has_pw or _sudo_cache_valid() or _running_as_root()
+        if not sudo_ready:
+            # No tenemos credenciales sudo todavía. Si estamos en el main
+            # thread (no en un subagente), pedimos la password ahora con
+            # un panel claro y reintentamos. Si está en subagente o el
+            # operador la cancela, devolvemos el error con el tip.
+            if not _is_subagent_thread():
+                console.print()
+                console.print(Panel(
+                    f"[bold {WHITE}]{full_path}[/] requiere [bold]root[/] "
+                    f"para escritura.\n\nVoy a pedirte la password sudo "
+                    f"para aplicarlo. Se cacheará en memoria del proceso "
+                    f"(equivalente a `sudo set`) — los siguientes edits "
+                    f"sobre archivos del sistema no volverán a pedirla.",
+                    title=f"[bold {ORANGE}]sudo necesario para FILE_EDIT/WRITE[/]",
+                    border_style=ORANGE, box=ROUNDED, padding=(1, 2),
+                ))
+                if _ensure_sudo_credentials():
+                    sudo_ready = True
+                else:
+                    return (False, False,
+                            f"write: {e} (password sudo cancelada o no "
+                            f"válida; ejecuta `sudo set` y reintenta)")
+            else:
+                return (False, False,
+                        f"write: {e} (tip: ejecuta `sudo set` desde el "
+                        f"REPL principal antes de lanzar el subagente)")
+        # Escribir a un temp en /tmp (writable por el usuario) y copiar
+        # con sudo. NamedTemporaryFile en delete=False para poder leerlo
+        # desde sudo cp.
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(prefix="agent-edit-", suffix=".tmp")
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp:
+                    tmp.write(body)
+                rc, _out, err = _sudo_run(["cp", tmp_path, full_path],
+                                          timeout=30, allow_tty_fallback=False)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            if rc != 0:
+                return (False, False, f"sudo cp falló (rc={rc}): {err or 'sin stderr'}")
+            return (True, True, "")
+        except OSError as e2:
+            return (False, False, f"tempfile/cp: {e2}")
+    except OSError as e:
+        return (False, False, f"write: {e}")
+
+
 def apply_file_edit(path, old_string, new_string):
     """Sustitución quirúrgica de `old_string` por `new_string` en el archivo.
     Requiere que old_string aparezca EXACTAMENTE UNA VEZ en el archivo
@@ -3815,11 +4015,9 @@ def apply_file_edit(path, old_string, new_string):
             "error": f"OLD aparece {n} veces; añade más contexto para que sea único",
         }
     new_content = content.replace(old_string, new_string, 1)
-    try:
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(new_content)
-    except OSError as e:
-        return {"ok": False, "path": rel, "error": f"write: {e}"}
+    ok_w, used_sudo, err = _write_file_with_sudo_fallback(full, new_content)
+    if not ok_w:
+        return {"ok": False, "path": rel, "error": err}
     diff_lines = list(difflib.unified_diff(
         content.splitlines(keepends=False),
         new_content.splitlines(keepends=False),
@@ -3830,6 +4028,7 @@ def apply_file_edit(path, old_string, new_string):
         "old_string": old_string, "new_string": new_string,
         "diff_lines": diff_lines,
         "old_content": content, "new_content": new_content,
+        "used_sudo": used_sudo,
     }
 
 
@@ -3857,11 +4056,9 @@ def apply_file_write(path, content):
             return {"ok": False, "path": rel, "error": f"mkdir: {e}"}
     # Normalizamos: el contenido siempre acaba con \n (UNIX-friendly)
     body = content if content.endswith("\n") else content + "\n"
-    try:
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(body)
-    except OSError as e:
-        return {"ok": False, "path": rel, "error": f"write: {e}"}
+    ok_w, used_sudo, err = _write_file_with_sudo_fallback(full, body)
+    if not ok_w:
+        return {"ok": False, "path": rel, "error": err}
     diff_lines = list(difflib.unified_diff(
         old_content.splitlines(keepends=False),
         body.splitlines(keepends=False),
@@ -3873,6 +4070,7 @@ def apply_file_write(path, content):
         "created": not pre_exists,
         "diff_lines": diff_lines,
         "old_content": old_content, "new_content": body,
+        "used_sudo": used_sudo,
     }
 
 
@@ -4018,12 +4216,14 @@ def process_file_blocks(answer):
 
         r = apply_file_edit(rel, old_s, new_s)
         if r["ok"]:
-            console.print(f"[bold {GREEN}]✓ aplicado[/] {rel}")
+            sudo_note = " [dim](via sudo)[/]" if r.get("used_sudo") else ""
+            console.print(f"[bold {GREEN}]✓ aplicado[/] {rel}{sudo_note}")
             console.print(
                 f"[dim]   ↺ si tu editor (VSCode/Cursor/...) no refresca, "
                 f"usa Ctrl+Shift+P → 'Revert File' o cierra y reabre la pestaña[/]"
             )
-            op_lines.append(f"✓ FILE_EDIT {rel} aplicado")
+            suffix = " (via sudo)" if r.get("used_sudo") else ""
+            op_lines.append(f"✓ FILE_EDIT {rel} aplicado{suffix}")
         else:
             console.print(f"[bold {RED}]✗ fallo:[/] {r['error']}")
             op_lines.append(f"✗ FILE_EDIT {rel} → {r['error']}")
@@ -4122,12 +4322,14 @@ def process_file_blocks(answer):
         r = apply_file_write(rel, content)
         if r["ok"]:
             label = "creado" if r["created"] else "sobreescrito"
-            console.print(f"[bold {GREEN}]✓ {label}[/] {rel}")
+            sudo_note = " [dim](via sudo)[/]" if r.get("used_sudo") else ""
+            console.print(f"[bold {GREEN}]✓ {label}[/] {rel}{sudo_note}")
             console.print(
                 f"[dim]   ↺ si tu editor (VSCode/Cursor/...) no refresca, "
                 f"usa Ctrl+Shift+P → 'Revert File' o cierra y reabre la pestaña[/]"
             )
-            op_lines.append(f"✓ FILE_WRITE {rel} {label}")
+            suffix = " (via sudo)" if r.get("used_sudo") else ""
+            op_lines.append(f"✓ FILE_WRITE {rel} {label}{suffix}")
         else:
             console.print(f"[bold {RED}]✗ fallo:[/] {r['error']}")
             op_lines.append(f"✗ FILE_WRITE {rel} → {r['error']}")
@@ -4136,10 +4338,16 @@ def process_file_blocks(answer):
     if op_lines:
         op_summary = "[FILE_OPS_RESULT]\n" + "\n".join(op_lines) + "\n[/FILE_OPS_RESULT]"
 
+    had_successful_edit_or_write = any(
+        line.startswith("✓ FILE_EDIT") or line.startswith("✓ FILE_WRITE")
+        for line in op_lines
+    )
+
     return {
         "any": True,
         "read_messages": read_messages,
         "op_summary": op_summary,
+        "had_successful_edit_or_write": had_successful_edit_or_write,
     }
 
 
@@ -4162,15 +4370,17 @@ def unload_target():
 TIMELINE_OUTPUT_LINES_MAX = 40
 
 
-def append_timeline_entry(command, result):
-    """Añade una entrada al `_timeline.md` del target activo con info del
-    comando ejecutado. Es MECÁNICO — no depende del modelo. Se ejecuta tras
-    cada `run_command` para garantizar que nada se pierde entre turnos.
+def append_timeline_entry(command, result, target=None):
+    """Añade una entrada al `_timeline.md` del target con info del comando
+    ejecutado. Es MECÁNICO — no depende del modelo. Si `target` no se pasa,
+    usa `ACTIVE_TARGET` (modo agente principal). Subagentes deben pasar
+    `target=sub.target` para evitar swap del global.
     """
-    if not ACTIVE_TARGET:
+    effective_target = target if target is not None else ACTIVE_TARGET
+    if not effective_target:
         return None
 
-    target_dir = os.path.join(TARGETS_DIR, ACTIVE_TARGET)
+    target_dir = os.path.join(TARGETS_DIR, effective_target)
     if not os.path.isdir(target_dir):
         return None
 
@@ -4191,7 +4401,7 @@ def append_timeline_entry(command, result):
     # Crear con header si no existe
     if not os.path.exists(timeline_path):
         header = (
-            f"# {ACTIVE_TARGET} — Timeline automática\n\n"
+            f"# {effective_target} — Timeline automática\n\n"
             f"Bitácora cronológica de TODOS los comandos ejecutados por el agente "
             f"durante el engagement. **Se rellena solo por el agente, no por el modelo.** "
             f"Útil como fuente de verdad para el informe final y para auditoría "
@@ -4412,23 +4622,25 @@ def find_duplicate_runs(command, target):
     return matches
 
 
-def append_runs_entry(command, rc):
-    """Añade una línea a `targets/<ACTIVE_TARGET>/_runs.md` SI la herramienta
-    está en NETWORK_TOOLS. Idempotente: si la huella ya existe en el archivo,
-    no la duplica. Devuelve el path o None."""
-    if not ACTIVE_TARGET:
+def append_runs_entry(command, rc, target=None):
+    """Añade una línea a `targets/<target>/_runs.md` SI la herramienta está
+    en NETWORK_TOOLS. Si `target` no se pasa, usa `ACTIVE_TARGET`.
+    Idempotente: si la huella ya existe en el archivo, no la duplica.
+    Devuelve el path o None."""
+    effective_target = target if target is not None else ACTIVE_TARGET
+    if not effective_target:
         return None
     tool = _runs_first_tool_token(command)
     if not tool or tool not in NETWORK_TOOLS:
         return None
 
-    target_dir = os.path.join(TARGETS_DIR, ACTIVE_TARGET)
+    target_dir = os.path.join(TARGETS_DIR, effective_target)
     if not os.path.isdir(target_dir):
         return None
     runs_path = os.path.join(target_dir, "_runs.md")
 
     # Idempotencia: si la huella ya está, no añadimos
-    for r in parse_runs(ACTIVE_TARGET):
+    for r in parse_runs(effective_target):
         if r["command"] == command:
             return runs_path
 
@@ -4444,7 +4656,7 @@ def append_runs_entry(command, rc):
     if not os.path.exists(runs_path):
         with open(runs_path, "w", encoding="utf-8") as f:
             f.write(
-                f"# {ACTIVE_TARGET} — Scans ejecutados (autogenerado)\n\n"
+                f"# {effective_target} — Scans ejecutados (autogenerado)\n\n"
                 f"Lista estructurada de comandos de escaneo ya ejecutados "
                 f"contra este target. **No editar a mano** — lo mantiene el "
                 f"agente tras cada ejecución. Consúltalo antes de proponer "
@@ -5586,6 +5798,18 @@ def _compact_messages_for_call(messages):
     return compacted
 
 
+# Regex compartidos por detección de alucinación Y de regurgitación. Cada
+# regex se compila UNA sola vez y se referencia por nombre en ambas listas
+# para evitar drift entre ellas.
+_RX_REG_SCANS         = re.compile(r"\[Scans en disco\s*—", re.IGNORECASE)
+_RX_REG_TOOLS_USED    = re.compile(r"\[Herramientas ya usadas contra\s+'", re.IGNORECASE)
+_RX_REG_TARGET_ACTIVE = re.compile(r"\[Target activo:\s*", re.IGNORECASE)
+_RX_REG_SKILL_ACTIVE  = re.compile(r"\[Skill activa:\s*", re.IGNORECASE)
+_RX_REG_TOOLS_MASTER  = re.compile(r"\[Tools master\s*·", re.IGNORECASE)
+_RX_REG_COMPACTADO    = re.compile(r"\[…COMPACTADO\s*·", re.IGNORECASE)
+_RX_REG_TIMELINE_RUNS = re.compile(r"^===\s+_(?:timeline|runs)\.md\s+===", re.MULTILINE | re.IGNORECASE)
+
+
 # Patrones que SÓLO produce el agente tras ejecutar un comando. Si el
 # modelo los emite en su respuesta, está fabricando output del sistema.
 _HALLUC_SYSTEM_PATTERNS = [
@@ -5603,20 +5827,21 @@ _HALLUC_SYSTEM_PATTERNS = [
      "tag `» AUTOPILOT —` (lo emite el agente, no tú)"),
     (re.compile(r"^\s*Comando\s+intrusivo\.\s*¿Ejecutar\?", re.MULTILINE | re.IGNORECASE),
      "prompt `Comando intrusivo. ¿Ejecutar? [s/N]:` (lo emite el agente)"),
-    # Regurgitación del contexto system del agente
-    (re.compile(r"\[Scans en disco\s*—", re.IGNORECASE),
+    # Regurgitación del contexto system del agente (regex compartidos
+    # con _REGURGITATION_MARKERS — definidos arriba).
+    (_RX_REG_SCANS,
      "bloque `[Scans en disco — …]` (es contexto system, NO tu output)"),
-    (re.compile(r"\[Herramientas ya usadas contra\s+'", re.IGNORECASE),
+    (_RX_REG_TOOLS_USED,
      "bloque `[Herramientas ya usadas contra …]` (contexto system)"),
-    (re.compile(r"\[Target activo:\s*", re.IGNORECASE),
+    (_RX_REG_TARGET_ACTIVE,
      "bloque `[Target activo: …]` (contexto system)"),
-    (re.compile(r"\[Skill activa:\s*", re.IGNORECASE),
+    (_RX_REG_SKILL_ACTIVE,
      "bloque `[Skill activa: …]` (contexto system)"),
-    (re.compile(r"\[Tools master\s*·", re.IGNORECASE),
+    (_RX_REG_TOOLS_MASTER,
      "bloque `[Tools master · …]` (contexto system)"),
     (re.compile(r"^===\s+[^=]+\s+===\s*$", re.MULTILINE),
      "separador `=== <archivo>.md ===` (delimitador interno del target block)"),
-    (re.compile(r"\[…COMPACTADO\s*·", re.IGNORECASE),
+    (_RX_REG_COMPACTADO,
      "marcador `[…COMPACTADO · …]` (lo inserta la compactación del agente)"),
     (re.compile(r"<archivo_dentro_de_targets/>", re.IGNORECASE),
      "placeholder `<archivo_dentro_de_targets/>` (es la plantilla, sustitúyelo por un nombre real)"),
@@ -5641,14 +5866,16 @@ def _detect_system_output_hallucination(answer):
 # truncamos el answer desde la PRIMERA aparición hasta el final. Razón:
 # una vez el modelo empieza a copiar el contexto system, lo normal es que
 # siga copiando bloque tras bloque hasta agotar max_tokens.
+# Los regex se comparten con _HALLUC_SYSTEM_PATTERNS (definidos más abajo)
+# vía las variables _RX_REG_*. Una sola definición, dos consumidores.
 _REGURGITATION_MARKERS = [
-    re.compile(r"\[Scans en disco\s*—", re.IGNORECASE),
-    re.compile(r"\[Herramientas ya usadas contra\s+'", re.IGNORECASE),
-    re.compile(r"\[Target activo:\s*", re.IGNORECASE),
-    re.compile(r"\[Skill activa:\s*", re.IGNORECASE),
-    re.compile(r"\[Tools master\s*·", re.IGNORECASE),
-    re.compile(r"^===\s+_(?:timeline|runs)\.md\s+===", re.MULTILINE | re.IGNORECASE),
-    re.compile(r"\[…COMPACTADO\s*·", re.IGNORECASE),
+    _RX_REG_SCANS,
+    _RX_REG_TOOLS_USED,
+    _RX_REG_TARGET_ACTIVE,
+    _RX_REG_SKILL_ACTIVE,
+    _RX_REG_TOOLS_MASTER,
+    _RX_REG_TIMELINE_RUNS,
+    _RX_REG_COMPACTADO,
 ]
 
 
@@ -5666,6 +5893,152 @@ _FILE_EDIT_PROMISE_RE = re.compile(
     r"he\s+(?:modific|cambi|edit|actualiz|a[ñn]ad|sustitu|reemplaz))",
     re.IGNORECASE,
 )
+
+
+# Detecta menciones a FILE_READ/FILE_EDIT en prosa (sin corchetes). Si
+# el modelo habla del bloque pero no lo emite, está atascado.
+_FILE_BLOCK_PROSE_RE = re.compile(
+    r"\bFILE_(?:READ|EDIT)\b(?!\s*[:\]])",
+    re.IGNORECASE,
+)
+# Captura la ruta mencionada en la prosa (la primera ruta absoluta o
+# ./relativa que aparezca tras "FILE_READ" / "FILE_EDIT").
+_FILE_BLOCK_PROSE_PATH_RE = re.compile(
+    r"FILE_(?:READ|EDIT)[^\n]{0,80}?\s+(?:sobre\s+|contra\s+|de\s+|a\s+|en\s+)?"
+    r"(/[^\s,;:'\"`]+|\./[^\s,;:'\"`]+|[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+
+
+# Inyección que el agente añade tras un FILE_READ exitoso. La primera
+# línea es: `[FILE_READ: <path>  (N/M líneas[, truncado])]`. Lo usamos
+# como fuente de verdad de "el modelo leyó este path" — el assistant
+# message original ya está stripped y no contiene el bloque crudo.
+_INJECTED_FILE_READ_RE = re.compile(
+    r"^\[FILE_READ:\s*(.+?)\s+\(\d+/\d+\s+l[íi]neas",
+    re.MULTILINE,
+)
+# Líneas que aparecen en el op_summary que el agente inyecta cuando un
+# FILE_EDIT o FILE_WRITE se APLICA con éxito. Si vemos alguna entre dos
+# FILE_READ, NO hay reread_loop (el modelo sí editó).
+_OP_SUMMARY_EDIT_SUCCESS_RE = re.compile(
+    r"^✓\s+FILE_(?:EDIT|WRITE)\s",
+    re.MULTILINE,
+)
+
+
+_FILE_EDIT_LITERAL_HEAD = re.compile(
+    r"\[\[FILE_EDIT:\s*([^\]]+?)\]\]", re.IGNORECASE,
+)
+
+
+def _detect_last_malformed_edit():
+    """Si el último assistant (tras strip) contiene `[[FILE_EDIT:` literal
+    — esto solo pasa cuando NI V1 NI V2 matcheó el bloque entero — el
+    modelo intentó editar pero la sintaxis estaba rota. Devuelve {path}
+    o None. Solo mira el assistant más reciente.
+    """
+    if not history:
+        return None
+    for m in reversed(history):
+        role = m.get("role")
+        if role == "user":
+            return None
+        if role != "assistant":
+            continue
+        content = m.get("content") or ""
+        if "[[FILE_EDIT:" not in content:
+            return None
+        m_path = _FILE_EDIT_LITERAL_HEAD.search(content)
+        return {"path": m_path.group(1).strip()} if m_path else {"path": "<archivo>"}
+    return None
+
+
+def _detect_file_block_stuck_pattern():
+    """Detecta dos tipos de atasco mirando los últimos ~20 mensajes del
+    history (sin parar en user messages, ya que los `continúa` del
+    operador son normales):
+
+    - kind='reread_loop':  hay ≥2 inyecciones `[FILE_READ: <path>]` del
+                           mismo `path` recientes y NO hay ninguna línea
+                           `✓ FILE_EDIT/WRITE` entre medias. El modelo
+                           relee en lugar de editar.
+    - kind='no_block':     el último assistant menciona FILE_READ/EDIT en
+                           prosa pero NO se ha inyectado ningún FILE_READ
+                           tras él (no emitió bloque ni siquiera para leer).
+    - kind='malformed_edit':el último assistant emitió `[[FILE_EDIT:` pero
+                           con sintaxis rota → ni V1 ni V2 capturaron el
+                           bloque, el archivo NO se modificó. Caso típico
+                           con modelos pequeños que confunden `<<<OLD`/
+                           `OLD>>>`.
+
+    Devuelve dict {n, path, kind} o None si no hay atasco. Cualquier
+    `✓ FILE_EDIT/WRITE` reciente rompe `reread_loop` y `no_block`.
+    """
+    malformed = _detect_last_malformed_edit()
+    if malformed:
+        return {"n": 1, "path": malformed["path"], "kind": "malformed_edit"}
+    if not history:
+        return None
+    # Solo miramos la cola — suficiente para detectar atascos vivos sin
+    # arrastrar carga histórica de sesiones largas.
+    tail = history[-30:] if len(history) > 30 else list(history)
+
+    read_paths_recent = []  # del más reciente al más antiguo
+    edited_seen = False
+    last_assistant_idx = None
+    last_assistant_content = ""
+
+    for idx in range(len(tail) - 1, -1, -1):
+        m = tail[idx]
+        role = m.get("role")
+        content = m.get("content", "") or ""
+        if role == "assistant" and last_assistant_idx is None:
+            last_assistant_idx = idx
+            last_assistant_content = content
+        if role == "system":
+            if _OP_SUMMARY_EDIT_SUCCESS_RE.search(content):
+                edited_seen = True
+                # Si el edit es POSTERIOR a algún FILE_READ ya recolectado,
+                # rompemos: el modelo sí editó.
+                if read_paths_recent:
+                    return None
+            for mr in _INJECTED_FILE_READ_RE.finditer(content):
+                read_paths_recent.append(mr.group(1).strip())
+
+    # Si vimos un edit en la cola tras todo el barrido y no hay reads
+    # PENDIENTES posteriores → no atasco.
+    if edited_seen and not read_paths_recent:
+        return None
+
+    # reread_loop: el mismo path leído ≥2 veces (las dos más recientes
+    # coinciden), sin edit entre medias.
+    if (
+        len(read_paths_recent) >= 2
+        and read_paths_recent[0] == read_paths_recent[1]
+    ):
+        return {
+            "n": len(read_paths_recent),
+            "path": read_paths_recent[0],
+            "kind": "reread_loop",
+        }
+
+    # no_block: el último assistant menciona FILE_READ/EDIT en prosa pero
+    # no provocó ninguna inyección [FILE_READ:] tras él.
+    if last_assistant_content and not read_paths_recent:
+        # Comprobar que no haya FILE_READ inyectado DESPUÉS de este assistant.
+        post = tail[last_assistant_idx + 1 :] if last_assistant_idx is not None else []
+        injected_after = any(
+            (mm.get("role") == "system"
+             and _INJECTED_FILE_READ_RE.search(mm.get("content", "") or ""))
+            for mm in post
+        )
+        if not injected_after and _FILE_BLOCK_PROSE_RE.search(last_assistant_content):
+            mp = _FILE_BLOCK_PROSE_PATH_RE.search(last_assistant_content)
+            path = mp.group(1).rstrip(".,;:") if mp else "<archivo>"
+            return {"n": 1, "path": path, "kind": "no_block"}
+
+    return None
 
 
 def _detect_unfulfilled_edit_promise(answer):
@@ -5926,11 +6299,9 @@ def _build_scans_overview(target_name):
 def ask_model(user_input):
     """Envía `user_input` al modelo y devuelve la respuesta. Si STREAM_OUTPUT,
     imprime cada chunk en directo a medida que llega (sin renderizar Markdown).
-    Procesa bloques TARGET_UPDATE al final.
+    Procesa bloques TARGET_UPDATE y FILE_* al final.
     """
     history.append({"role": "user", "content": user_input})
-
-    model = get_active_model()
 
     # Inyectamos la fecha y hora actuales como mensaje system EFÍMERO (no se
     # guarda en el history). Así el modelo siempre sabe qué día es y los
@@ -5958,25 +6329,178 @@ def ask_model(user_input):
         if runs_summary:
             ephemeral.append({"role": "system", "content": runs_summary})
 
+    # Nudge si el modelo tiene comandos "quemados" — el autopilot ya los
+    # intentó y no los pudo resolver. Sirve para que no vuelva a proponer
+    # exactamente el mismo comando turno tras turno.
+    if _AUTOPILOT_BURNED_COMMANDS:
+        burned_lines = "\n".join(
+            f"  · `{r}`" for (_, r) in _AUTOPILOT_BURNED_COMMANDS
+        )
+        ephemeral.append({
+            "role": "system",
+            "content": (
+                "COMANDOS QUEMADOS — NO VOLVER A PROPONER:\n"
+                f"El autopilot ya intentó estos comandos sin éxito (cada uno "
+                f"hasta 5 reintentos). Volver a proponerlos LITERALMENTE solo "
+                f"creará otro bucle.\n"
+                f"{burned_lines}\n\n"
+                f"Si necesitas info similar, cambia de enfoque (otra "
+                f"herramienta, otros flags, leer un archivo en disco con "
+                f"FILE_READ, etc.). NO propongas los comandos de arriba tal "
+                f"cual ni con cambios cosméticos (espacios, comillas)."
+            ),
+        })
+
+    # Rompe-bucle: si el modelo en los últimos turnos prometió leer/editar
+    # pero NO emitió bloque FILE_*, le metemos un nudge duro. Sin esto el
+    # modelo se imita a sí mismo (temp=0.1 + frequency_penalty=0.4 favorecen
+    # copiar el patrón "POR QUÉ + bullets" en lugar de emitir el bloque).
+    stuck = _detect_file_block_stuck_pattern()
+    if stuck:
+        path = stuck["path"]
+        if stuck.get("kind") == "reread_loop":
+            stuck_msg = (
+                "ROMPE-BUCLE — RE-LEYENDO EL MISMO ARCHIVO:\n"
+                f"Has emitido `[[FILE_READ: {path}]]` en los últimos "
+                f"{stuck['n']} turnos consecutivos SIN un solo "
+                f"`[[FILE_EDIT: …]]`. El contenido del archivo ya está en "
+                f"este HISTORY como bloque `[FILE_READ: {path}] … [/FILE_READ: {path}]` "
+                f"(emitido por el agente, no por ti). NO necesitas releerlo.\n\n"
+                f"EN ESTE TURNO, PROHIBIDO emitir otro `[[FILE_READ:]]` del "
+                f"mismo archivo. OBLIGATORIO emitir directamente el bloque "
+                f"FILE_EDIT con el cambio que el operador pidió. Formato EXACTO "
+                f"(cada delimitador en su propia línea, dobles corchetes, NO uses "
+                f"`<<<OLD`, `OLD>>>`, `<<>>` ni variantes con `<`/`>`):\n"
+                f"  [[FILE_EDIT: {path}]]\n"
+                f"  [[OLD]]\n"
+                f"  texto literal que existe en el archivo (con whitespace exacto)\n"
+                f"  [[/OLD]]\n"
+                f"  [[NEW]]\n"
+                f"  texto que lo sustituye\n"
+                f"  [[/NEW]]\n"
+                f"  [[/FILE_EDIT]]\n"
+                f"Si no recuerdas qué cambiar, propón la modificación mínima "
+                f"razonable consistente con la última instrucción del operador "
+                f"— pero EMITE EL BLOQUE."
+            )
+        elif stuck.get("kind") == "malformed_edit":
+            stuck_msg = (
+                "CORRECCIÓN OBLIGATORIA — TU FILE_EDIT ANTERIOR ESTABA "
+                "MAL FORMATEADO:\n"
+                f"En el turno anterior emitiste `[[FILE_EDIT: {path}]]` "
+                f"pero los delimitadores estaban rotos (probablemente usaste "
+                f"`<<<OLD`, `OLD>>>`, `<<<NEW>>>`, `<<>>` o similares). El "
+                f"parser NO pudo extraer el cambio y el archivo NO se "
+                f"modificó. El operador NO lo va a repetir — lo arreglas tú "
+                f"AHORA.\n\n"
+                f"RE-EMITE EL BLOQUE con el formato EXACTO. Cada delimitador "
+                f"en su PROPIA LÍNEA. Usa SOLO dobles corchetes `[[ ]]`, "
+                f"NUNCA `<<<` ni `>>>`:\n"
+                f"  [[FILE_EDIT: {path}]]\n"
+                f"  [[OLD]]\n"
+                f"  texto literal que existe en el archivo (whitespace exacto)\n"
+                f"  [[/OLD]]\n"
+                f"  [[NEW]]\n"
+                f"  texto que lo sustituye\n"
+                f"  [[/NEW]]\n"
+                f"  [[/FILE_EDIT]]\n"
+                f"Si necesitas hacer VARIOS cambios, emite VARIOS bloques "
+                f"FILE_EDIT consecutivos (uno por cambio), cada uno con su "
+                f"propia pareja OLD/NEW. NO metas múltiples OLD/NEW en un "
+                f"solo bloque."
+            )
+        else:  # 'no_block'
+            stuck_msg = (
+                "ROMPE-BUCLE — PROSA SIN BLOQUE:\n"
+                f"En los últimos {stuck['n']} turnos has hablado de "
+                f"FILE_READ/FILE_EDIT sobre `{path}` pero NO has emitido "
+                f"NINGÚN bloque `[[FILE_READ: …]]` ni `[[FILE_EDIT: …]]`. "
+                f"Eso deja al operador en bucle.\n\n"
+                f"EN ESTE TURNO, OBLIGATORIO:\n"
+                f"  • Si todavía no has leído el archivo: emite literalmente "
+                f"`[[FILE_READ: {path}]]` (con DOBLES corchetes y sobre su "
+                f"propia línea) y NADA MÁS de prosa explicativa.\n"
+                f"  • Si ya tienes el contenido en HISTORY: emite el bloque "
+                f"`[[FILE_EDIT: {path}]]` con `[[OLD]] ... [[/OLD]]` y "
+                f"`[[NEW]] ... [[/NEW]]` y `[[/FILE_EDIT]]`.\n"
+                f"NO repitas la prosa 'POR QUÉ' sin un bloque. NO digas "
+                f"'es necesario porque está fuera del workspace' — las rutas "
+                f"absolutas están permitidas. EMITE EL BLOQUE YA."
+            )
+        ephemeral.append({"role": "system", "content": stuck_msg})
+
     # Insertamos justo después del system_prompt principal (índice 1).
     messages_for_call = [history[0]] + ephemeral + history[1:]
+
+    # ROMPE-BUCLE FUERTE para reread_loop:
+    # 1) Quitamos del PROMPT (no del history persistido) los assistant
+    #    messages vacíos o triviales — son los `[[FILE_READ:]]` post-strip
+    #    que el modelo se está imitando a sí mismo turno tras turno.
+    # 2) Subimos temperature y desactivamos las penalties para romper el
+    #    determinismo. tem=0.1 + freq_penalty=0.4 hace que el modelo copie
+    #    su patrón anterior; sin libertad no sale del atractor.
+    stuck_overrides = {}
+    if stuck and stuck.get("kind") == "reread_loop":
+        loop_path = stuck.get("path", "")
+        filtered = []
+        dropped_assist = 0
+        replaced_reads = 0
+        kept_one_full_read = False
+        # Recorremos en REVERSA para conservar la inyección de FILE_READ
+        # más reciente (con contenido completo) y reemplazar las anteriores
+        # del mismo path por un placeholder corto. Sin esto, el modelo ve
+        # 5 copias del contenido del archivo y eso refuerza el atractor de
+        # "lee más" en lugar de pasar a editar.
+        rev = []
+        for mm in reversed(messages_for_call):
+            role = mm.get("role")
+            content = mm.get("content") or ""
+            if role == "assistant":
+                if len(content.strip()) < 5:
+                    dropped_assist += 1
+                    continue
+            elif role == "system" and loop_path and content.startswith("[FILE_READ:"):
+                # ¿Es del path del bucle?
+                if loop_path in content.split("\n", 1)[0]:
+                    if kept_one_full_read:
+                        # Reemplazamos por un placeholder muy corto.
+                        rev.append({
+                            "role": "system",
+                            "content": (
+                                f"[FILE_READ: {loop_path}  (ya inyectado más "
+                                f"arriba; contenido omitido para romper el "
+                                f"reread_loop — usa la versión completa de la "
+                                f"primera inyección)]"
+                            ),
+                        })
+                        replaced_reads += 1
+                        continue
+                    else:
+                        kept_one_full_read = True
+            rev.append(mm)
+        filtered = list(reversed(rev))
+        if dropped_assist or replaced_reads:
+            messages_for_call = filtered
+            console.print(
+                f"[dim {CYAN}]› rompe-bucle: filtrados {dropped_assist} "
+                f"assistant vacíos + {replaced_reads} FILE_READ duplicado(s) "
+                f"colapsados · temp↑[/]"
+            )
+        stuck_overrides = {
+            "temperature": 0.7,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+        }
 
     # Compactación pre-envío: trunca resultados de comandos antiguos para
     # acelerar el prefill del modelo local. NO toca history en memoria.
     messages_for_call = _compact_messages_for_call(messages_for_call)
 
-    common_kwargs = dict(
-        model=model,
-        messages=messages_for_call,
-        temperature=0.1,
-        # Cinturón anti-bucle: tope duro de tokens + penalización de repetición.
-        max_tokens=4096,
-        frequency_penalty=0.4,
-        presence_penalty=0.2,
-        # Timeout per-request (segundos). Redundante con el del cliente pero
-        # blindamos por si la versión del SDK no lo propaga al streaming.
-        timeout=LLM_REQUEST_TIMEOUT,
-    )
+    # Kwargs base del perfil 'main' + overrides del rompe-bucle si los hay
+    # (sube temperature, apaga penalties). `model` se ignora aquí porque
+    # `_llm_kwargs` resuelve `get_active_model()` por su cuenta.
+    common_kwargs = _llm_kwargs("main", overrides=stuck_overrides)
+    common_kwargs["messages"] = messages_for_call
 
     if STREAM_MODEL_OUTPUT:
         answer = _ask_model_streaming(common_kwargs)
@@ -6021,9 +6545,12 @@ def ask_model(user_input):
     n_opens = len(_TARGET_UPDATE_OPEN_RE.findall(answer or ""))
     n_closes = len(_TARGET_UPDATE_CLOSE_RE.findall(answer or ""))
     if n_opens > n_closes:
+        # Escapamos `[[/TARGET_UPDATE]]` porque Rich interpreta `[[/...]]`
+        # como tag de cierre y dispara MarkupError.
+        close_tag = rich_escape("[[/TARGET_UPDATE]]")
         console.print(
             f"[dim]› ⚠ {n_opens - n_closes} bloque(s) TARGET_UPDATE sin "
-            f"`[[/TARGET_UPDATE]]` final · recuperados con cierre implícito[/]"
+            f"`{close_tag}` final · recuperados con cierre implícito[/]"
         )
 
     # Procesar bloques TARGET_UPDATE emitidos por el modelo
@@ -6040,24 +6567,73 @@ def ask_model(user_input):
             load_target(ACTIVE_TARGET)
 
     # ────────────────────────────────────────────────────────
-    # GUARDRAIL anti-promesa-vacía: el modelo dijo "modifico/cambio/..."
-    # pero NO emitió un bloque FILE_EDIT/FILE_WRITE para cumplir la promesa.
-    # Avisamos al operador con un panel rojo antes de procesar nada.
+    # GUARDRAIL unificado anti-edición-fallida. Cubre dos casos:
+    #   (a) malformed: el modelo escribió `[[FILE_EDIT:` o `[[FILE_WRITE:`
+    #       literal pero la sintaxis está rota → el regex no capta el bloque
+    #       entero → archivo NO modificado.
+    #   (b) prometida pero ausente: el modelo dijo en prosa "modifico/cambio/
+    #       actualizo…" pero no emitió bloque alguno.
+    # Emitimos UN solo panel — el caso (a) es más específico y tiene
+    # prioridad sobre el (b).
     # ────────────────────────────────────────────────────────
-    unfulfilled, snippet = _detect_unfulfilled_edit_promise(answer)
-    if unfulfilled:
+    edit_literals  = len(_FILE_EDIT_LITERAL_RE.findall(answer or ""))
+    edit_matches   = len(FILE_EDIT_PATTERN.findall(answer or ""))
+    write_literals = len(_FILE_WRITE_LITERAL_RE.findall(answer or ""))
+    write_matches  = len(FILE_WRITE_PATTERN.findall(answer or ""))
+    malformed_edit  = max(0, edit_literals  - edit_matches)
+    malformed_write = max(0, write_literals - write_matches)
+    if malformed_edit or malformed_write:
+        bits = []
+        if malformed_edit:
+            bits.append(f"{malformed_edit} FILE_EDIT")
+        if malformed_write:
+            bits.append(f"{malformed_write} FILE_WRITE")
+        edit_close = rich_escape("[[/FILE_EDIT]]")
+        edit_open  = rich_escape("[[FILE_EDIT: ruta]]")
+        old_open   = rich_escape("[[OLD]]")
+        old_close  = rich_escape("[[/OLD]]")
+        new_open   = rich_escape("[[NEW]]")
+        new_close  = rich_escape("[[/NEW]]")
+        write_kw   = rich_escape("[[FILE_WRITE:")
+        edit_kw    = rich_escape("[[FILE_EDIT:")
         console.print()
         console.print(Panel(
-            f"[bold {RED}]El modelo prometió un cambio en prosa pero NO emitió "
-            f"ningún bloque FILE_EDIT/FILE_WRITE para cumplirlo.[/]\n\n"
-            f"[{WHITE}]Snippet detectado:[/]\n"
-            f"  [dim]\"...{snippet}...\"[/]\n\n"
-            f"[bold]Qué hacer:[/] pídele explícitamente que [bold]"
-            f"emita el bloque FILE_EDIT[/] (o re-formula con `@archivo:L<a>-L<b>` "
-            f"para señalar dónde quieres el cambio).",
-            title=f"[bold {RED}]⚠ Promesa de edición sin cumplir[/]",
+            f"[bold {RED}]Bloque(s) malformado(s) detectado(s) · "
+            f"{', '.join(bits)}[/]\n\n"
+            f"[{WHITE}]El modelo emitió `{edit_kw}` / `{write_kw}` pero la "
+            f"sintaxis está rota (delimitadores inline, falta `{edit_close}`, "
+            f"o `<<<OLD/OLD>>>` mal cerrados). El archivo NO se ha "
+            f"modificado.[/]\n\n"
+            f"[bold]Qué hacer:[/] pídele que re-emita con el formato canónico "
+            f"(cada delimitador en su propia línea):\n"
+            f"  [dim]{edit_open}\n"
+            f"  {old_open}\n"
+            f"  contenido OLD\n"
+            f"  {old_close}\n"
+            f"  {new_open}\n"
+            f"  contenido NEW\n"
+            f"  {new_close}\n"
+            f"  {edit_close}[/]",
+            title=f"[bold {RED}]⚠ FILE_* mal formado — archivo NO modificado[/]",
             border_style=RED, box=ROUNDED, padding=(1, 2),
         ))
+    else:
+        # Solo chequeamos promesa-incumplida si NO había bloque malformado
+        # (evita doble panel sobre la misma respuesta).
+        unfulfilled, snippet = _detect_unfulfilled_edit_promise(answer)
+        if unfulfilled:
+            console.print()
+            console.print(Panel(
+                f"[bold {RED}]El modelo prometió un cambio en prosa pero NO emitió "
+                f"ningún bloque FILE_EDIT/FILE_WRITE para cumplirlo.[/]\n\n"
+                f"[{WHITE}]Snippet detectado:[/]\n"
+                f"  [dim]\"...{snippet}...\"[/]\n\n"
+                f"[bold]Qué hacer:[/] pídele explícitamente que [bold]"
+                f"emita el bloque FILE_EDIT[/] (o re-formula con `@archivo:L<a>-L<b>` "
+                f"para señalar dónde quieres el cambio).",
+                title=f"[bold {RED}]⚠ Promesa de edición sin cumplir[/]",
+                border_style=RED, box=ROUNDED, padding=(1, 2),
+            ))
 
     # ────────────────────────────────────────────────────────
     # Procesar bloques FILE_READ / FILE_EDIT / FILE_WRITE
@@ -6068,7 +6644,6 @@ def ask_model(user_input):
         answer = strip_file_blocks(answer)
 
     history.append({"role": "assistant", "content": answer})
-    save_session()
 
     if applied:
         _print_target_updates_panel(applied)
@@ -6078,13 +6653,20 @@ def ask_model(user_input):
     if file_results["read_messages"]:
         for msg in file_results["read_messages"]:
             history.append({"role": "system", "content": msg})
-        save_session()
 
     # Inyectar feedback de FILE_EDIT/WRITE al history (errores + confirmaciones)
     if file_results["op_summary"]:
         history.append({"role": "system", "content": file_results["op_summary"]})
-        save_session()
 
+    # Un solo save_session() al final cubre los 3 appends previos. Antes
+    # se llamaba tres veces consecutivas — innecesario.
+    save_session()
+
+    # NOTA: la antigua rama AUTO-FOLLOWUP (que llamaba a ask_model
+    # recursivamente cuando el modelo sólo leía) se eliminó. Su cobertura
+    # se solapa con `_detect_file_block_stuck_pattern(kind='reread_loop')`,
+    # que aplica el mismo nudge en el SIGUIENTE turno con filtrado de
+    # history + temperature override — más robusto y sin doble stream.
     return answer
 
 
@@ -6565,6 +7147,134 @@ def _check_tor_running():
         return False
 
 
+def _proxychains_socks_endpoint():
+    """Devuelve (host, port) del primer SOCKS/HTTP listado en
+    /etc/proxychains4.conf (o /etc/proxychains.conf) bajo [ProxyList].
+    None si no encuentra el archivo o no hay entrada válida.
+    """
+    for path in ("/etc/proxychains4.conf", "/etc/proxychains.conf"):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                in_proxylist = False
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.lower().startswith("[proxylist]"):
+                        in_proxylist = True
+                        continue
+                    if not in_proxylist:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0].lower() in (
+                        "socks5", "socks4", "http"
+                    ):
+                        try:
+                            return (parts[1], int(parts[2]))
+                        except ValueError:
+                            continue
+        except OSError:
+            continue
+    return None
+
+
+def _socks_alive(host, port):
+    """¿Hay algo escuchando en host:port? TCP connect_ex con timeout corto."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.4)
+        rc = s.connect_ex((host, int(port)))
+        s.close()
+        return rc == 0
+    except Exception:
+        return False
+
+
+def _check_proxychains_socks_alive():
+    """¿Está vivo el SOCKS configurado en proxychains? Devuelve
+    (alive, host, port). `alive` es None si no hay conf legible."""
+    endpoint = _proxychains_socks_endpoint()
+    if endpoint is None:
+        return (None, None, None)
+    host, port = endpoint
+    return (_socks_alive(host, port), host, port)
+
+
+# Tipos de SOCKS que el agente sabe levantar automáticamente.
+# Cada entrada: (host, port) → callable que lanza el listener y devuelve
+# (ok, mensaje). Si no hay handler para (host, port), el agente solo avisa.
+def _bring_up_tor():
+    """Arranca Tor con systemd. Requiere sudo cacheado o stored."""
+    rc, out, err = _sudo_run(
+        ["systemctl", "start", "tor"], timeout=20, allow_tty_fallback=False
+    )
+    if rc != 0:
+        return (False, f"systemctl start tor falló (rc={rc}): {err or out or 'sin output'}")
+    # Pequeña espera para que el listener aparezca.
+    for _ in range(10):
+        if _socks_alive("127.0.0.1", 9050):
+            return (True, "tor arriba en 127.0.0.1:9050")
+        time.sleep(0.3)
+    return (False, "tor arrancó pero 127.0.0.1:9050 sigue sin responder")
+
+
+def _bring_up_ssh_chain_9090():
+    """Levanta el túnel SSH-chain 3-hop hacia SOCKS local 9090. Usa el script
+    scripts/tunnel_9090_up.sh del workspace, que es idempotente."""
+    script = os.path.join(WORKSPACE, "scripts", "tunnel_9090_up.sh")
+    if not os.path.isfile(script):
+        return (False, f"falta el script {script}")
+    try:
+        proc = subprocess.run(
+            ["bash", script],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, "timeout esperando que el túnel levante (30s)")
+    except Exception as e:
+        return (False, f"error ejecutando script: {e}")
+    if proc.returncode == 0 and _socks_alive("127.0.0.1", 9090):
+        return (True, "túnel SSH-chain arriba en 127.0.0.1:9090")
+    err = (proc.stderr or proc.stdout or "").strip()
+    return (False, f"el script no levantó el túnel (rc={proc.returncode}): {err[:300]}")
+
+
+_SOCKS_AUTOSTART_HANDLERS = {
+    ("127.0.0.1", 9050): _bring_up_tor,
+    ("127.0.0.1", 9090): _bring_up_ssh_chain_9090,
+}
+
+
+def _try_autostart_proxychains_socks():
+    """Si proxychains apunta a un SOCKS que sabemos levantar y está caído,
+    intentamos levantarlo. Devuelve un dict con el resultado para que el
+    caller lo muestre al operador.
+    Posibles `status`:
+      - 'no_conf'  → no hay /etc/proxychains4.conf legible
+      - 'alive'    → el SOCKS ya está vivo, no se hizo nada
+      - 'started'  → estaba caído, se ha levantado con éxito
+      - 'unhandled'→ caído pero no tenemos handler para ese endpoint
+      - 'failed'   → caído, intentamos levantarlo y falló
+    """
+    endpoint = _proxychains_socks_endpoint()
+    if endpoint is None:
+        return {"status": "no_conf"}
+    host, port = endpoint
+    if _socks_alive(host, port):
+        return {"status": "alive", "host": host, "port": port}
+    handler = _SOCKS_AUTOSTART_HANDLERS.get((host, port))
+    if handler is None:
+        return {"status": "unhandled", "host": host, "port": port}
+    ok, msg = handler()
+    return {
+        "status": "started" if ok else "failed",
+        "host": host, "port": port, "msg": msg,
+    }
+
+
 def classify_command(command):
     import re
 
@@ -6614,23 +7324,87 @@ def classify_command(command):
     return "intrusive"
 
 
+# Fallback: el modelo a veces escribe la corrección en prosa
+# ("Comando corregido: <cmd>", "Comando propuesto: <cmd>", …) en lugar del
+# bloque canónico `COMANDO:`. Sin esto, extract_command devolvía None y el
+# comando corregido NUNCA se aplicaba (autopilot lo leía como "sin fix
+# viable" y cortaba; el loop principal no proponía nada). Sólo disparamos
+# con una palabra-señal fuerte (corregido/propuesto/…) para no capturar
+# prosa tipo "Comando ejecutado:" o un "Comando:" suelto de un resumen.
+_COMMAND_FALLBACK_RE = re.compile(
+    r"(?im)^[\s>*_#`-]*comando\s+"
+    r"(?:corregido|propuesto|sugerido|correcto|final|alternativo|definitivo)"
+    r"[\s*_`]*:\s*(.+?)\s*$"
+)
+
+
+def _clean_fallback_command(cmd):
+    """Limpia el comando capturado en prosa: quita negrita/cursiva markdown
+    y backticks envolventes que el modelo a veces añade."""
+    cmd = cmd.strip().strip("*_ ").strip()
+    if len(cmd) > 1 and cmd.startswith("`") and cmd.endswith("`"):
+        cmd = cmd[1:-1]
+    return cmd.strip("`").strip()
+
+
 def extract_command(answer):
+    if not answer:
+        return None
+
     marker = "COMANDO:"
 
-    if marker not in answer:
+    if marker in answer:
+        command_block = answer.split(marker, 1)[1].strip()
+        if not command_block:
+            return None
+        command = command_block.splitlines()[0].strip()
+        if command.startswith("```"):
+            return None
+        return command
+
+    # Sin marcador canónico: intentamos la variante en prosa.
+    m = _COMMAND_FALLBACK_RE.search(answer)
+    if m:
+        command = _clean_fallback_command(m.group(1))
+        if command and not command.startswith("```"):
+            return command
+
+    return None
+
+
+# Regex para capturar el bloque "POR QUÉ:" que precede a un "COMANDO:".
+# Acepta variantes ortográficas: "POR QUÉ", "POR QUE", "POR QUÉ:" "Por qué:"
+# Captura todo el cuerpo (hasta línea en blanco o COMANDO:).
+_RATIONALE_BLOCK_RE = re.compile(
+    r"(?:^|\n)\s*POR\s+QU[EÉ]\s*:\s*\n(.*?)(?=\n\s*\n|\n\s*COMANDO\s*:|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_rationale(answer):
+    """Devuelve el texto del bloque POR QUÉ: que precede al COMANDO: (o None
+    si no hay). Usado para destacar visualmente la justificación al
+    operador antes de pedirle confirmación del comando."""
+    if not answer:
         return None
-
-    command_block = answer.split(marker, 1)[1].strip()
-
-    if not command_block:
+    m = _RATIONALE_BLOCK_RE.search(answer)
+    if not m:
         return None
+    body = m.group(1).strip()
+    return body if body else None
 
-    command = command_block.splitlines()[0].strip()
 
-    if command.startswith("```"):
-        return None
+# Rationale extraído del último answer del modelo — lo pinta `run_command`
+# justo antes del panel "Comando propuesto" para que el operador vea POR QUÉ
+# se le está pidiendo ese comando antes de autorizar.
+_LAST_PROPOSED_RATIONALE = None
 
-    return command
+
+def remember_command_rationale(answer):
+    """Guarda el bloque POR QUÉ extraído del answer para que run_command
+    lo pueda renderizar antes del panel del comando propuesto."""
+    global _LAST_PROPOSED_RATIONALE
+    _LAST_PROPOSED_RATIONALE = extract_rationale(answer)
 
 
 # Detección de herramienta faltante en stderr. Cubre:
@@ -7799,6 +8573,68 @@ def _handle_agent_meta_action(fix_cmd):
     return None
 
 
+# Comandos que el autopilot intentó resolver pero NO pudo. Sirve para
+# nudge al modelo en el siguiente turno: "ya probaste X 5 veces, no lo
+# propongas otra vez". Limitamos a los últimos N para no acumular.
+_AUTOPILOT_BURNED_COMMANDS = []  # list[(normalized_cmd, raw_cmd)]
+_AUTOPILOT_BURNED_MAX = 8
+
+
+def _normalize_cmd_for_compare(c):
+    """Colapsa whitespace para comparar dos comandos equivalentes."""
+    return " ".join((c or "").split())
+
+
+def _remember_burned_command(raw_cmd):
+    """Recuerda un comando que el autopilot no pudo resolver tras N intentos."""
+    norm = _normalize_cmd_for_compare(raw_cmd)
+    if not norm:
+        return
+    # Dedupe
+    _AUTOPILOT_BURNED_COMMANDS[:] = [
+        (n, r) for (n, r) in _AUTOPILOT_BURNED_COMMANDS if n != norm
+    ]
+    _AUTOPILOT_BURNED_COMMANDS.append((norm, raw_cmd))
+    while len(_AUTOPILOT_BURNED_COMMANDS) > _AUTOPILOT_BURNED_MAX:
+        _AUTOPILOT_BURNED_COMMANDS.pop(0)
+
+
+def _is_burned_command(raw_cmd):
+    """¿Está este comando en la lista de quemados? Devuelve el raw o None."""
+    norm = _normalize_cmd_for_compare(raw_cmd)
+    for (n, r) in _AUTOPILOT_BURNED_COMMANDS:
+        if n == norm:
+            return r
+    return None
+
+
+def _is_benign_nonzero_rc(command, rc):
+    """rc != 0 que NO debería disparar autopilot. Casos:
+      - grep/egrep/fgrep/rgrep/zgrep rc=1 → no match (info válida, no error).
+      - test / [ rc=1 → condición falsa.
+      - diff rc=1 → diferencias detectadas (esperado).
+    El check se aplica al último segmento del último pipe (lo que decide
+    el rc final en bash).
+    """
+    if rc != 1:
+        return False
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    last_segment = cmd.rsplit("|", 1)[-1].strip()
+    # Quitamos posibles redirecciones para quedarnos con el binario.
+    last_segment = last_segment.split(">", 1)[0].strip()
+    if not last_segment:
+        return False
+    first_token = last_segment.split()[0]
+    if "/" in first_token:
+        first_token = first_token.rsplit("/", 1)[-1]
+    return first_token in (
+        "grep", "egrep", "fgrep", "rgrep", "zgrep",
+        "test", "[", "diff",
+    )
+
+
 def troubleshoot_loop(failed_command, failed_output):
     """Bucle de auto-fix sin confirmación.
 
@@ -7938,6 +8774,47 @@ def troubleshoot_loop(failed_command, failed_output):
             })
             break
 
+        # Rechazo de "fix" idéntico al comando que falla. Si el modelo
+        # propone re-ejecutar lo mismo sin cambios, NO es un fix — es
+        # bucle. Cortamos el autopilot en seco para que el operador
+        # vea el panel "sin resolver" y el modelo pase al análisis.
+        if _normalize_cmd_for_compare(fix_cmd) == _normalize_cmd_for_compare(failed_command):
+            console.print()
+            console.print(Panel(
+                f"[bold {RED}]Fix idéntico al comando que falla[/]\n\n"
+                f"[{WHITE}]El modelo propuso re-ejecutar el mismo comando "
+                f"sin cambios. Eso no es un fix — es un bucle. Cierro el "
+                f"autopilot aquí para que el modelo replantee.[/]\n\n"
+                f"[dim]{rich_escape(fix_cmd)}[/dim]",
+                title=f"[bold {RED}]⚠ Autopilot — bucle de fix idéntico[/]",
+                border_style=RED, box=ROUNDED, padding=(1, 2),
+            ))
+            attempts.append({
+                "attempt": attempt, "fix": fix_cmd,
+                "note": "fix idéntico al comando original — autopilot cortado",
+            })
+            break
+
+        # Rechazo del MISMO fix dos veces consecutivas (sin que el primero
+        # haya resuelto). Si el modelo no aprende, no merece más intentos.
+        if attempts:
+            last = attempts[-1]
+            last_fix = last.get("fix") if isinstance(last, dict) else None
+            if last_fix and _normalize_cmd_for_compare(fix_cmd) == _normalize_cmd_for_compare(last_fix):
+                console.print()
+                console.print(Panel(
+                    f"[bold {RED}]Fix repetido sin cambios[/]\n\n"
+                    f"[{WHITE}]El modelo propone el mismo fix que el intento "
+                    f"anterior. Cierro el autopilot — necesita replantear.[/]",
+                    title=f"[bold {RED}]⚠ Autopilot — fix repetido[/]",
+                    border_style=RED, box=ROUNDED, padding=(1, 2),
+                ))
+                attempts.append({
+                    "attempt": attempt, "fix": fix_cmd,
+                    "note": "fix repetido respecto al intento anterior — autopilot cortado",
+                })
+                break
+
         # ¿Es una meta-acción del agente? Si sí, manejarla aquí sin lanzar shell.
         meta = _handle_agent_meta_action(fix_cmd)
         is_meta = meta is not None
@@ -8041,6 +8918,15 @@ def troubleshoot_loop(failed_command, failed_output):
         # failed_command para la siguiente iteración (el fix se centra en ella).
         if is_chain and first_failing_part:
             failed_command = first_failing_part
+
+    # Si llegamos aquí, el autopilot agotó intentos sin resolver. Marcamos
+    # el comando original como "quemado" — en futuros turnos, si el modelo
+    # lo vuelve a proponer literal, le metemos un nudge para que cambie de
+    # enfoque en lugar de re-intentar lo mismo.
+    _remember_burned_command(failed_command)
+    if is_chain and original_chain:
+        # También el original entero, por si el modelo lo encadena de nuevo.
+        _remember_burned_command(" && ".join(original_chain))
 
     return {
         "resolved": False,
@@ -8227,15 +9113,44 @@ def run_command(command, auto=False):
         effective_command, proxy_used = maybe_wrap_with_proxy(command)
     proxy_note = ""
     if proxy_used:
-        if proxy_used in ("proxychains4", "proxychains") and not _check_tor_running():
-            proxy_note = (
-                f"\n[bold {RED}]⚠ {proxy_used} configurado pero no se detecta "
-                f"Tor escuchando en 127.0.0.1:9050.[/] "
-                f"Arranca con [bold]sudo systemctl start tor[/] o el comando "
-                f"fallará al conectar."
-            )
+        if proxy_used in ("proxychains4", "proxychains"):
+            autostart = _try_autostart_proxychains_socks()
+            st = autostart["status"]
+            if st == "alive":
+                proxy_note = (
+                    f"\n[dim]→ enrutado vía [bold]{proxy_used}[/] "
+                    f"(SOCKS {autostart['host']}:{autostart['port']} OK)[/]"
+                )
+            elif st == "started":
+                proxy_note = (
+                    f"\n[bold {GREEN}]✓ {proxy_used}: SOCKS levantado "
+                    f"automáticamente[/] · {autostart['msg']}"
+                )
+            elif st == "no_conf":
+                proxy_note = (
+                    f"\n[bold {RED}]⚠ {proxy_used} activo pero "
+                    f"/etc/proxychains4.conf no se encuentra/legible.[/] "
+                    f"El comando probablemente fallará."
+                )
+            elif st == "unhandled":
+                h, p = autostart["host"], autostart["port"]
+                proxy_note = (
+                    f"\n[bold {RED}]⚠ {proxy_used} apunta a SOCKS {h}:{p} "
+                    f"pero NADIE escucha ahí.[/] El comando fallará con rc=7. "
+                    f"Opciones: [bold]proxy off[/] para ir directo, "
+                    f"[bold]agent:noproxy <cmd>[/] para bypass single-shot, "
+                    f"o levanta un listener en {h}:{p} y reintenta."
+                )
+            else:  # 'failed'
+                h, p = autostart["host"], autostart["port"]
+                proxy_note = (
+                    f"\n[bold {RED}]⚠ {proxy_used}: SOCKS {h}:{p} caído y el "
+                    f"auto-arranque falló:[/] {autostart.get('msg', '?')}\n"
+                    f"[dim]El comando fallará. Usa [bold]agent:noproxy <cmd>[/] "
+                    f"o [bold]proxy off[/] como bypass.[/]"
+                )
         else:
-            proxy_note = f"\n[dim]→ enrutado vía [bold]{proxy_used}[/] (Tor)[/]"
+            proxy_note = f"\n[dim]→ enrutado vía [bold]{proxy_used}[/][/]"
 
     auto_tag = f"\n[bold {ORANGE}]» AUTOPILOT — sin confirmación[/]" if auto else ""
 
@@ -8244,11 +9159,23 @@ def run_command(command, auto=False):
     _remember_proposed_command(command)
     copy_hint = f"\n[dim]   📋 escribe [bold]copy[/] (o [bold]c[/]) para copiar este comando al portapapeles[/]"
 
+    # Aviso si el comando está en la lista de "quemados" por el autopilot
+    # (lo intentó 5 veces sin éxito). Para que el operador NO lo apruebe
+    # otra vez por inercia, y para que el panel deje claro el bucle.
+    burned_note = ""
+    if _is_burned_command(command) and not auto:
+        burned_note = (
+            f"\n[bold {RED}]⚠ QUEMADO:[/] el autopilot ya intentó este "
+            f"comando hasta 5 veces sin éxito. Re-ejecutarlo no aporta "
+            f"info nueva; cancela con [bold]N[/] y pide al modelo otro "
+            f"enfoque."
+        )
+
     _q_print()
     _q_print(Panel(
         f"[bold {ORANGE}]📋 Comando propuesto[/bold {ORANGE}] "
         f"[bold {color}]· {label}[/]\n\n[{WHITE}]{command}[/]"
-        f"{proxy_note}{auto_tag}{copy_hint}",
+        f"{proxy_note}{burned_note}{auto_tag}{copy_hint}",
         border_style=color,
         box=ROUNDED
     ))
@@ -9859,11 +10786,12 @@ def main():
             old_s = "\n".join(old_lines)
             new_s = "\n".join(new_lines)
             # Reutilizamos el wire-up del modelo: construimos un answer "ficticio"
-            # con el bloque FILE_EDIT y lo procesamos.
+            # con el bloque FILE_EDIT (formato V2 — el único soportado) y lo
+            # procesamos.
             synthetic = (
                 f"[[FILE_EDIT: {path}]]\n"
-                f"<<<OLD\n{old_s}\nOLD>>>\n"
-                f"<<<NEW\n{new_s}\nNEW>>>\n"
+                f"[[OLD]]\n{old_s}\n[[/OLD]]\n"
+                f"[[NEW]]\n{new_s}\n[[/NEW]]\n"
                 f"[[/FILE_EDIT]]"
             )
             process_file_blocks(synthetic)
@@ -10094,7 +11022,7 @@ def main():
                         f"[bold]Goal:[/] {gr.goal}\n"
                         f"[bold]Estado:[/] [{status_color}]{gr.status}[/]  ·  "
                         f"Fase: {gr.current_phase}/{gr.max_phases}\n"
-                        f"[bold]Target:[/] [bold {PURPLE}]{gr.target}[/]  ·  "
+                        f"[bold]Target:[/] [bold {PURPLE}]{gr.target or '(ninguno — modo ad-hoc)'}[/]  ·  "
                         f"Started: {gr.started_at}\n"
                         f"[bold]Subagentes por fase:[/] "
                         + " · ".join(
@@ -10250,7 +11178,7 @@ def main():
                     f"[bold {GREEN}]✓ Goal lanzado · id {goal_run.id}[/]\n\n"
                     f"[bold {WHITE}]Goal:[/] {goal_run.goal[:300]}"
                     f"{'…' if len(goal_run.goal) > 300 else ''}\n"
-                    f"[bold {WHITE}]Target:[/] {goal_run.target}\n"
+                    f"[bold {WHITE}]Target:[/] {goal_run.target or '(ninguno — modo ad-hoc)'}\n"
                     f"[bold {WHITE}]Max fases:[/] {goal_run.max_phases}  ·  "
                     f"[bold {WHITE}]Max subagentes por fase:[/] "
                     f"{MAX_CONCURRENT_SUBAGENTS}\n\n"
@@ -10832,6 +11760,7 @@ def main():
             answer = ask_model(effective_input)
 
             command = extract_command(answer)
+            remember_command_rationale(answer)
 
             if command:
                 # run_command muestra el panel con el comando propuesto, luego
@@ -10863,9 +11792,13 @@ def main():
 
                 # AUTOPILOT de troubleshooting: si el comando falló y el modo
                 # está activo, entrar al bucle de auto-fix antes de pasar al
-                # análisis del modelo.
+                # análisis del modelo. Excepción: rc=1 de grep / test / diff
+                # NO es error — es información válida ("sin coincidencias",
+                # "condición falsa", "hay diferencias"). Disparar autopilot
+                # ahí mete al modelo en un bucle de reintento sin sentido.
                 if (TROUBLESHOOT_AUTOPILOT
-                        and first_rc != 0 and first_rc != -1):
+                        and first_rc != 0 and first_rc != -1
+                        and not _is_benign_nonzero_rc(command, first_rc)):
                     ts_outcome = troubleshoot_loop(command, result)
                     _print_troubleshoot_summary(ts_outcome)
                     # Reemplazamos el `result` que va al análisis con el
@@ -10951,11 +11884,25 @@ def main():
             print()
             continue
         except Exception as e:
-            console.print(Panel(
-                f"[bold {RED}]Error:[/bold {RED}] {e}",
-                border_style=RED,
-                box=ROUNDED
-            ))
+            # Escapamos {e} y el traceback porque pueden contener `[...]`
+            # literal (p. ej. `[/FILE_EDIT]` emitido por el modelo) que
+            # Rich interpretaría como markup y dispararía MarkupError
+            # DENTRO del handler de errores, matando el REPL.
+            import traceback
+            err_safe = rich_escape(str(e))
+            tb_safe = rich_escape(traceback.format_exc())
+            try:
+                console.print(Panel(
+                    f"[bold {RED}]Error:[/bold {RED}] {err_safe}\n\n"
+                    f"[dim]{tb_safe}[/dim]",
+                    border_style=RED,
+                    box=ROUNDED,
+                ))
+            except Exception:
+                # Última red de seguridad: si incluso esto falla, escribimos
+                # raw a stderr y seguimos vivos.
+                sys.stderr.write(f"\n[Error fatal del REPL] {e}\n{traceback.format_exc()}\n")
+                sys.stderr.flush()
 
 
 if __name__ == "__main__":
