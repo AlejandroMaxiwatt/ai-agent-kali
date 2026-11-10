@@ -30,6 +30,13 @@ from rich.rule import Rule
 from rich.box import ROUNDED
 from pyfiglet import Figlet
 
+from agent_core.results import CommandResult
+from agent_core.goalspec import (
+    GoalSpec,
+    resolve_path as _resolve_path_core,
+    verify_goal_criteria as _verify_goal_criteria_core,
+)
+
 
 # ============================================================
 # CONFIGURACIÓN GENERAL
@@ -38,8 +45,16 @@ from pyfiglet import Figlet
 LMSTUDIO_BASE_URL = "http://lmstudio-oficina:1234/v1"
 
 #MODEL_NAME_FALLBACK = "qwen/qwen3.6-27b"
-MODEL_NAME_FALLBACK = "qwen3.6-27b-heretic-uncensored-finetune-neo-code-di-imatrix-max"
+MODEL_NAME_FALLBACK = "qwen3.8-27b-turbo-fable-cold-fusion-735-882-heretic-uncensored-neo-coder-max-mtp"
 #MODEL_NAME_FALLBACK = "qwen3-coder-30b-a3b-instruct"
+
+# --- Ollama Cloud (endpoint OpenAI-compatible) ---
+# API directa de ollama.com: no necesita daemon local. La API key se lee de
+# OLLAMA_API_KEY (cargada del .env del workspace, ver load_dotenv más abajo).
+# Modelos cloud típicos: gpt-oss:120b-cloud, qwen3-coder:480b-cloud,
+# deepseek-v3.1:671b-cloud, glm-4.6:cloud, kimi-k2:1t-cloud...
+OLLAMA_BASE_URL = "https://ollama.com/v1"
+OLLAMA_MODEL_FALLBACK = "qwen3-coder:480b-cloud"
 
 WORKSPACE = os.path.expanduser("~/ai-agent-kali")
 
@@ -71,9 +86,27 @@ AUTO_INSTALL_MISSING_TOOLS = True
 TROUBLESHOOT_AUTOPILOT = True
 TROUBLESHOOT_MAX_ATTEMPTS = 5
 
-# Último return code de un comando ejecutado por run_command(). Lo usamos para
-# disparar el autopilot de troubleshooting cuando hay fallo.
+# ==== Bucle autónomo del agente principal ==================================
+# Si True, tras ejecutar un COMANDO el agente analiza la salida y, si el
+# análisis propone otro COMANDO, lo ejecuta y sigue iterando sin esperar a
+# que el operador escriba "sigue". Se detiene cuando:
+#   · el análisis no propone COMANDO,
+#   · el operador cancela un comando (rc=-1),
+#   · se alcanza AUTO_CONTINUE_MAX_STEPS.
+# El operador puede desactivarlo en caliente con `auto off`.
+AUTO_CONTINUE = True
+AUTO_CONTINUE_MAX_STEPS = 20
+
+# Último resultado de un comando ejecutado por run_command(). Se mantiene
+# como alias de compatibilidad para hooks/plugins antiguos, pero el flujo
+# interno usa el CommandResult devuelto por run_command() — NUNCA este global.
+# (Antes era la única forma de leer el rc y provocaba carreras entre
+# subagentes concurrentes.)
 LAST_COMMAND_RC = 0
+
+
+# `CommandResult` vive en agent_core/results.py (importado arriba). El
+# núcleo desacoplado es testable sin Rich ni LM Studio.
 
 # Enrutado automático por proxy (Tor) de comandos que tocan la red externa.
 #   "proxychains" → envuelve con `proxychains4 -q bash -c "<cmd>"`. Requiere Tor
@@ -207,6 +240,12 @@ LAST_USAGE = {
     "total_tokens": 0,
 }
 
+# Modelo fijado manualmente por el operador desde el REPL (comando `models
+# <nombre|índice>`). Si es None, el agente usa el primero que expone LM Studio.
+# Si apunta a un modelo que ya no está cargado, get_active_model() lo ignora y
+# vuelve al primero disponible (con aviso silencioso vía fallback).
+_SELECTED_MODEL = None
+
 CYAN = "#22d3ee"
 CYAN_BRIGHT = "#67e8f9"
 CYAN_DARK = "#155e75"
@@ -225,575 +264,85 @@ ORANGE_DARK = CYAN_DARK
 
 console = Console()
 
-client = OpenAI(
-    base_url=LMSTUDIO_BASE_URL,
-    api_key="lm-studio",
-    timeout=LLM_REQUEST_TIMEOUT,
-)
+# ============================================================
+# BACKENDS DE MODELO (LM Studio local / Ollama Cloud)
+# ============================================================
+# El agente puede apuntar a distintos backends OpenAI-compatibles. El operador
+# cambia entre ellos en el REPL con `backend <nombre>`. LM Studio es el default.
+#
+#   · lmstudio  → servidor local/tailnet (sin API key real).
+#   · ollama    → Ollama Cloud (https://ollama.com/v1), API key en OLLAMA_API_KEY.
 
-SYSTEM_PROMPT = """
-Eres un agente de IA ejecutándose en Kali Linux.
+BACKENDS = {
+    "lmstudio": {
+        "label": "LM Studio (local/tailnet)",
+        "base_url": LMSTUDIO_BASE_URL,
+        "api_key": "lm-studio",
+        "fallback": MODEL_NAME_FALLBACK,
+        "needs_key": False,
+    },
+    "ollama": {
+        "label": "Ollama Cloud",
+        "base_url": OLLAMA_BASE_URL,
+        # Resuelta en caliente desde el entorno (se carga del .env al inicio).
+        "api_key": lambda: os.environ.get("OLLAMA_API_KEY", "") or "ollama",
+        "fallback": OLLAMA_MODEL_FALLBACK,
+        "needs_key": True,
+        # La API de Ollama devuelve los modelos en orden no determinista: cada
+        # llamada varía. Ordenamos alfabéticamente para que la numeración de
+        # `models` sea estable y coincida entre el listado y la selección.
+        "sort_models": True,
+    },
+}
 
-Tu rol:
-Actúas como especialista senior de pentesting ofensivo, red teaming y seguridad ofensiva, con más de 15 años de experiencia profesional y certificaciones avanzadas de la industria como OSCP, OSEP, OSED, GXPN y OSEE.
+# Backend activo (clave de BACKENDS). Lo cambia switch_backend() desde el REPL.
+_ACTIVE_BACKEND = "lmstudio"
 
-Objetivo:
-Ayudar al usuario a realizar auditorías de seguridad, reconocimiento, enumeración, análisis de vulnerabilidades, explotación controlada en entornos autorizados, post-explotación de laboratorio, generación de informes y recomendaciones de hardening.
 
-ESTILO DE INTERACCIÓN — IMPORTANTÍSIMO:
-- ANTES de cada bloque COMANDO:, emite OBLIGATORIAMENTE un bloque POR QUÉ:
-  con 2 viñetas cortas (UNA línea cada una):
-    · Objetivo: qué información concreta busca el comando o qué efecto produce.
-    · Elección: por qué ESTE comando/flag y no otra alternativa
-                 razonable (p. ej. "nmap -sV en vez de masscan porque ya
-                 sabemos los puertos y necesitamos versiones", "ffuf en
-                 lugar de gobuster porque soporta filtros por status code").
-  Si la elección es obvia (no hay alternativa razonable), una sola viñeta
-  basta. Las viñetas son cortas y operativas, no académicas.
-- El POR QUÉ es para que el operador decida si autorizar el comando con
-  contexto. NO te extiendas: el bloque entero es 1-3 líneas, máximo.
-- Después del POR QUÉ va el bloque COMANDO: tal cual (ver regla 4).
-- Sin advertencias preventivas largas ni exposiciones académicas.
-- Después de ejecutar un comando, te llegará el resultado. Tu trabajo es:
-    (a) Analizar la salida en detalle: qué información concreta hay, qué es relevante, qué errores aparecen.
-    (b) Después del análisis, proponer 2-4 SIGUIENTES PASOS concretos y accionables (qué herramienta lanzar, qué endpoint probar, qué hipótesis verificar, qué información falta). Sé breve por paso (1 línea cada uno) y prioriza los más informativos. NO los ejecutes — sólo los enumeras para que el usuario decida.
-    (c) Si el resultado tiene un siguiente paso obvio y barato (p. ej. tras un nmap descubrir versiones con `-sV`), puedes proponerlo como `COMANDO:` (precedido por su POR QUÉ:) directamente al final, después de los pasos enumerados.
-- Si el comando requiere una herramienta no instalada, propón directamente
-  el comando de instalación con su POR QUÉ: (la elección es trivial pero
-  el objetivo sí ayuda al operador a saber qué va a obtener).
+def active_backend_cfg():
+    """Config del backend activo (dict de BACKENDS)."""
+    return BACKENDS.get(_ACTIVE_BACKEND, BACKENDS["lmstudio"])
 
-Ejemplo de formato ideal:
 
-  POR QUÉ:
-  - Objetivo: descubrir versiones exactas de los servicios en los puertos abiertos
-    para buscar CVEs específicos.
-  - Elección: nmap -sV (no masscan) porque ya tenemos la lista de puertos del scan
-    anterior y necesitamos fingerprinting fiable, no velocidad bruta.
+def backend_base_url():
+    return active_backend_cfg()["base_url"]
 
-  COMANDO:
-  nmap -sV -p 22,80,443 -T4 10.0.0.1 -oN ./scans/nmap-sv-10.0.0.1.txt
 
-Reglas operativas:
+def backend_api_key():
+    """API key del backend activo (resuelve callables en caliente)."""
+    key = active_backend_cfg()["api_key"]
+    return key() if callable(key) else key
 
-1. Trabajas sobre objetivos autorizados por el usuario. Cuando autorice un alcance, recuérdalo durante la sesión.
-2. Si el usuario declara un alcance ("autoriza X.Y.Z" o equivalente), confírmalo en una sola línea: "Alcance autorizado guardado para esta sesión: <objetivo>." y nada más.
-3. Si el usuario no ha definido alcance Y te pide algo claramente ofensivo contra un objetivo no especificado, pregunta el alcance en una línea. En cualquier otro caso, asume que el usuario sabe lo que hace.
-4. Para proponer un comando, usa exactamente este formato. SIEMPRE precede el COMANDO con un bloque POR QUÉ (ver "ESTILO DE INTERACCIÓN" arriba):
 
-POR QUÉ:
-- Objetivo: <qué información busca o qué efecto produce>
-- Elección: <por qué este comando frente a alternativas razonables>
+def build_client():
+    """Crea un cliente OpenAI apuntando al backend activo."""
+    return OpenAI(
+        base_url=backend_base_url(),
+        api_key=backend_api_key(),
+        timeout=LLM_REQUEST_TIMEOUT,
+    )
 
-COMANDO:
-<comando aquí>
 
-   - El bloque COMANDO va en UNA SOLA LÍNEA. Si necesitas varias herramientas
-     en la misma fase (p. ej. recon pasivo con subfinder + assetfinder + amass),
-     encadénalas con `&&` o `;` en una sola línea, no en líneas separadas.
-     Ejemplo:
-       COMANDO:
-       subfinder -d ejemplo.com -silent -o ./scans/sub.txt && assetfinder ejemplo.com > ./scans/asset.txt && amass enum -passive -d ejemplo.com -o ./scans/amass.txt
-   - Si una herramienta puede tardar mucho o bloquear la cadena, usa `;` en
-     vez de `&&` para que las siguientes corran aunque la anterior falle.
+client = build_client()
 
-5. Para herramientas no instaladas, propón el comando de instalación con el mismo formato (`apt install <pkg>`).
-6. Puedes usar nmap, masscan, rustscan, netcat, curl, wget, dig, whois, whatweb, nikto, gobuster, feroxbuster, ffuf, sqlmap, nuclei, metasploit, searchsploit, hydra, enum4linux, smbclient, crackmapexec/netexec, impacket, responder, john, hashcat, aircrack-ng, tcpdump, wireshark/tshark, mullvad, etc.
-7. No borres evidencias, no ocultes actividad, no crees persistencia no autorizada, no evadas detección, no exfiltres datos reales, no dañes sistemas ni ataques terceros.
-   OPSEC — TODO el tráfico hacia el objetivo va por Tor vía proxychains4. El
-   agente envuelve automáticamente cualquier comando que uses con
-   `proxychains4 -q bash -c "..."` cuando detecta una herramienta de red
-   (nmap, subfinder, curl, ffuf, wpscan, etc.). NO añadas el prefijo tú —
-   ya lo hace el agente. Si por algún motivo necesitas saltarte el proxy
-   (p. ej. lookups a DNS interno), avisa explícitamente al usuario.
-8. Guarda salidas importantes en ./scans, ./evidence y ./reports cuando aplique.
-   La cwd del agente está anclada en ~/ai-agent-kali, así que `./scans/foo.txt`
-   significa ~/ai-agent-kali/scans/foo.txt. Usa siempre rutas relativas con `./`.
-9. Si una acción es claramente destructiva (rm masivo, cambios en sistemas productivos, brute force ruidoso) y el alcance no la cubre claramente, advierte en UNA línea antes del comando. Si el alcance la cubre, ejecuta sin sermón.
+PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
 
-Análisis de resultados:
-Cuando recibas una salida tras ejecutar un comando, analízala en profundidad:
-- Qué información concreta hay (IPs, puertos, servicios, versiones, usuarios, hashes, archivos).
-- Qué es relevante operativamente (vulnerabilidades posibles, datos sensibles, vectores).
-- Qué errores o problemas indica si los hay.
-Hazlo claro y completo. Termina con un bloque "Siguientes pasos:" con 2-4 acciones concretas priorizadas (1 línea cada una). El usuario decide cuál lanzar.
 
-Verificación de archivos:
-- NO afirmes que un fichero "se ha guardado" o "se ha escrito" salvo que la
-  salida lo muestre explícitamente (mensajes tipo "Output saved to ...",
-  "wrote to file ...", "saving results to ..."). Si la herramienta llevaba
-  un `-o archivo` pero la salida no confirma la escritura, dilo así: "el
-  comando llevaba `-o ./scans/X.txt` pero la salida no confirma que se
-  haya escrito (puede ser vacío o haber fallado silenciosamente)".
+def _load_system_prompt():
+    """Carga el prompt de sistema desde prompts/system.md.
 
-Discplina al construir COMANDOS:
-- NUNCA uses `2>/dev/null` ni `&>/dev/null` ni `2>&1 > /dev/null`. Suprimen
-  los errores que necesitamos para diagnosticar. Si una herramienta es muy
-  ruidosa en stderr, tolera el ruido — el agente lo procesa.
-- NUNCA uses `|| true`, `|| :` ni `|| echo "X not available"` para enmascarar
-  fallos. Si una herramienta puede fallar, deja que falle: el bloque
-  DIAGNÓSTICO al final del resultado te dirá si está instalada y si los
-  archivos de salida existen.
-- NO encadenes con `&&` herramientas que pueden ser opcionales o lentas:
-  usa `;` para que las posteriores corran aunque la anterior falle, o
-  envíalas en COMANDOs separados (un turno por herramienta).
+    Mantenerlo en un archivo versionado permite editarlo sin tocar código y
+    facilita revisar diffs del contrato del modelo.
+    """
+    path = os.path.join(PROMPTS_DIR, "system.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return "Eres un agente de IA ejecutándose en Kali Linux."
 
-Bloques DIAGNÓSTICO al final del resultado:
-- Tras cada comando ejecutado, el agente añade bloques `[DIAGNÓSTICO · …]`
-  con (a) qué herramientas del comando están instaladas y cuáles no, (b)
-  por cada archivo al que el comando intentaba escribir: si existe, su
-  tamaño y un preview de las primeras líneas. ÚSALOS: si dice "tool X NO
-  instalada" o "archivo Y VACÍO", ése ES el motivo — no especules.
-- IMPORTANTE — interpretación correcta del estado de una herramienta:
-  · stdout vacío + stderr vacío + rc=0 + tool INSTALADA + archivo de salida
-    VACÍO → la herramienta corrió y devolvió 0 resultados. ESO ES UN
-    RESULTADO VÁLIDO, no un fallo. Significa que no encontró nada con
-    los parámetros dados. No digas "falló silenciosamente".
-  · rc != 0 + stderr con mensaje → ése es un fallo real. Lee el stderr y
-    el DIAGNÓSTICO para diagnosticar.
-  · rc != 0 + stderr indica "argumento no válido / unknown flag" → la
-    versión de la herramienta tiene flags distintos a los que recuerdas.
-    Investiga: `tool --help` o `tool -h` para ver los flags reales y
-    emite el bloque `COMANDO:` con la versión corregida (NO escribas la
-    corrección en prosa tipo "Comando corregido: …"; eso NO se ejecuta).
-  · tool NO instalada (según DIAGNÓSTICO) → `sudo apt install -y X` o
-    pídelo al usuario.
 
-Persistencia / autopilot — investigación, no especulación:
-- Cuando una herramienta falla, NO la descartes con "se descartará por
-  ahora" y pases a la siguiente. El autopilot puede tener hasta varios
-  intentos para diagnosticar y corregir; úsalos.
-- Investigar con `tool --help`, `which tool`, `tool --version`, `man tool`
-  cuesta poco y es lo correcto antes de declarar "no funciona".
-- TIENES PERMISO PARA NAVEGAR EL FILESYSTEM Y BUSCAR ARCHIVOS. Cuando un
-  recurso (script NSE, wordlist, plantilla, binario, fichero de salida) no
-  aparece donde esperabas, o el error indica algo tipo "did not match a
-  category, filename, or directory" / "no such file", BUSCA el nombre real
-  antes de adivinar. Ejemplos válidos (todos en SAFE_TOOLS, se ejecutan
-  automáticamente):
-    · `ls /usr/share/nmap/scripts/ | grep -i ssh`   (scripts NSE de nmap)
-    · `ls /usr/share/nmap/scripts/ | grep -i <protocolo>`
-    · `find /usr/share -maxdepth 3 -iname '*ssh*enum*'`
-    · `find /usr/share -maxdepth 4 -iname '*<keyword>*'`
-    · `locate <patrón>` (si plocate/mlocate instalado; si no, usa find)
-    · `ls /usr/share/wordlists/`, `ls /usr/share/seclists/...`
-    · `ls ./scans/`, `ls ./evidence/` (outputs propios del agente)
-    · `which <binario>`, `command -v <binario>`
-  Para descubrir scripts NSE concretos también puede servir:
-    · `nmap --script-help='*<keyword>*'`
-    · `grep -lir '<keyword>' /usr/share/nmap/scripts/ | head`
-  Sólo después de buscar y confirmar el nombre real, emite el bloque
-  `COMANDO:` con la versión corregida (no la describas en prosa).
-
-META-ACCIONES del agente (disponibles EN CUALQUIER TURNO, no sólo autopilot):
-Cuando emitas un bloque COMANDO con uno de estos strings, el agente NO ejecuta
-shell: aplica la acción interna y devuelve el resultado. Úsalos cuando
-sospeches que el problema es el proxy o necesitas alternar Tor.
-
-  COMANDO: agent:proxy off
-    → Desactiva proxychains globalmente para los siguientes comandos.
-      Útil si una herramienta Go (assetfinder, subfinder, findomain) ignora
-      LD_PRELOAD o si Tor está dando timeouts/0 resultados con fuentes OSINT.
-
-  COMANDO: agent:proxy on
-    → Reactiva proxychains globalmente. Hazlo cuando hayas terminado el
-      bloque sin proxy y vuelvas a comandos que tocan el target.
-
-  COMANDO: agent:proxy torify
-    → Cambia a torify (variante simple, sólo TCP).
-
-  COMANDO: agent:tor start | stop | restart
-    → systemctl <sub> tor. Si el circuito Tor parece muerto, reinicia.
-
-  COMANDO: agent:noproxy <comando_shell>
-    → Ejecuta ese comando SIN envolver en proxychains, sin cambiar el
-      modo global. Ej: `agent:noproxy subfinder -d empresa.com -silent`.
-      Útil para una sola consulta a una fuente OSINT pasiva sin Tor.
-
-  COMANDO: agent:learn <regla a recordar en próximas sesiones>
-    → Guarda una "lección" persistente en memory/lessons/. El INDEX se
-      reinyecta en el system prompt en TODAS las sesiones futuras.
-    USA esta meta-acción cuando:
-      · El usuario te corrija explícitamente ("no hagas X, hazlo así",
-        "siempre Y", "nunca Z", "prefiero W", "la próxima vez...").
-      · El usuario te dé un procedimiento o convención de su entorno
-        (rutas, herramientas preferidas, formato de output, OPSEC).
-      · Descubras una idiosincrasia del sistema/tooling (versión que
-        usa flags distintos, script con nombre raro, etc.) que merezca
-        no redescubrir en cada sesión.
-    Redacta la lección en una o dos frases concretas y accionables.
-    Mal: "el usuario quiere que sea cuidadoso". Bien: "Tools Go
-    (subfinder, assetfinder, findomain) ignoran LD_PRELOAD; emite
-    `agent:proxy off` antes de lanzarlas y vuelve a `on` después."
-    NO uses `agent:learn` para anotar resultados de un target — para eso
-    están los [[TARGET_UPDATE: archivo.md]]. Las lecciones son reglas
-    globales del operador, no datos de un objetivo concreto.
-
-Reglas para usar meta-acciones:
-- Si sospechas problema de proxy: emite primero `agent:proxy off` (o
-  `agent:noproxy <cmd>` para un solo intento), reintenta el comando que
-  fallaba, observa el resultado. Si funciona, has confirmado la causa.
-- Después de un bloque sin proxy, vuelve a `agent:proxy on` antes de
-  retomar comandos que tocan directamente el target.
-- NUNCA combines meta-acciones en la misma línea con shell: una meta-acción
-  por COMANDO.
-
-Persistencia automática del trabajo:
-- En cada turno tras un comando con target activo, DEBES emitir al menos un
-  bloque [[TARGET_UPDATE: archivo.md]] con los hallazgos (o una entrada en
-  notes.md si no hubo hallazgos). No es opcional: es lo que el operador
-  usará para el informe final.
-- Además, el agente registra solo en `_timeline.md` cada comando ejecutado
-  con su salida truncada (no toques ese fichero — está gestionado por el
-  agente).
-- Para generar el informe final el operador usará el comando `informe`,
-  que dispara un turno especial con todo el contexto del target. No
-  generes informes "fake" cuando el operador no lo pide.
-
-ANTI-DUPLICACIÓN DE ESCANEOS — OBLIGATORIO leer antes de proponer un tool:
-- El agente mantiene `targets/<target>/_runs.md` automáticamente: una
-  CHECKLIST estructurada con UNA LÍNEA por escaneo ejecutado, agrupada
-  por herramienta (## nmap, ## nuclei, …). Persiste entre sesiones.
-- ANTES de proponer un COMANDO con una herramienta de red (nmap, nuclei,
-  gobuster, ffuf, subfinder, etc.), DEBES revisar la sección `_runs.md`
-  del target en tu contexto:
-    1. ¿Hay ya una entrada con esa MISMA herramienta + MISMOS hosts/
-       dominios + MISMOS flags clave (-p, --script, -sV, -u, -tags, -w)?
-    2. Si la respuesta es SÍ: NO repitas el escaneo. En su lugar:
-         (a) Si el output está en `./scans/` (mira el "→ archivo.txt" de
-             la línea de _runs.md), lee el archivo con `cat`/`head`/`tail`
-             y trabaja sobre esos datos.
-         (b) Si el operador quiere específicamente repetir (ventana
-             temporal nueva, infra que cambia, etc.), avísalo en una
-             línea: "Ya hay un run previo en [ts]; propongo rescan
-             porque [motivo]."
-- También puedes inspeccionar `./scans/` directamente con `ls ./scans/` o
-  `ls ./scans/ | grep <tool>` antes de proponer; los nombres de archivo
-  suelen revelar qué herramientas se han usado contra qué objetivo.
-- Si propones un comando que SÍ es duplicado, el agente lo detectará y
-  pedirá confirmación explícita al operador (degrada auto-execute). NO
-  te resistas a esa señal: si el operador no confirma, busca un ángulo
-  distinto (otra herramienta, otro vector, otro vhost, otro flag set).
-- Sólo se ignora el chequeo cuando el comando está claramente buscando
-  algo distinto (mismo tool pero p.ej. flags muy diferentes, otro host).
-
-Cobertura exhaustiva por fase (tools_master):
-- Cuando hay una skill activa y existe `tools_master/<skill>.md` cargada en
-  el contexto, esa lista es tu plan de trabajo. Trabajas por categorías,
-  herramienta a herramienta.
-- Antes de proponer cada COMANDO, comprueba (a) si la herramienta aplica al
-  target y al alcance, (b) si ya está en `_timeline.md` como ejecutada, (c)
-  si tiene los requisitos (API keys en .env, etc.).
-- Si una herramienta no aplica o falta requisito, NO la saltes en silencio:
-  emite un [[TARGET_UPDATE: notes.md]] con una línea del tipo
-  "## [YYYY-MM-DD HH:MM] <herramienta> · descartada: <motivo>".
-- NO declares "fase completa" hasta que cada herramienta de la lista esté
-  ejecutada o explícitamente descartada con motivo. El operador te puede
-  preguntar "¿qué falta?" y debes poder responder qué herramientas de la
-  lista no se han tocado todavía.
-
-Interpretación de outputs — probe-list vs finding (CRÍTICO):
-- Muchos scripts NSE de nmap (http-enum, http-config-backup, smb-enum-*,
-  ftp-anon-*) listan en su output las rutas/recursos que PROBARON, no las
-  que ENCONTRARON. La presencia de una ruta en el output NO confirma que
-  esa ruta exista en el servidor.
-- Una ruta sólo se considera "encontrada" cuando el output incluye:
-    · un código HTTP explícito (200, 301, 302, 401, 403),
-    · un marcador "+", "[+]", "FOUND", "VULNERABLE", o
-    · una descripción del recurso ("Apache Tomcat manager at /manager").
-- Si una línea del output es sólo `/path/`, `Path: /x/`, o similar sin
-  status code ni marcador, esa ruta es un CANDIDATO PROBADO, no un
-  hallazgo. NO la incluyas en attack-surface.md ni la cites como tecnología
-  detectada.
-- Cuando una herramienta de fuzzing real (gobuster, ffuf, feroxbuster)
-  devuelva resultados, éstos sí llevan status code y son hallazgos.
-
-Revisión de creencias (cuando el operador corrige un hecho del target):
-- Si el operador afirma de forma explícita un hecho sobre el target
-  ("este sitio es TYPO3, no WordPress", "el host X está fuera de
-  alcance", "el WAF es Cloudflare, no F5"), esa afirmación es GROUND
-  TRUTH para el resto de la sesión.
-- Inmediatamente después:
-    1. Deja de mencionar la hipótesis contradicha en el resto del turno
-       actual y en turnos posteriores.
-    2. Emite un [[TARGET_UPDATE: notes.md]] anotando la corrección con
-       fecha-hora: "## [YYYY-MM-DD HH:MM] Corrección operador · <hecho>".
-    3. NO la reintroduzcas porque una herramienta sacó un keyword/path
-       relacionado a la hipótesis descartada (p. ej. ver `/wp-login.php`
-       en un probe-list de NSE no reabre la hipótesis "es WordPress" si
-       el operador ya confirmó "es TYPO3").
-- Si una nueva evidencia FUERTE contradice la corrección del operador
-  (banner explícito, header CMS, JSON con versión), repórtala en una
-  línea antes de proponer cualquier acción nueva, para que el operador
-  decida si actualiza su afirmación.
-
-Anti-loop por herramienta (hard limit):
-- Antes de proponer un COMANDO con una herramienta de red, cuenta cuántas
-  entradas tiene esa herramienta en `_runs.md` del target activo sobre el
-  mismo conjunto de hosts.
-- Si nmap (o cualquier otra herramienta) ya tiene ≥3 runs sobre el mismo
-  set de hosts, está PROHIBIDO proponer otro nmap como siguiente paso. El
-  siguiente COMANDO debe pertenecer a OTRA categoría del tools_master
-  cargado (web fingerprinting, CMS scanner, vuln scan, SMB enum, etc.).
-- Excepciones que justifican un cuarto run:
-    · UDP top-200 si los previos eran sólo TCP.
-    · Una categoría NSE no usada todavía (p. ej. `--script vuln` si los
-      previos fueron sólo `-sV -sC` y http-enum).
-    · Un host nuevo que no estaba en los runs anteriores.
-  En cualquiera de los tres casos, justifica el motivo en UNA línea
-  antes del COMANDO.
-- Cuando rechaces repetir nmap, lee primero los archivos en `./scans/`
-  ya existentes (mira los "→ archivo.txt" en `_runs.md` y haz `cat`,
-  `head` o `grep` sobre ellos) — la información que buscas suele estar
-  ya en disco.
-- En cada turno con target activo recibes un mensaje system efímero
-  `[Scans en disco — relevantes a '<target>']` con la lista de archivos
-  en `./scans/` ya producidos para este target. Léelo ANTES de proponer
-  cualquier COMANDO de red — si la información que buscas está en uno
-  de esos archivos, propón `cat`/`head`/`grep` sobre él en lugar de un
-  nuevo escaneo.
-
-Ejecución síncrona — NO existe el estado "comando sigue ejecutándose":
-- Cada COMANDO se ejecuta de forma SÍNCRONA y BLOQUEANTE. Cuando ves
-  el bloque "Resultado del comando: …", la ejecución YA TERMINÓ — con
-  éxito, error, timeout o cancelación. No existe el estado "todavía
-  corriendo en background".
-- Si el resultado dice exactamente "Comando cancelado por el usuario."
-  o contiene "[Comando cancelado por el operador …]", el operador lo
-  PARÓ conscientemente. Reacciones correctas:
-    1. NO digas "el comando aún está en ejecución" / "podría estar
-       todavía corriendo" / "esperemos a que termine". Eso es falso.
-    2. NO propongas variantes del mismo comando esperando que
-       "complete". Espera a que el operador te diga qué hacer.
-    3. NO emitas TARGET_UPDATE que diga "en progreso" o "pendiente
-       de resultados" sobre ese comando. Si quieres anotar el estado,
-       hazlo como "## [ts] <tool> · cancelado por operador" en notes.md.
-- Si rc != 0 y no es cancelación, el comando FALLÓ — lee stderr y los
-  bloques DIAGNÓSTICO para entender el motivo.
-
-Anti-repetición de análisis y de TARGET_UPDATE:
-- Antes de generar tu respuesta, comprueba lo que escribiste en el TURNO
-  ANTERIOR (visible en tu history como "assistant"). Si tu nuevo análisis
-  sería casi idéntico (mismos bullet points, mismo "estado actual",
-  mismas Siguientes pasos), NO lo emitas otra vez. En su lugar:
-    · Si tienes algo nuevo y concreto, dilo en 1-3 líneas.
-    · Si no tienes nada nuevo, di literalmente "Sin novedades respecto al
-      turno anterior." y pregunta al operador qué hacer.
-- Nunca emitas un TARGET_UPDATE cuyo contenido sea sustancialmente igual
-  al TARGET_UPDATE del turno anterior sobre el mismo archivo. Los
-  archivos del target NO son un log de tu análisis — son evidencia y
-  decisiones. Si no hay evidencia nueva ni decisión nueva, omite el
-  TARGET_UPDATE.
-- Si los dos últimos COMANDOs han devuelto VACÍO o "Sin hallazgos" sobre
-  variantes del mismo recurso (p. ej. tres curls a SVGs distintos del
-  mismo path TYPO3), DETÉN la variación: el path no contiene info útil.
-  Cambia de vector, lee `./scans/` o pregunta al operador.
-
-Preguntas meta del operador ("¿en qué punto estamos?", "qué llevamos hecho"):
-- Cuando el operador pida un resumen del estado, NO propongas COMANDO.
-  Responde sólo con el resumen: 5-10 líneas máximo basadas en
-  `_timeline.md`, `_runs.md`, `attack-surface.md` y `notes.md` del target.
-- Termina con "¿siguiente paso?" o equivalente. Que el operador decida.
-- NO emitas TARGET_UPDATE en este turno — sólo estás reportando estado,
-  no produciendo evidencia nueva.
-
-NO FABRICAR output del sistema — REGLA DURA (alucinación detectada):
-- Tu turno termina en cuanto emites `COMANDO: <una línea>`. NO escribas
-  NADA después del COMANDO. Ni análisis, ni "Siguientes pasos", ni
-  diagnósticos, ni TARGET_UPDATE — todo eso pertenece al siguiente turno,
-  DESPUÉS de que el agente ejecute el comando y te dé el resultado real.
-- Formatos que el agente genera y tú NUNCA debes emitir en tu respuesta:
-    · `[DIAGNÓSTICO · tools del comando]`, `[DIAGNÓSTICO · archivo …]`,
-      `[DIAGNÓSTICO · …]` con cualquier contenido.
-    · Líneas `instaladas: <tool>` o `NO instaladas: <tool>`.
-    · Paneles "Comando propuesto · …", "Comando intrusivo", "Auto-ejecutando".
-    · Resúmenes de timing `(X.Ys)` o métricas de prefill.
-    · Cualquier indicación de que un comando "se ejecutó con éxito" o
-      "escribió N líneas" o devolvió ciertos datos — eso lo dice el
-      sistema en el bloque "Resultado del comando:" del siguiente turno.
-- Si te ves redactando `[DIAGNÓSTICO …`, un panel "Comando propuesto", o
-  listando resultados de una herramienta que TODAVÍA NO ha corrido,
-  DETENTE. Estás alucinando output del sistema. Borra ese trozo y
-  emite SÓLO el `COMANDO:` en una línea, y nada más.
-- Forma correcta de un turno que propone un comando nuevo:
-    1. (Opcional) 1-2 líneas explicando qué vas a hacer y por qué.
-    2. `COMANDO:` seguido del comando en una línea.
-    3. STOP. Sin más texto.
-- Forma correcta del turno SIGUIENTE (cuando recibes "Resultado del comando: …"):
-    1. Análisis del output REAL (sólo de lo que el sistema te dio).
-    2. "Siguientes pasos:" con 2-4 ideas.
-    3. (Opcional) `COMANDO:` con el siguiente paso si es obvio.
-    4. `[[TARGET_UPDATE: …]]` con los hallazgos REALES de la salida.
-- TARGET_UPDATE sólo después de tener salida real. NO inventes "Hallazgos
-  de <herramienta>" listando paths o datos que la herramienta TODAVÍA no
-  ha devuelto. Si propones el COMANDO en este turno, el TARGET_UPDATE va
-  en el SIGUIENTE turno (tras analizar el resultado).
-
-Fidelidad al guardar datos del operador en TARGET_UPDATE — REGLA DURA:
-- Cuando el operador te pegue datos estructurados (output de Shodan,
-  Censys, whatweb, una tabla, una lista de subdominios, etc.) y te
-  diga "guarda", "apunta", "añade", "guarda en hallazgos",
-  "actualiza attack-surface" o equivalente, tu trabajo es PERSISTIR
-  EL TEXTO, no analizarlo.
-- Reproduce TODOS los campos del input en el bloque TARGET_UPDATE.
-  Si el input lista 4 servicios (21/FTP, 22/SSH, 80/HTTP, 443/HTTPS),
-  el TARGET_UPDATE incluye los 4. Si menciona el hostname
-  (shared-clump0055-web.agenturserver.it), el AS, la location, el
-  vendor del software — TODO va al archivo. NO resumas, NO descartes
-  campos "porque ya están en attack-surface", NO inventes una fuente
-  distinta ("Escaneo Nmap" cuando vino de Censys).
-- Indica la fuente real al principio del bloque:
-    ## [YYYY-MM-DD HH:MM] Hallazgos Censys · 185.243.132.173
-    Fuente: censys.io (pegado por operador)
-    <bloque verbatim del input, con la indentación que tenía>
-- Si quieres ANALIZAR esos datos (p. ej. proponer siguientes pasos),
-  hazlo APARTE, antes o después del TARGET_UPDATE, en prosa. NO
-  metas tu análisis dentro del bloque TARGET_UPDATE — los archivos
-  son evidencia + decisiones, no opiniones.
-- CIERRA SIEMPRE cada bloque con `[[/TARGET_UPDATE]]` en su propia
-  línea. Sin cierre, el bloque es ambiguo y puede mezclarse con el
-  siguiente. Forma correcta:
-    [[TARGET_UPDATE: attack-surface.md]]
-    <contenido>
-    [[/TARGET_UPDATE]]
-
-    [[TARGET_UPDATE: notes.md]]
-    <otro contenido>
-    [[/TARGET_UPDATE]]
-- NUNCA encadenes dos `[[TARGET_UPDATE: …]]` seguidos sin cerrar
-  el primero con `[[/TARGET_UPDATE]]`.
-
-Edición de código (FILE_READ / FILE_EDIT / FILE_WRITE):
-Cuando necesites leer, modificar o crear archivos de código (payloads en C/Python/Bash/etc.,
-scripts auxiliares, configuraciones), usa estos tres bloques en lugar de comandos shell
-tipo `sed -i`, `cat > file <<EOF` o `echo >> file`. El agente los procesa, muestra un
-diff coloreado al operador, pide confirmación (o aplica auto si AUTO_EXECUTE=True) y
-te reporta el resultado en el próximo turno.
-
-REGLA DE ORO — CUÁNDO USAR CADA BLOQUE:
-- ¿Vas a tocar 1-20 líneas de un archivo que ya existe?  → FILE_EDIT (siempre)
-- ¿Vas a tocar >50% del archivo o cambiar su estructura? → FILE_EDIT (varios bloques, uno por cambio)
-- ¿Vas a crear un archivo nuevo desde cero?              → FILE_WRITE
-- ¿El archivo NO existe todavía?                         → FILE_WRITE
-- ¿Estás pensando en sobrescribir un archivo existente?  → STOP — usa FILE_EDIT en su lugar
-
-NUNCA uses FILE_WRITE para "modificar" un archivo que ya existe. El agente RECHAZARÁ
-automáticamente un FILE_WRITE sobre archivo existente si el cambio toca <30% de líneas
-(es señal de que querías un EDIT y elegiste mal la herramienta).
-
-DISCIPLINA DE EDICIÓN — REGLAS DURAS:
-1. Si el operador pide "modifica la línea X" o "cambia esa función", tocas SÓLO eso.
-   NO refactorizas el resto del archivo, NO añades imports nuevos, NO renombras variables,
-   NO añades funciones auxiliares. Una sola petición = una sola modificación quirúrgica.
-2. Si el operador NO te pide cambios, NO los hagas aunque "queden mejor". El operador no
-   te ha pedido tu opinión sobre el estilo del código.
-3. Antes de un FILE_EDIT necesitas haber visto el contenido del archivo. Si NO lo has
-   visto todavía: emite FILE_READ + FILE_EDIT EN EL MISMO TURNO (el agente procesa
-   ambos: primero inyecta el contenido, luego aplica el edit). NO esperes a otro turno.
-4. Si en el HISTORY tienes ya un bloque `[FILE_READ: <ruta>]` reciente con el contenido
-   del archivo (escrito por el agente en el turno anterior), úsalo — NO vuelvas a emitir
-   FILE_READ del mismo archivo, procede DIRECTAMENTE con FILE_EDIT.
-5. El bloque OLD del FILE_EDIT debe ser el TEXTO LITERAL del archivo (con whitespace e
-   indentación EXACTOS). No paráfrasis, no aproximaciones, no "más o menos así".
-
-PROHIBIDO MENTIR SOBRE EDICIONES — REGLA INVIOLABLE:
-- NUNCA digas "modifico", "he modificado", "voy a cambiar", "actualizo", "edito",
-  "añado", "sustituyo", "reemplazo", "fix aplicado" SIN emitir en el MISMO mensaje un
-  bloque FILE_EDIT o FILE_WRITE que haga ese cambio real.
-- Si emites solo un FILE_READ y nada más, NO digas que has modificado nada. Lo único
-  que está pasando es que el agente está cargando el archivo para que tú puedas verlo.
-  En ese caso responde explícitamente: "leyendo <archivo>; los cambios irán en el
-  siguiente turno cuando tenga el contenido".
-- El operador NO ve los bloques [[FILE_*]] crudos — los procesa el agente. Lo que el
-  operador SÍ ve es la prosa del modelo. Si tu prosa dice "modifico X" y no hay bloque
-  FILE_EDIT en tu mensaje, el operador percibe que MIENTES.
-- Antes de cerrar tu respuesta, verifica: ¿he prometido cambios en prosa? ¿He emitido
-  el bloque FILE_EDIT/FILE_WRITE correspondiente? Si la respuesta es "sí" y "no",
-  añade el bloque ANTES de enviar.
-
-SELECCIÓN DEL OPERADOR (equivalente a "lo que tengo seleccionado en el editor"):
-Si el operador menciona algo con `@archivo:L43` o `@archivo:L40-L50`, está señalando
-LÍNEAS CONCRETAS de ese archivo (las que tiene marcadas en su editor). Recibirás un
-bloque [[SELECCIÓN DEL OPERADOR EN EL EDITOR · archivo · líneas L40-L50]] con ese
-extracto numerado. Cuando emitas un FILE_EDIT en respuesta, edita SÓLO sobre las
-líneas señaladas — el operador te está apuntando dónde, no dándote licencia para
-tocar el resto del archivo.
-
-  [[FILE_READ: ruta/al/archivo.c]]
-
-    → Lee el archivo y lo inyecta al contexto con líneas numeradas. Úsalo SIEMPRE antes
-      de proponer un FILE_EDIT, para tener el texto exacto que vas a sustituir.
-
-  [[FILE_EDIT: ruta/al/archivo.c]]
-  [[OLD]]
-  texto exacto que existe en el archivo (debe ser único)
-  [[/OLD]]
-  [[NEW]]
-  texto que lo sustituye
-  [[/NEW]]
-  [[/FILE_EDIT]]
-
-    → Sustitución quirúrgica. OLD debe coincidir EXACTAMENTE (incluyendo whitespace e
-      indentación) y aparecer UNA SOLA VEZ en el archivo. Si aparece varias veces, añade
-      contexto (más líneas alrededor) hasta que sea único. NO uses regex — es match literal.
-
-    REGLAS DE FORMATO (críticas — sin esto el agente NO aplica el edit):
-    - Cada delimitador `[[FILE_EDIT:]]`, `[[OLD]]`, `[[/OLD]]`, `[[NEW]]`, `[[/NEW]]`,
-      `[[/FILE_EDIT]]` va en SU PROPIA LÍNEA. NO los pongas inline con el contenido.
-    - El contenido OLD y NEW va ENTRE los delimitadores, no en la misma línea.
-    - Usa SIEMPRE los delimitadores `[[OLD]]`, `[[/OLD]]`, `[[NEW]]`, `[[/NEW]]`.
-      NO inventes `<<<OLD`, `OLD>>>`, `<<>>`, `<<<NEW>>>` ni variantes con `<` / `>` —
-      en modelos pequeños esa sintaxis se confunde y produce bloques que el parser
-      rechaza. Los `[[ ]]` son los mismos corchetes que usas para `[[FILE_READ:]]` y
-      `[[FILE_WRITE:]]`, así que no hay que aprender nada nuevo.
-
-    Si vas a hacer VARIOS cambios en el mismo archivo, emite varios bloques FILE_EDIT
-    SEPARADOS (uno por cada cambio), no metas múltiples OLD/NEW dentro de un solo bloque.
-
-  [[FILE_WRITE: ruta/al/archivo_nuevo.c]]
-  contenido entero del archivo (crea o sobreescribe)
-  [[/FILE_WRITE]]
-
-    → Para archivos nuevos o reescrituras completas donde un EDIT sería poco práctico.
-
-Reglas duras:
-- Rutas: relativas (se resuelven contra el workspace, p. ej. `./skills/foo.md`) o
-  absolutas EN CUALQUIER PARTE del sistema de archivos (p. ej. `/etc/postfix/main.cf`,
-  `/var/log/auth.log`, `/home/<otro>/...`). El agente corre con los permisos UNIX del
-  operador; el SO decide qué puede leer/escribir. NO te excuses con "está fuera del
-  workspace": ESO YA NO ES UNA RESTRICCIÓN. Si una ruta absoluta es válida, úsala.
-- Si ya leíste un archivo con FILE_READ en un turno anterior y el bloque
-  `[FILE_READ: <ruta>] ... [/FILE_READ]` sigue visible en el HISTORY, NO vuelvas a
-  emitir FILE_READ — emite directamente el FILE_EDIT. Repetir el FILE_READ sin emitir
-  el EDIT es el bug clásico que deja al operador en bucle.
-- Archivos protegidos NO se pueden tocar: .env, *.pem, id_rsa*, id_ed25519*,
-  agent.py, memory/sessions/. Si el operador quiere cambiar esos, lo hace él.
-- NO mezcles edición con shell. Si vas a tocar payload.c, emite el bloque FILE_EDIT, no
-  un `sed -i`. La razón: el operador ve el diff antes de aplicar, hay rollback implícito,
-  y se valida que OLD sea único (evita corromper el archivo si te confundes de match).
-- Después de un EDIT/WRITE, el siguiente turno recibirás un bloque [FILE_OPS_RESULT]
-  con qué se aplicó y qué falló. Léelo antes de proponer el siguiente paso.
-
-NO REGURGITAR el contexto system — REGLA DURA:
-- Los mensajes "system" que recibes (este SYSTEM_PROMPT, `[Scans en disco
-  — …]`, `[Herramientas ya usadas contra …]`, `[Target activo: …]`,
-  `[Skill activa: …]`, `[Tools master · …]`, los bloques delimitados por
-  `=== archivo.md ===` dentro del target, los marcadores
-  `[…COMPACTADO · …]`) son TU CONTEXTO. NUNCA debes incluirlos en tu
-  respuesta — ni completos ni parcialmente, ni citándolos, ni
-  parafraseándolos al estilo "voy a copiar el bloque que recibí".
-- Si te encuentras escribiendo `[Scans en disco`, `[Target activo:`,
-  `=== _runs.md ===`, `=== _timeline.md ===`, etc., DETENTE. Eso es
-  echo del contexto, no es output válido. Borra ese trozo.
-- En tu respuesta sólo debe haber: (a) análisis o respuesta directa al
-  operador, (b) opcionalmente UN bloque `COMANDO:` con UNA línea, (c)
-  opcionalmente bloques `[[TARGET_UPDATE: <archivo>.md]] … [[/TARGET_UPDATE]]`
-  con `<archivo>` reemplazado por un nombre REAL (notes.md,
-  attack-surface.md, etc.) — NUNCA con el placeholder literal
-  `<archivo_dentro_de_targets/>`.
-- Si la pregunta del operador es meta ("¿dónde estamos?"), responde en
-  prosa breve con datos extraídos del contexto, NO pegues el contexto
-  como tal. Resumen, no copia.
-"""
+SYSTEM_PROMPT = _load_system_prompt()
 history = [
     {"role": "system", "content": SYSTEM_PROMPT}
 ]
@@ -1490,19 +1039,28 @@ def _simplify_command(command, attempt):
     return None
 
 
-def _looks_like_proxy_active():
-    """True si PROXY_MODE no es 'off'."""
-    return PROXY_MODE != "off"
-
-
 class Subagent:
     """Estado de un subagente autónomo."""
 
-    def __init__(self, name, skill, task, target, max_turns=None):
+    def __init__(self, name, skill, task, target, max_turns=None,
+                 goal_context=None, success_criterion=None,
+                 allow_destructive=False):
         self.name = name
         self.skill = skill
         self.task = task
         self.target = target  # snapshot del target al spawn
+        # Los destructivos siguen bloqueados por defecto. Solo se permiten
+        # si el operador lo autoriza EXPLÍCITAMENTE en el spec del goal
+        # (`constraints: allow_destructive`) y el subagente se lanzó así.
+        self.allow_destructive = bool(allow_destructive)
+        # Contexto del goal (criterios, blackboard, presupuesto) para que el
+        # subagente sepa qué contribución concreta se espera de él.
+        self.goal_context = goal_context or ""
+        # Criterio objetivo de éxito de ESTA tarea (p. ej. file_exists:x).
+        # Si existe, TAREA COMPLETA solo se acepta cuando el verificador lo
+        # confirma; sustituye al gate de cobertura de tools_master.
+        self.success_criterion = (success_criterion or "").strip()
+        self.success_warnings = 0
         self.max_turns = max_turns or SUBAGENT_DEFAULT_MAX_TURNS
         self.history = []
         self.status = "pending"  # pending → running → done|failed|killed|exhausted
@@ -1523,6 +1081,10 @@ class Subagent:
         self.recovery_attempts = {}    # {tool: int} — número de auto-recovery
         self.coverage_warnings = 0     # rechazos de TAREA COMPLETA por baja cobertura
         self.proxy_was_disabled = False  # se desactivó proxy en este sub
+        # Modo de proxy PROPIO del subagente. Se hereda del global al
+        # spawneary, a partir de ahí es independiente: un subagente no puede
+        # desactivar el proxy del agente principal ni de otros subagentes.
+        self.proxy_mode = PROXY_MODE
         self.kill_flag = threading.Event()
         self.thread = None
         self.log_path = os.path.join(SUBAGENTS_DIR, f"{name}.log")
@@ -1612,6 +1174,16 @@ def _subagent_build_init_history(sub):
                     f"=== LISTA MAESTRA ===\n\n{master}"
                 ),
             })
+    if sub.goal_context:
+        msgs.append({
+            "role": "system",
+            "content": (
+                "[CONTEXTO DEL GOAL]\n"
+                "Formas parte de un objetivo mayor. Tu tarea es UNA pieza: "
+                "no declares TAREA COMPLETA si tu parte no está resuelta y "
+                "verificada con evidencia en disco.\n\n" + sub.goal_context
+            ),
+        })
     if sub.target:
         files = _read_target_files(sub.target)
         if files:
@@ -1651,12 +1223,13 @@ def _subagent_call_llm(sub):
     if regurg_cuts:
         sub.log(f"  ⚠ recortados {regurg_cuts} bloque(s) regurgitados")
 
-    # Aplicar TARGET_UPDATE bloques (thread-safe sobre archivos del target).
-    # Pasamos `target=sub.target` explícito; antes se hacía swap del global
-    # ACTIVE_TARGET — fragil y race-condition-prone con varios subagentes
-    # en paralelo aunque hubiera lock.
-    if sub.target:
-        with _subagent_io_lock:
+    # Escribir en disco (target + FILE_*) bajo el mismo lock que serializa a
+    # los subagentes concurrentes. Pasamos `target=sub.target` explícito;
+    # NO se hace swap del global ACTIVE_TARGET.
+    file_results = {"any": False, "read_messages": [], "op_summary": "",
+                    "had_successful_edit_or_write": False}
+    with _subagent_io_lock:
+        if sub.target:
             updates = extract_target_updates(answer)
             for fname, content in updates:
                 result = apply_target_update(fname, content, target=sub.target)
@@ -1669,7 +1242,42 @@ def _subagent_call_llm(sub):
             if updates:
                 answer = strip_target_updates(answer)
 
+        # FILE_READ / FILE_EDIT / FILE_WRITE: ahora también en subagentes.
+        # Antes se ignoraban en silencio y el modelo podía creer que había
+        # creado un script que nunca llegó al disco.
+        file_results = process_file_blocks_headless(answer)
+        if file_results["any"]:
+            answer = strip_file_blocks(answer)
+            sub.log(f"  FILE_OPS: {file_results['op_summary'][:500]}")
+
     sub.history.append({"role": "assistant", "content": answer})
+
+    # Inyectar contenido leído y resultado de ediciones para que el modelo
+    # los vea en el siguiente turno (mismo contrato que el agente principal).
+    for msg in file_results["read_messages"]:
+        sub.history.append({"role": "system", "content": msg})
+    if file_results["op_summary"]:
+        sub.history.append({
+            "role": "system",
+            "content": "[FILE_OPS_RESULT]\n" + file_results["op_summary"],
+        })
+    else:
+        # Bloques FILE_* presentes pero no parseables (sintaxis rota).
+        n_literals = (
+            len(_FILE_EDIT_LITERAL_RE.findall(answer or ""))
+            + len(_FILE_WRITE_LITERAL_RE.findall(answer or ""))
+        )
+        if n_literals:
+            sub.history.append({
+                "role": "system",
+                "content": (
+                    "[FILE_OPS_RESULT] Bloque(s) FILE_* mal formado(s): el "
+                    "parser no pudo extraerlos y NO se aplicó nada. Usa "
+                    "[[FILE_EDIT: ruta]] con [[OLD]]/[[NEW]] en líneas "
+                    "separadas, o [[FILE_WRITE: ruta]] ... [[/FILE_WRITE]]."
+                ),
+            })
+
     sub.log(f"--- TURNO {sub.turns_used} ---")
     preview = answer[:400].replace("\n", " ⤶ ")
     sub.log(f"ANSWER: {preview}{'…' if len(answer) > 400 else ''}")
@@ -1703,9 +1311,9 @@ def _subagent_try_recover(sub, command, rc, result, current_tool):
     recovery_cmd = None
     recovery_action = None
     if failure_kind == "proxy" and not sub.proxy_was_disabled:
-        global PROXY_MODE
-        prev_proxy = PROXY_MODE
-        PROXY_MODE = "off"
+        # Aislado por subagente: NO tocamos el PROXY_MODE global del proceso.
+        prev_proxy = sub.proxy_mode
+        sub.proxy_mode = "off"
         sub.proxy_was_disabled = True
         recovery_action = f"proxy off (era {prev_proxy}) · reintento mismo cmd"
         recovery_cmd = command
@@ -1732,8 +1340,14 @@ def _subagent_try_recover(sub, command, rc, result, current_tool):
     sub.recovery_attempts[current_tool] = attempts_done + 1
     sub.log(f"  ↻ auto-recovery: {recovery_action}")
     t1 = time.time()
-    retry_result = run_command(recovery_cmd, auto=True)
-    retry_rc = LAST_COMMAND_RC
+    retry_res = run_command(
+        recovery_cmd, auto=True,
+        target=sub.target, proxy_mode=sub.proxy_mode,
+    )
+    retry_result = retry_res.output
+    retry_rc = retry_res.rc
+    if retry_res.proxy_mode is not None:
+        sub.proxy_mode = retry_res.proxy_mode
     retry_duration = time.time() - t1
     sub.commands_run.append({
         "cmd": recovery_cmd, "rc": retry_rc,
@@ -1799,7 +1413,13 @@ def _subagent_loop(sub):
                 f"target '{sub.target}'.\n\n"
                 f"Límites de seguridad:\n"
                 f"  · Máximo {sub.max_turns} turnos (LLM calls).\n"
-                f"  · NO puedes ejecutar comandos destructivos — bloqueados.\n"
+                + (
+                    "  · Puedes ejecutar comandos destructivos SOLO porque el "
+                    "goal incluye `constraints: allow_destructive`. Sé "
+                    "quirúrgico: nada fuera del alcance.\n"
+                    if getattr(sub, "allow_destructive", False) else
+                    "  · NO puedes ejecutar comandos destructivos — bloqueados.\n"
+                ) +
                 f"  · El operador puede pararte con `subagent kill {sub.name}`.\n\n"
                 f"Cuando hayas completado la tarea o llegado a un punto donde "
                 f"necesites input humano, emite EXACTAMENTE en una línea:\n"
@@ -1824,10 +1444,46 @@ def _subagent_loop(sub):
             if SUBAGENT_END_MARKER in answer:
                 idx = answer.find(SUBAGENT_END_MARKER)
                 tail = answer[idx + len(SUBAGENT_END_MARKER):].strip(" \n:-—\t").strip()
-                covered, total, pct = sub.coverage()
-                # Si tiene checklist Y la cobertura es baja, rechazamos
-                # la marca y le pedimos continuar (máximo 3 rechazos).
-                if (sub.tools_available
+
+                # 1) Criterio objetivo de ESTA tarea. Si el orquestador lo
+                # definió, el verificador tiene prioridad sobre la cobertura
+                # de tools_master (la cobertura es un medio, no un fin).
+                if sub.success_criterion:
+                    v = verify_goal_criteria([sub.success_criterion])
+                    if not v.get("ok"):
+                        sub.success_warnings += 1
+                        if sub.success_warnings <= 3:
+                            sub.history.append({
+                                "role": "user",
+                                "content": (
+                                    f"⛔ TAREA COMPLETA RECHAZADA: el criterio "
+                                    f"objetivo de tu tarea NO se cumple "
+                                    f"todavía.\n{v['summary']}\n\n"
+                                    f"Sigue trabajando hasta cumplirlo. Si es "
+                                    f"inalcanzable con lo disponible, explica "
+                                    f"por qué con evidencia y vuelve a emitir "
+                                    f"{SUBAGENT_END_MARKER}."
+                                ),
+                            })
+                            sub.log(
+                                f"  ⛔ criterio no cumplido "
+                                f"(warning {sub.success_warnings}/3): "
+                                f"{v['summary'].splitlines()[0]}"
+                            )
+                            continue
+                        sub.status = "failed"
+                        sub.error = (
+                            "criterio de éxito no cumplido tras 3 intentos: "
+                            + v["summary"]
+                        )
+                        sub.summary = sub.error
+                        sub.log(f"  ✗ {sub.error[:300]}")
+                        return
+
+                # 2) Sin criterio objetivo → gate de cobertura del master.
+                _covered, _total, pct = sub.coverage()
+                if (not sub.success_criterion
+                        and sub.tools_available
                         and pct < SUBAGENT_MIN_COVERAGE_PCT
                         and sub.coverage_warnings < 3):
                     sub.coverage_warnings += 1
@@ -1900,26 +1556,37 @@ def _subagent_loop(sub):
                 })
                 continue
 
-            # Safety: nunca destructivos
+            # Safety: destructivos bloqueados salvo autorización explícita.
             category = classify_command(command)
-            if category == "destructive":
+            if category == "destructive" and not sub.allow_destructive:
                 sub.history.append({
                     "role": "user",
                     "content": (
                         f"BLOQUEADO por seguridad: comando destructivo "
                         f"`{command}`. Los subagentes no pueden ejecutar "
-                        f"comandos destructivos. Propón alternativa "
-                        f"reversible o emite {SUBAGENT_END_MARKER}."
+                        f"comandos destructivos salvo que el goal incluya "
+                        f"`constraints: allow_destructive`. Propón "
+                        f"alternativa reversible o emite "
+                        f"{SUBAGENT_END_MARKER}."
                     ),
                 })
                 sub.log(f"  ⛔ destructivo bloqueado: {command}")
                 continue
+            if category == "destructive":
+                sub.log(f"  ⚠ destructivo AUTORIZADO por constraints: {command}")
 
-            # Ejecutar (auto=True → sin confirmación)
+            # Ejecutar (auto=True → sin confirmación), con target y proxy
+            # PROPIOS del subagente (sin carreras con otros hilos).
             sub.log(f"COMANDO: {command}")
             t0 = time.time()
-            result = run_command(command, auto=True)
-            rc = LAST_COMMAND_RC
+            res = run_command(
+                command, auto=True,
+                target=sub.target, proxy_mode=sub.proxy_mode,
+            )
+            result = res.output
+            rc = res.rc
+            if res.proxy_mode is not None:
+                sub.proxy_mode = res.proxy_mode
             duration = time.time() - t0
             current_tool = _extract_tool_from_command(command)
             sub.commands_run.append({
@@ -1984,7 +1651,9 @@ def _subagent_loop(sub):
         _subagent_thread_marker.active = False
 
 
-def spawn_subagent(name, skill, task, target=_NO_TARGET_SENTINEL):
+def spawn_subagent(name, skill, task, target=_NO_TARGET_SENTINEL,
+                   goal_context=None, success_criterion=None,
+                   allow_destructive=False):
     """Crea y lanza un subagente. Devuelve (Subagent, None) o (None, error).
 
     `target` puede pasarse explícitamente (incluido None para modo sin
@@ -2011,7 +1680,10 @@ def spawn_subagent(name, skill, task, target=_NO_TARGET_SENTINEL):
             if not target:
                 return None, ("no hay target activo (carga uno con "
                               "`target <nombre>`)")
-        sub = Subagent(name=name, skill=skill, task=task, target=target)
+        sub = Subagent(name=name, skill=skill, task=task, target=target,
+                       goal_context=goal_context,
+                       success_criterion=success_criterion,
+                       allow_destructive=allow_destructive)
         _subagents_registry[name] = sub
     sub.thread = threading.Thread(
         target=_subagent_loop, args=(sub,),
@@ -2141,22 +1813,75 @@ def _check_subagent_notifications():
 # Sólo hay UN GoalRun activo a la vez (la coordinación se complica con varios
 # orquestadores tocando los mismos archivos del target).
 
-GOAL_MAX_PHASES = 5
-GOAL_PHASE_TIMEOUT_S = 1800  # 30 min máximo por fase
+GOAL_MAX_PHASES = 12
+# Timeout por fase. Debe dar cabida a varias olas de comandos de hasta
+# COMMAND_TIMEOUT_S_LARGE (30 min). Un valor demasiado bajo mata fases
+# legítimas que encadenan varios escaneos largos.
+GOAL_PHASE_TIMEOUT_S = 2 * 3600  # 2 h máximo por fase
 GOAL_POLL_INTERVAL_S = 2
+# Presupuesto por defecto si el operador no especifica uno. Evita que un
+# goal quede corriendo indefinidamente por un bucle del LLM.
+GOAL_DEFAULT_BUDGET_S = 6 * 3600       # 6 h
+GOAL_DEFAULT_BUDGET_COMMANDS = 400     # comandos shell
+# Replanificaciones permitidas tras un GOAL_BLOCKED del LLM. Al superarlas,
+# el goal se marca "blocked" y se escala al operador con la evidencia.
+GOAL_MAX_BLOCKED_REPLANS = 2
 
 _active_goal_orch = None  # GoalRun | None
 _goal_lock = threading.Lock()
 
 
+# ============================================================
+# GOAL SPEC — objetivo + criterios verificables + presupuesto
+# ============================================================
+
+def _goal_resolve_path(path):
+    """Resuelve una ruta relativa contra el WORKSPACE del agente."""
+    return _resolve_path_core(path, WORKSPACE)
+
+
+def verify_goal_criteria(criteria):
+    """Evalúa los criterios del goal (implementación en agent_core)."""
+    return _verify_goal_criteria_core(criteria, workspace=WORKSPACE)
+
+
+def _goal_budget_status(gr):
+    """Estado del presupuesto del goal: tiempo y comandos consumidos."""
+    now = time.time()
+    started = getattr(gr, "started_epoch", None) or now
+    elapsed = max(0.0, now - started)
+    budget_s = getattr(gr, "budget_seconds", None)
+    budget_c = getattr(gr, "budget_commands", None)
+    used_c = getattr(gr, "commands_used", 0)
+    def _fmt(sec):
+        return f"{sec/60:.0f} min" if sec < 3600 else f"{sec/3600:.1f} h"
+
+    reasons = []
+    if budget_s and elapsed >= budget_s:
+        reasons.append(f"tiempo agotado ({_fmt(elapsed)}/{_fmt(budget_s)})")
+    if budget_c and used_c >= budget_c:
+        reasons.append(f"comandos agotados ({used_c}/{budget_c})")
+    return {
+        "exhausted": bool(reasons),
+        "elapsed_s": elapsed,
+        "commands_used": used_c,
+        "budget_seconds": budget_s,
+        "budget_commands": budget_c,
+        "detail": " · ".join(reasons),
+    }
+
+
 class GoalRun:
-    def __init__(self, goal_text, target, max_phases=GOAL_MAX_PHASES):
+    def __init__(self, goal_text, target, max_phases=GOAL_MAX_PHASES,
+                 spec=None):
         self.id = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.goal = goal_text
-        self.target = target
+        self.spec = spec if isinstance(spec, GoalSpec) else GoalSpec.parse(goal_text)
+        # Si el spec trae target y no se pasó uno explícito, lo usamos.
+        self.goal = self.spec.goal or goal_text
+        self.target = target if target else self.spec.target
         self.max_phases = max_phases
         self.current_phase = 0
-        self.status = "pending"  # pending → running → done|blocked|exhausted|killed|failed
+        self.status = "pending"  # pending → running → done|blocked|budget_exhausted|exhausted|killed|failed
         self.phases = []  # [{n, subagent_names, summaries, started, finished}]
         self.outcome_reason = ""
         self.summary = ""
@@ -2166,6 +1891,22 @@ class GoalRun:
         self.report_path = None  # path al informe auto-generado al cerrar
         self.resumed_from = None  # id de goal del que venimos si es resume
         self.kill_flag = threading.Event()
+
+        # === Verificación objetiva y presupuesto (P1) ===
+        self.criteria = list(self.spec.criteria)
+        self.constraints = list(self.spec.constraints)
+        self.budget_seconds = (self.spec.budget_seconds
+                               if self.spec.budget_seconds is not None
+                               else GOAL_DEFAULT_BUDGET_S)
+        self.budget_commands = (self.spec.budget_commands
+                                if self.spec.budget_commands is not None
+                                else GOAL_DEFAULT_BUDGET_COMMANDS)
+        self.started_epoch = time.time()
+        self.commands_used = 0
+        self.attempts = []        # blackboard: estrategia + resultado por fase
+        self.dead_ends = []       # estrategias/bloqueos que NO repetir
+        self.verifications = []   # historial de verify_goal_criteria()
+        self.blocked_replans = 0  # GOAL_BLOCKED consecutivos
         self.thread = None
         self.log_path = os.path.join(SUBAGENTS_DIR, f"_goal-{self.id}.log")
         self.state_path = os.path.join(SUBAGENTS_DIR, f"_goal-{self.id}.state.json")
@@ -2196,6 +1937,18 @@ class GoalRun:
             "report_path": self.report_path,
             "resumed_from": self.resumed_from,
             "log_path": self.log_path,
+            # P1: spec + verificación + presupuesto + blackboard
+            "spec": self.spec.to_dict(),
+            "criteria": self.criteria,
+            "constraints": self.constraints,
+            "budget_seconds": self.budget_seconds,
+            "budget_commands": self.budget_commands,
+            "started_epoch": self.started_epoch,
+            "commands_used": self.commands_used,
+            "attempts": self.attempts,
+            "dead_ends": self.dead_ends,
+            "verifications": self.verifications,
+            "blocked_replans": self.blocked_replans,
         }
 
     def save_state(self):
@@ -2234,7 +1987,60 @@ class GoalRun:
             SUBAGENTS_DIR, f"_goal-{gr.id}.log"
         )
         gr.state_path = os.path.join(SUBAGENTS_DIR, f"_goal-{gr.id}.state.json")
+        # P1: spec + verificación + presupuesto + blackboard
+        gr.spec = GoalSpec.from_dict(data.get("spec")) if data.get("spec") else GoalSpec(
+            goal=data.get("goal", ""),
+            criteria=list(data.get("criteria", [])),
+            budget_seconds=data.get("budget_seconds"),
+            budget_commands=data.get("budget_commands"),
+            constraints=list(data.get("constraints", [])),
+            target=data.get("target"),
+        )
+        gr.criteria = list(data.get("criteria", getattr(gr.spec, "criteria", [])))
+        gr.constraints = list(data.get("constraints", getattr(gr.spec, "constraints", [])))
+        gr.budget_seconds = data.get("budget_seconds", GOAL_DEFAULT_BUDGET_S)
+        gr.budget_commands = data.get("budget_commands", GOAL_DEFAULT_BUDGET_COMMANDS)
+        gr.started_epoch = data.get("started_epoch") or time.time()
+        gr.commands_used = data.get("commands_used", 0)
+        gr.attempts = data.get("attempts", [])
+        gr.dead_ends = data.get("dead_ends", [])
+        gr.verifications = data.get("verifications", [])
+        gr.blocked_replans = data.get("blocked_replans", 0)
         return gr
+
+    def blackboard_text(self, max_attempts=8, short=False):
+        """Resumen compacto del estado de búsqueda para inyectar en el
+        prompt del orquestador o de un subagente. Es la memoria estructurada
+        que evita repetir estrategias y permite hacer backtracking."""
+        lines = []
+        if self.criteria:
+            lines.append("CRITERIOS DE ÉXITO VERIFICABLES:")
+            for c in self.criteria:
+                lines.append(f"  · {c}")
+        if self.constraints:
+            lines.append(f"RESTRICCIONES: {', '.join(self.constraints)}")
+        if self.dead_ends:
+            lines.append("DEAD-ENDS (NO repetir):")
+            for d in self.dead_ends[-max_attempts:]:
+                lines.append(f"  · {d}")
+        if self.attempts:
+            lines.append("INTENTOS PREVIOS:")
+            for a in self.attempts[-max_attempts:]:
+                strat = (a.get("strategy") or "")[:160]
+                out = (a.get("outcome") or "")[:200]
+                lines.append(f"  · Fase {a.get('phase', '?')}: {strat} → {out}")
+        if self.verifications:
+            last = self.verifications[-1]
+            lines.append("ÚLTIMA VERIFICACIÓN:")
+            lines.append("  " + (last.get("summary") or "").replace("\n", "\n  "))
+        if not short:
+            b = _goal_budget_status(self)
+            lines.append(
+                f"PRESUPUESTO: {b['elapsed_s']/60:.0f} min transcurridos · "
+                f"{b['commands_used']}/{b['budget_commands']} comandos · "
+                f"límite {b['budget_seconds']/3600:.1f}h"
+            )
+        return "\n".join(lines) if lines else "(sin historial previo)"
 
 
 # --- Parsing del plan emitido por el LLM-orquestador --------------------
@@ -2243,9 +2049,22 @@ class GoalRun:
 _GOAL_SUB_RE = re.compile(
     r"-\s*name:\s*(?P<name>[A-Za-z0-9_\-]+)\s*\n"
     r"\s*skill:\s*(?P<skill>[A-Za-z0-9_\-]+)\s*\n"
+    r"(?:\s*depends_on:\s*(?P<depends>[^\n]*)\n)?"
+    r"(?:\s*success:\s*(?P<success>[^\n]*)\n)?"
     r"\s*task:\s*(?P<task>.+?)(?=\n\s*-\s*name:|\nEND_PLAN|\Z)",
     re.DOTALL,
 )
+
+
+def _parse_depends(raw):
+    """'a, b; c' → ['a', 'b', 'c'] (ignora none/ninguno)."""
+    items = re.split(r"[,;]+", raw or "")
+    out = []
+    for x in items:
+        x = x.strip()
+        if x and x.lower() not in ("none", "ninguno", "ninguna", "-"):
+            out.append(x)
+    return out
 
 
 def _parse_orchestrator_response(text):
@@ -2294,6 +2113,8 @@ def _parse_orchestrator_response(text):
             subs.append({
                 "name": m.group("name").strip(),
                 "skill": m.group("skill").strip(),
+                "depends_on": _parse_depends(m.group("depends")),
+                "success": (m.group("success") or "").strip(),
                 "task": m.group("task").strip(),
             })
         if subs:
@@ -2440,6 +2261,12 @@ SKILLS DISPONIBLES para asignar a subagentes: {skills_str}
 
 FASE ACTUAL: {goal_run.current_phase + 1} / {goal_run.max_phases}
 
+CRITERIOS DE ÉXITO VERIFICABLES (los evalúa el AGENTE, no tú):
+{chr(10).join('  · ' + c for c in goal_run.criteria) if goal_run.criteria else '  (ninguno definido — el sistema aceptará tu GOAL_DONE)'}
+
+ESTADO DE BÚSQUEDA (blackboard — no repitas lo que ya falló):
+{goal_run.blackboard_text()}
+
 HISTORIAL DE FASES YA EJECUTADAS:
 {prev_summary or '(ninguna fase previa)'}
 
@@ -2456,7 +2283,11 @@ INSTRUCCIONES:
 
 2. Decide UNA de estas tres salidas (sin texto antes ni después del bloque):
 
-   A) GOAL_DONE — si el objetivo ya se cumplió según la evidencia:
+   A) GOAL_DONE — si el objetivo ya se cumplió según la evidencia.
+      IMPORTANTE: si hay criterios de éxito arriba, el agente los verificará
+      de forma objetiva. Si no se cumplen, tu GOAL_DONE será RECHAZADO y
+      tendrás que proponer otro PLAN. No lo emitas hasta que la evidencia
+      permita cumplirlos.
 
          GOAL_DONE:
          reason: <una frase explicando por qué se cumplió>
@@ -2477,13 +2308,22 @@ INSTRUCCIONES:
          PLAN:
          - name: <alfanum-corto>
            skill: <uno de las skills disponibles>
+           depends_on: <opcional: nombres de otros subagentes de ESTE plan>
+           success: <opcional: criterio objetivo de éxito de esta tarea>
            task: <UN párrafo describiendo la misión concreta del subagente,
                   qué herramientas usar, qué archivos consultar/actualizar,
                   qué considerar "tarea completa">
          - name: <otro>
            skill: <skill>
+           depends_on: <opcional>
+           success: <opcional>
            task: <misión>
          END_PLAN
+
+      `depends_on` permite crear un DAG dentro de la fase: si B depende de A,
+      el agente lanzará A primero y B cuando A termine. `success` es un
+      criterio verificable (p. ej. "file_exists:evidence/x.txt" o
+      "cmd_rc:test -s evidence/x.txt") que el subagente verá en su tarea.
 
 3. Reglas de orquestación:
    - Si la fase anterior dejó subagentes "exhausted" o "failed", o si los
@@ -2625,10 +2465,136 @@ def _list_available_skills():
     return out
 
 
+def _goal_account_commands(goal_run, names):
+    """Suma al presupuesto los comandos ejecutados por los subagentes de una
+    ola. Se llama una vez por ola para no contar dos veces."""
+    with _subagents_lock:
+        for n in names:
+            s = _subagents_registry.get(n)
+            if s:
+                goal_run.commands_used += len(s.commands_run)
+
+
+def _goal_execute_phase(goal_run, phase_n, specs):
+    """Ejecuta una fase respetando `depends_on` (DAG ligero por olas).
+
+    Devuelve dict:
+      {spawned, summaries, errors, killed, timed_out}
+    """
+    specs = list(specs or [])[:MAX_CONCURRENT_SUBAGENTS]
+    # Claves únicas: si el LLM repite un nombre, no perdemos tareas.
+    pending = {}
+    for i, s in enumerate(specs):
+        if not isinstance(s, dict):
+            continue
+        key = (s.get("name") or f"task{i+1}").strip() or f"task{i+1}"
+        base = key
+        n = 1
+        while key in pending:
+            n += 1
+            key = f"{base}_{n}"
+        d = dict(s)
+        d["name"] = key
+        pending[key] = d
+    done_orig, failed_orig = set(), set()
+    spawned_all, summaries, errors = [], [], []
+    # La fase nunca debe exceder el presupuesto restante del goal.
+    phase_timeout = GOAL_PHASE_TIMEOUT_S
+    b = _goal_budget_status(goal_run)
+    if goal_run.budget_seconds:
+        remaining_budget = goal_run.budget_seconds - b["elapsed_s"]
+        phase_timeout = min(phase_timeout, max(60.0, remaining_budget))
+    deadline = time.time() + phase_timeout
+    goal_ctx = goal_run.blackboard_text(short=True)
+
+    while pending:
+        if goal_run.kill_flag.is_set():
+            for n in spawned_all:
+                kill_subagent(n)
+            return {"spawned": spawned_all, "summaries": summaries,
+                    "errors": errors, "killed": True, "timed_out": False}
+
+        ready = [
+            s for s in pending.values()
+            if all(d in done_orig or d in failed_orig
+                   for d in s.get("depends_on", []))
+        ]
+        if not ready:
+            # Ciclo o dependencia inexistente: desbloqueamos para no colgar.
+            goal_run.log("  ⚠ DAG sin nodos listos (ciclo/dependencia "
+                         "huérfana); se ejecuta el resto sin esperar")
+            ready = list(pending.values())
+
+        wave = ready[:max(1, MAX_CONCURRENT_SUBAGENTS)]
+        wave_map = {}
+        for spec in wave:
+            name = f"p{phase_n}-{spec['name']}"[:48]
+            pending.pop(spec["name"], None)
+            task = spec.get("task", "")
+            if spec.get("success"):
+                task += (f"\n\nCRITERIO DE ÉXITO DE ESTA TAREA: "
+                         f"{spec['success']}")
+            _sub, err = spawn_subagent(
+                name, spec.get("skill", ""), task,
+                target=goal_run.target, goal_context=goal_ctx,
+                success_criterion=spec.get("success") or None,
+                allow_destructive=(
+                    "allow_destructive" in (goal_run.constraints or [])
+                ),
+            )
+            if err:
+                errors.append((name, err))
+                failed_orig.add(spec["name"])
+                goal_run.log(f"  ✗ spawn fail '{name}': {err}")
+            else:
+                wave_map[name] = spec["name"]
+                spawned_all.append(name)
+                goal_run.log(
+                    f"  ✓ spawned '{name}' skill={spec.get('skill')} "
+                    f"deps={spec.get('depends_on') or []} "
+                    f"task={spec.get('task', '')[:80]}..."
+                )
+
+        if not wave_map:
+            continue
+
+        remaining = max(1.0, deadline - time.time())
+        wait = _goal_wait_phase(
+            list(wave_map), goal_run.kill_flag, remaining,
+        )
+        if wait["killed"]:
+            for n in spawned_all:
+                kill_subagent(n)
+            return {"spawned": spawned_all, "summaries": summaries,
+                    "errors": errors, "killed": True, "timed_out": False}
+        if wait["timed_out"]:
+            for n in wave_map:
+                kill_subagent(n)
+            return {"spawned": spawned_all, "summaries": summaries,
+                    "errors": errors, "killed": False, "timed_out": True}
+
+        for name, orig in wave_map.items():
+            s = _subagents_registry.get(name)
+            if s and s.status == "done":
+                done_orig.add(orig)
+            else:
+                failed_orig.add(orig)
+        summaries.extend(_collect_subagent_summaries(list(wave_map)))
+        _goal_account_commands(goal_run, list(wave_map))
+
+    return {"spawned": spawned_all, "summaries": summaries,
+            "errors": errors, "killed": False, "timed_out": False}
+
+
 def _goal_run_loop(goal_run):
-    """Bucle del orquestador: planifica fases hasta done/blocked/exhausted.
-    Tras cada fase completada y al cerrar, vuelca el estado a disco para
-    permitir reanudación tras crash/cierre del agente.
+    """Bucle del orquestador con controlador + verificador + presupuesto.
+
+    Regla de parada (P1):
+      · el verificador objetivo confirma los criterios → done
+      · el presupuesto (tiempo/comandos) se agota → budget_exhausted
+      · el LLM se bloquea tras N replanificaciones → blocked (escalado)
+      · agotar max_phases → exhausted
+    Tras cada fase y al cerrar se persiste el estado para reanudación.
     """
     _subagent_thread_marker.active = True  # silencia output a la consola
     is_resumed = goal_run.resumed_from is not None
@@ -2636,6 +2602,8 @@ def _goal_run_loop(goal_run):
         goal_run.status = "running"
         if not goal_run.started_at:
             goal_run.started_at = datetime.now().isoformat(timespec="seconds")
+        if not getattr(goal_run, "started_epoch", None):
+            goal_run.started_epoch = time.time()
         if is_resumed:
             goal_run.log(f"GoalRun REANUDADO · target={goal_run.target} · "
                          f"continuando desde fase {goal_run.current_phase + 1}"
@@ -2644,9 +2612,23 @@ def _goal_run_loop(goal_run):
             goal_run.log(f"GoalRun iniciado · target={goal_run.target} · "
                          f"max_phases={goal_run.max_phases}")
         goal_run.log(f"GOAL: {goal_run.goal}")
+        goal_run.log(f"CRITERIOS: {goal_run.criteria or '(ninguno)'}")
+        goal_run.log(f"PRESUPUESTO: {goal_run.budget_seconds}s · "
+                     f"{goal_run.budget_commands} comandos · "
+                     f"restricciones={goal_run.constraints or '[]'}")
         goal_run.save_state()
 
         available_skills = _list_available_skills()
+
+        # Verificación inicial: puede estar ya cumplido.
+        v0 = verify_goal_criteria(goal_run.criteria)
+        goal_run.verifications.append(v0)
+        if v0["ok"]:
+            goal_run.status = "done"
+            goal_run.outcome_reason = "Criterios verificados antes de empezar."
+            goal_run.summary = v0["summary"]
+            goal_run.log("✓ Criterios ya cumplidos al inicio.")
+            return
 
         while goal_run.current_phase < goal_run.max_phases:
             if goal_run.kill_flag.is_set():
@@ -2654,21 +2636,24 @@ def _goal_run_loop(goal_run):
                 goal_run.outcome_reason = "Kill solicitado por el operador."
                 return
 
+            budget = _goal_budget_status(goal_run)
+            if budget["exhausted"]:
+                goal_run.status = "budget_exhausted"
+                goal_run.outcome_reason = (
+                    f"Presupuesto agotado: {budget['detail']}. "
+                    f"La evidencia acumulada sigue en el target; puedes "
+                    f"subir el presupuesto y reanudar."
+                )
+                goal_run.log(f"⛔ {goal_run.outcome_reason}")
+                return
+
             phase_n = goal_run.current_phase + 1
-            goal_run.log(f"=== Planificando fase {phase_n} ===")
+            goal_run.log(f"=== Planificando fase {phase_n} "
+                         f"(presupuesto: {budget['commands_used']}/"
+                         f"{budget['budget_commands']} cmds · "
+                         f"{budget['elapsed_s']/60:.0f} min) ===")
             plan = _goal_request_plan(goal_run, available_skills)
             goal_run.log(f"Plan decision: action={plan.get('action')}")
-
-            if plan["action"] == "done":
-                goal_run.status = "done"
-                goal_run.outcome_reason = plan.get("reason", "")
-                goal_run.summary = plan.get("summary", "")
-                return
-
-            if plan["action"] == "blocked":
-                goal_run.status = "blocked"
-                goal_run.outcome_reason = plan.get("reason", "")
-                return
 
             if plan["action"] == "parse_error":
                 goal_run.status = "failed"
@@ -2678,101 +2663,180 @@ def _goal_run_loop(goal_run):
                 )
                 return
 
-            # action == "phase"
-            subs_spec = plan["subagents"][:MAX_CONCURRENT_SUBAGENTS]
-            spawned = []
-            errors = []
-            for spec in subs_spec:
-                # nombre único: prefijo con fase para evitar colisiones
-                name = f"p{phase_n}-{spec['name']}"[:48]
-                _sub, err = spawn_subagent(
-                    name, spec["skill"], spec["task"],
-                    target=goal_run.target,
+            if plan["action"] == "done":
+                # El LLM dice "hecho", pero el verificador tiene la última
+                # palabra si hay criterios objetivos.
+                v = verify_goal_criteria(goal_run.criteria)
+                goal_run.verifications.append(v)
+                if v["unknown"] or v["ok"]:
+                    goal_run.status = "done"
+                    goal_run.outcome_reason = plan.get("reason", "")
+                    goal_run.summary = plan.get("summary", "")
+                    return
+                goal_run.log("⛔ GOAL_DONE RECHAZADO por el verificador:\n"
+                             + v["summary"])
+                goal_run.dead_ends.append(
+                    f"Fase {phase_n}: el LLM declaró GOAL_DONE pero los "
+                    f"criterios no se cumplen ({v['summary'].splitlines()[0]})"
                 )
-                if err:
-                    errors.append((name, err))
-                    goal_run.log(f"  ✗ spawn fail '{name}': {err}")
-                else:
-                    spawned.append(name)
-                    goal_run.log(
-                        f"  ✓ spawned '{name}' skill={spec['skill']} "
-                        f"task={spec['task'][:80]}..."
+                goal_run.attempts.append({
+                    "phase": phase_n,
+                    "strategy": "GOAL_DONE (rechazado por verificador)",
+                    "outcome": v["summary"].splitlines()[0],
+                    "verification_ok": False,
+                })
+                goal_run.current_phase += 1
+                goal_run.save_state()
+                continue
+
+            if plan["action"] == "blocked":
+                reason = plan.get("reason", "")
+                goal_run.blocked_replans += 1
+                goal_run.dead_ends.append(
+                    f"Fase {phase_n}: bloqueo declarado: {reason[:300]}"
+                )
+                goal_run.log(f"⚠ GOAL_BLOCKED ({goal_run.blocked_replans}/"
+                             f"{GOAL_MAX_BLOCKED_REPLANS}): {reason}")
+                if goal_run.blocked_replans > GOAL_MAX_BLOCKED_REPLANS:
+                    goal_run.status = "blocked"
+                    goal_run.outcome_reason = (
+                        f"Bloqueado tras {goal_run.blocked_replans} "
+                        f"replanificaciones. Último motivo: {reason}"
                     )
+                    return
+                # No paramos: consumimos una fase y replanificamos con el
+                # dead-end en el blackboard para forzar otra estrategia.
+                goal_run.attempts.append({
+                    "phase": phase_n,
+                    "strategy": "GOAL_BLOCKED (replanificación forzada)",
+                    "outcome": reason[:300],
+                    "verification_ok": False,
+                })
+                goal_run.current_phase += 1
+                goal_run.save_state()
+                continue
 
-            if not spawned:
-                goal_run.status = "failed"
-                goal_run.outcome_reason = (
-                    f"Ningún subagente lanzado en fase {phase_n}. "
-                    f"Errores: {errors}"
-                )
-                return
-
-            # Esperar a que terminen
-            goal_run.log(f"Esperando fin de fase {phase_n} "
-                         f"({len(spawned)} subagentes)...")
-            wait_result = _goal_wait_phase(
-                spawned, goal_run.kill_flag, GOAL_PHASE_TIMEOUT_S,
+            # action == "phase"
+            phase_res = _goal_execute_phase(
+                goal_run, phase_n, plan.get("subagents", []),
             )
-
-            if wait_result["killed"]:
-                # Matar los subagentes que aún estén corriendo
-                for n in spawned:
-                    kill_subagent(n)
+            if phase_res["killed"]:
                 goal_run.status = "killed"
                 goal_run.outcome_reason = "Goal cancelado durante fase."
                 return
-
-            if wait_result["timed_out"]:
-                for n in spawned:
-                    kill_subagent(n)
+            if phase_res["timed_out"]:
+                b_now = _goal_budget_status(goal_run)
+                if b_now["exhausted"]:
+                    goal_run.status = "budget_exhausted"
+                    goal_run.outcome_reason = (
+                        f"Presupuesto agotado durante la fase {phase_n}: "
+                        f"{b_now['detail']}."
+                    )
+                else:
+                    goal_run.status = "failed"
+                    goal_run.outcome_reason = (
+                        f"Fase {phase_n} excedió timeout "
+                        f"({GOAL_PHASE_TIMEOUT_S}s)."
+                    )
+                return
+            if not phase_res["spawned"]:
                 goal_run.status = "failed"
                 goal_run.outcome_reason = (
-                    f"Fase {phase_n} excedió timeout ({GOAL_PHASE_TIMEOUT_S}s)."
+                    f"Ningún subagente lanzado en fase {phase_n}. "
+                    f"Errores: {phase_res['errors']}"
                 )
                 return
 
-            # Recoger summaries y guardar la fase
-            summaries = _collect_subagent_summaries(spawned)
+            summaries = phase_res["summaries"]
             goal_run.phases.append({
                 "n": phase_n,
-                "subagent_names": spawned,
+                "subagent_names": phase_res["spawned"],
                 "subagent_summaries": summaries,
                 "finished_at": datetime.now().isoformat(timespec="seconds"),
             })
             goal_run.current_phase += 1
+            goal_run.blocked_replans = 0  # una fase ejecutada rompe la racha
+
+            # Verificación objetiva tras la fase.
+            v = verify_goal_criteria(goal_run.criteria)
+            goal_run.verifications.append(v)
+            goal_run.attempts.append({
+                "phase": phase_n,
+                "strategy": " | ".join(
+                    f"{s.get('name')}: {(s.get('task') or '')[:80]}"
+                    for s in plan.get("subagents", [])
+                ),
+                "outcome": (
+                    f"{len(summaries)} subagentes · "
+                    f"{v['summary'].splitlines()[0]}"
+                ),
+                "subagents": [
+                    {"name": s["name"], "skill": s["skill"],
+                     "status": s["status"], "n_commands": s["n_commands"]}
+                    for s in summaries
+                ],
+                "verification_ok": v["ok"],
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            })
+            # Cap del blackboard para no crecer sin límite.
+            goal_run.attempts = goal_run.attempts[-30:]
+            goal_run.dead_ends = goal_run.dead_ends[-30:]
+
             goal_run.log(f"=== Fase {phase_n} terminada · "
-                         f"{len(summaries)} subagentes ===")
-            # SNAPSHOT del estado tras cada fase completa. Esto es el punto
-            # de checkpoint para reanudación tras crash.
+                         f"{len(summaries)} subagentes · "
+                         f"verificación: {v['summary'].splitlines()[0]} ===")
+            if v["ok"]:
+                goal_run.status = "done"
+                goal_run.outcome_reason = "Criterios de éxito verificados."
+                goal_run.summary = v["summary"]
+                goal_run.save_state()
+                return
+
+            if summaries and all(
+                s["status"] in ("failed", "exhausted", "killed")
+                for s in summaries
+            ):
+                goal_run.dead_ends.append(
+                    f"Fase {phase_n}: todos los subagentes fallaron o "
+                    f"agotaron sus turnos"
+                )
+
+            # SNAPSHOT tras cada fase completa (checkpoint de reanudación).
             goal_run.save_state()
 
-        # Si salimos del while sin done/blocked → última oportunidad de
-        # declarar GOAL_DONE basado en la evidencia acumulada por todas
-        # las fases (los subagentes de la última fase pueden haber escrito
-        # TARGET_UPDATEs que SI cumplen el goal, pero el orquestador nunca
-        # los re-evaluó porque entró en la fase siguiente). Hacemos una
-        # llamada final de evaluación.
+        # Agotadas las fases → evaluación final + verificación.
         if not goal_run.kill_flag.is_set():
             goal_run.log("=== Evaluación final tras agotar fases ===")
             final_eval = _goal_request_plan(
                 goal_run, available_skills, max_attempts=2,
             )
             goal_run.log(f"Evaluación final: action={final_eval.get('action')}")
-            if final_eval["action"] == "done":
+            v = verify_goal_criteria(goal_run.criteria)
+            goal_run.verifications.append(v)
+            if v["ok"]:
+                goal_run.status = "done"
+                goal_run.outcome_reason = "Criterios verificados en evaluación final."
+                goal_run.summary = v["summary"]
+            elif v["unknown"] and final_eval["action"] == "done":
                 goal_run.status = "done"
                 goal_run.outcome_reason = final_eval.get("reason", "")
                 goal_run.summary = final_eval.get("summary", "")
+            elif final_eval["action"] == "done":
+                goal_run.status = "exhausted"
+                goal_run.outcome_reason = (
+                    f"El LLM declaró GOAL_DONE pero los criterios NO se "
+                    f"verifican ({v['summary'].splitlines()[0]}). Se agotaron "
+                    f"las {goal_run.max_phases} fases."
+                )
             elif final_eval["action"] == "blocked":
                 goal_run.status = "blocked"
                 goal_run.outcome_reason = final_eval.get("reason", "")
             else:
-                # parse_error o phase → mantenemos exhausted
                 goal_run.status = "exhausted"
                 goal_run.outcome_reason = (
                     f"Se agotaron las {goal_run.max_phases} fases sin "
-                    f"alcanzar el goal. Revisa el INFORME AUTOMÁTICO "
-                    f"para ver la evidencia recopilada — puede contener "
-                    f"el vector aunque el orquestador no lo haya declarado."
+                    f"alcanzar el goal. Revisa el INFORME AUTOMÁTICO y el "
+                    f"blackboard (attempts/dead_ends) en el estado persistido."
                 )
         else:
             goal_run.status = "killed"
@@ -2816,14 +2880,25 @@ def start_goal(goal_text, max_phases=GOAL_MAX_PHASES):
                 f"{_active_goal_orch.max_phases}). "
                 f"`goal kill` para detenerlo antes de lanzar otro"
             )
-        if not goal_text or len(goal_text.strip()) < 8:
+        spec = GoalSpec.parse(goal_text)
+        if not spec.goal or len(spec.goal.strip()) < 8:
             return None, "describe el goal en al menos 8 caracteres"
         # El target es opcional: si no hay uno activo, el goal corre en
         # modo ad-hoc (sin workspace compartido; los subagentes no escriben
         # TARGET_UPDATEs ni se genera informe automático).
-        goal_run = GoalRun(goal_text=goal_text.strip(),
+        # `goal spec` puede indicar `target: <nombre>`; lo cargamos si no hay
+        # uno activo o si difiere.
+        if spec.target and spec.target != ACTIVE_TARGET:
+            ok, info = load_target(spec.target)
+            if not ok:
+                return None, (
+                    f"target '{spec.target}' del spec no se pudo cargar: "
+                    f"{info.get('error', '?')}"
+                )
+        goal_run = GoalRun(goal_text=spec.goal,
                            target=ACTIVE_TARGET,
-                           max_phases=max_phases)
+                           max_phases=max_phases,
+                           spec=spec)
         _active_goal_orch = goal_run
     goal_run.thread = threading.Thread(
         target=_goal_run_loop, args=(goal_run,),
@@ -2882,7 +2957,10 @@ def resume_goal(goal_id):
                 data = json.load(f)
         except Exception as e:
             return None, f"error leyendo estado: {e}"
-        if data.get("status") in ("done", "blocked", "killed"):
+        # `blocked`, `exhausted` y `budget_exhausted` son reanudables: el
+        # operador puede subir el presupuesto/fases y continuar. Solo `done`
+        # y `killed` son terminales de verdad.
+        if data.get("status") in ("done", "killed"):
             return None, (
                 f"goal '{goal_id}' ya tiene estado terminal "
                 f"({data['status']}). Lanza un nuevo `goal` si quieres "
@@ -2907,6 +2985,11 @@ def resume_goal(goal_id):
         gr.outcome_reason = ""
         gr.finished_at = ""
         gr.resumed_from = data.get("id")
+        # Al reanudar, el operador concede una ventana de presupuesto nueva
+        # (si no, un goal budget_exhausted volvería a agotarse al instante).
+        gr.started_epoch = time.time()
+        gr.commands_used = 0
+        gr.blocked_replans = 0
         gr.log("=== RESUME desde disco ===")
         gr.log(f"current_phase={gr.current_phase}/{gr.max_phases} · "
                f"fases ya completadas: {len(gr.phases)}")
@@ -3335,11 +3418,11 @@ def _print_goal_finished_panel(gr, ring_bell=False):
     status_colors = {
         "done": GREEN, "blocked": "#fbbf24",
         "exhausted": MAGENTA, "killed": "#fbbf24",
-        "failed": RED,
+        "budget_exhausted": "#f97316", "failed": RED,
     }
     status_emoji = {
         "done": "✅", "blocked": "⚠️", "exhausted": "⏱️",
-        "killed": "✋", "failed": "❌",
+        "budget_exhausted": "💸", "killed": "✋", "failed": "❌",
     }
     color = status_colors.get(gr.status, WHITE)
     emoji = status_emoji.get(gr.status, "·")
@@ -3359,6 +3442,31 @@ def _print_goal_finished_panel(gr, ring_bell=False):
     ]
     if gr.outcome_reason:
         lines.append(f"[bold]Motivo:[/] {gr.outcome_reason}")
+    # Verificación objetiva de criterios (P1).
+    if getattr(gr, "criteria", None):
+        lines.append("")
+        lines.append("[bold]Criterios de éxito:[/]")
+        last_v = (gr.verifications[-1] if getattr(gr, "verifications", None)
+                  else None)
+        if last_v:
+            for r in last_v.get("results", []):
+                mark = f"[{GREEN}]✓[/]" if r["ok"] else f"[{RED}]✗[/]"
+                lines.append(f"  {mark} {r['criterion']} — {r['detail']}")
+        else:
+            for c in gr.criteria:
+                lines.append(f"  · {c}")
+    if getattr(gr, "dead_ends", None):
+        lines.append("")
+        lines.append("[bold]Dead-ends registrados:[/]")
+        for d in gr.dead_ends[-5:]:
+            lines.append(f"  · {d[:180]}")
+    if getattr(gr, "budget_commands", None):
+        b = _goal_budget_status(gr)
+        lines.append("")
+        lines.append(
+            f"[bold]Presupuesto:[/] {b['elapsed_s']/60:.0f} min · "
+            f"{b['commands_used']}/{b['budget_commands']} comandos"
+        )
     if gr.summary:
         lines.append("")
         lines.append(f"[bold]Resumen del orquestador:[/]")
@@ -3409,7 +3517,8 @@ def _check_goal_notifications():
     terminar un GoalRun (sólo una vez por goal)."""
     with _goal_lock:
         gr = _active_goal_orch
-    if gr and gr.status in ("done", "blocked", "exhausted", "killed", "failed") \
+    if gr and gr.status in ("done", "blocked", "exhausted",
+                            "budget_exhausted", "killed", "failed") \
             and not gr.reported:
         _print_goal_finished_panel(gr, ring_bell=True)
         gr.reported = True
@@ -4351,6 +4460,96 @@ def process_file_blocks(answer):
     }
 
 
+def process_file_blocks_headless(answer):
+    """Igual que `process_file_blocks` pero SIN UI ni confirmaciones.
+
+    Pensado para subagentes autónomos (hilos en background): aplica
+    FILE_READ/EDIT/WRITE directamente y devuelve los mensajes que el
+    llamador debe inyectar en el history del subagente. Mantiene el
+    guardrail anti-reescritura de FILE_WRITE sobre archivos existentes.
+
+    Devuelve el mismo dict que `process_file_blocks`:
+      {any, read_messages, op_summary, had_successful_edit_or_write}
+    """
+    reads = extract_file_reads(answer)
+    edits = extract_file_edits(answer)
+    writes = extract_file_writes(answer)
+    if not (reads or edits or writes):
+        return {"any": False, "read_messages": [], "op_summary": "",
+                "had_successful_edit_or_write": False}
+
+    read_messages = []
+    op_lines = []
+    had_success = False
+
+    for raw_path in reads:
+        r = apply_file_read(raw_path)
+        if r["ok"]:
+            read_messages.append(
+                f"[FILE_READ: {r['path']}  ({r['shown_lines']}/{r['total_lines']} líneas"
+                + (", truncado" if r["truncated"] else "") + ")]\n"
+                + r["content"]
+                + f"[/FILE_READ: {r['path']}]"
+            )
+            op_lines.append(
+                f"✓ FILE_READ {r['path']} → {r['shown_lines']} líneas"
+            )
+        else:
+            op_lines.append(f"✗ FILE_READ {raw_path} → {r['error']}")
+
+    for raw_path, old_s, new_s in edits:
+        r = apply_file_edit(raw_path, old_s, new_s)
+        if r["ok"]:
+            had_success = True
+            op_lines.append(f"✓ FILE_EDIT {r['path']} aplicado")
+        else:
+            op_lines.append(f"✗ FILE_EDIT {raw_path} → {r['error']}")
+
+    for raw_path, content in writes:
+        ok_path, full_or_err, rel = _validate_workspace_path(raw_path)
+        if not ok_path:
+            op_lines.append(f"✗ FILE_WRITE {raw_path} → {full_or_err}")
+            continue
+        # Guardrail: no reescribir un archivo existente para un cambio <30%
+        # (debe usar FILE_EDIT). Igual que el flujo interactivo.
+        if os.path.exists(full_or_err):
+            try:
+                with open(full_or_err, "r", encoding="utf-8") as f:
+                    old_content = f.read()
+            except (OSError, UnicodeDecodeError):
+                old_content = ""
+            if old_content:
+                body = content if content.endswith("\n") else content + "\n"
+                sm = difflib.SequenceMatcher(
+                    a=old_content.splitlines(),
+                    b=body.splitlines(),
+                    autojunk=False,
+                )
+                changed = 1.0 - sm.ratio()
+                if changed < 0.30:
+                    op_lines.append(
+                        f"✗ FILE_WRITE {rel} → REJECTED: el archivo existe y "
+                        f"el cambio sólo toca {int(changed*100)}% (umbral 30%). "
+                        f"Usa FILE_EDIT."
+                    )
+                    continue
+        r = apply_file_write(raw_path, content)
+        if r["ok"]:
+            had_success = True
+            op_lines.append(
+                f"✓ FILE_WRITE {r['path']} {'creado' if r.get('created') else 'sobrescrito'}"
+            )
+        else:
+            op_lines.append(f"✗ FILE_WRITE {raw_path} → {r['error']}")
+
+    return {
+        "any": True,
+        "read_messages": read_messages,
+        "op_summary": "\n".join(op_lines),
+        "had_successful_edit_or_write": had_success,
+    }
+
+
 def unload_target():
     """Elimina del history el bloque del target activo y limpia el marcador."""
     global ACTIVE_TARGET
@@ -4705,8 +4904,18 @@ def append_runs_entry(command, rc, target=None):
 # ============================================================
 
 def get_lmstudio_models():
+    """Lista de IDs de modelos expuestos por el backend activo (LM Studio o
+    Ollama Cloud). Nombre histórico; sirve para cualquier backend
+    OpenAI-compatible. Si el backend no responde, cae a su fallback."""
+    cfg = active_backend_cfg()
+    base = cfg["base_url"].rstrip("/")
+    fallback = cfg.get("fallback", MODEL_NAME_FALLBACK)
+    headers = {}
+    key = backend_api_key()
+    if cfg.get("needs_key") and key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
-        response = requests.get(f"{LMSTUDIO_BASE_URL}/models", timeout=3)
+        response = requests.get(f"{base}/models", headers=headers, timeout=6)
         response.raise_for_status()
 
         data = response.json()
@@ -4717,15 +4926,173 @@ def get_lmstudio_models():
             if model_id:
                 models.append(model_id)
 
-        return models if models else [MODEL_NAME_FALLBACK]
+        if not models:
+            return [fallback]
+        # Orden determinista para backends cuyo endpoint no garantiza orden
+        # estable (p. ej. Ollama Cloud): así el índice de `models N` siempre
+        # apunta al mismo modelo que muestra la tabla.
+        if cfg.get("sort_models"):
+            models = sorted(models, key=str.lower)
+        return models
 
     except Exception:
-        return [MODEL_NAME_FALLBACK]
+        return [fallback]
+
+
+def get_lmstudio_models_detailed():
+    """Lista enriquecida de modelos vía el API nativo de LM Studio
+    (`/api/v0/models`): incluye estado (loaded / not-loaded), ventana de
+    contexto y capacidades (tool_use, vision...). Si el endpoint nativo no
+    está disponible cae a `/v1/models` (solo IDs, sin estado).
+
+    Devuelve lista de dicts: {id, state, arch, max_ctx, loaded_ctx, caps, quant}.
+    """
+    # El API nativo de estado/contexto solo existe en LM Studio. En otros
+    # backends (Ollama Cloud) saltamos directo al fallback de solo-IDs.
+    if _ACTIVE_BACKEND != "lmstudio":
+        return [
+            {"id": m, "state": "cloud", "arch": "", "quant": "",
+             "max_ctx": None, "loaded_ctx": None, "caps": []}
+            for m in get_lmstudio_models()
+        ]
+
+    base = LMSTUDIO_BASE_URL.rstrip("/")
+    # El API nativo cuelga de la raíz del host, no de /v1.
+    native_base = base[:-3] if base.endswith("/v1") else base
+    try:
+        r = requests.get(f"{native_base}/api/v0/models", timeout=3)
+        r.raise_for_status()
+        out = []
+        for item in r.json().get("data", []):
+            mid = item.get("id")
+            if not mid:
+                continue
+            out.append({
+                "id": mid,
+                "state": item.get("state", "unknown"),
+                "arch": item.get("arch", ""),
+                "quant": item.get("quantization", ""),
+                "max_ctx": item.get("max_context_length"),
+                "loaded_ctx": item.get("loaded_context_length"),
+                "caps": item.get("capabilities", []) or [],
+            })
+        if out:
+            return out
+    except Exception:
+        pass
+
+    # Fallback: solo IDs desde el endpoint OpenAI-compatible.
+    return [
+        {"id": m, "state": "unknown", "arch": "", "quant": "",
+         "max_ctx": None, "loaded_ctx": None, "caps": []}
+        for m in get_lmstudio_models()
+    ]
 
 
 def get_active_model():
+    """Modelo que el agente usará en sus llamadas.
+
+    Prioridad:
+      1. Selección manual del operador (_SELECTED_MODEL), si sigue expuesta.
+      2. Primer modelo que expone LM Studio.
+      3. MODEL_NAME_FALLBACK.
+    """
     models = get_lmstudio_models()
-    return models[0] if models else MODEL_NAME_FALLBACK
+    if _SELECTED_MODEL and _SELECTED_MODEL in models:
+        return _SELECTED_MODEL
+    return models[0] if models else active_backend_cfg().get(
+        "fallback", MODEL_NAME_FALLBACK)
+
+
+def set_active_model(selector):
+    """Fija el modelo activo desde un nombre exacto o un índice (1-based,
+    tal como aparece en `print_models`). Devuelve (ok, mensaje).
+
+    selector="auto" / "reset" / "" → vuelve al modo automático (primero
+    expuesto por LM Studio).
+    """
+    global _SELECTED_MODEL
+    models = get_lmstudio_models()
+
+    sel = (selector or "").strip()
+    if sel.lower() in ("", "auto", "reset", "default"):
+        _SELECTED_MODEL = None
+        return True, "Modo automático: se usará el primer modelo cargado en LM Studio."
+
+    # ¿Índice 1-based?
+    if sel.isdigit():
+        idx = int(sel)
+        if 1 <= idx <= len(models):
+            _SELECTED_MODEL = models[idx - 1]
+            return True, f"Modelo activo → {_SELECTED_MODEL}"
+        return False, f"Índice fuera de rango (hay {len(models)} modelo(s); usa 1..{len(models)})."
+
+    # Nombre exacto.
+    if sel in models:
+        _SELECTED_MODEL = sel
+        return True, f"Modelo activo → {sel}"
+
+    # Coincidencia parcial (case-insensitive) — útil para nombres largos.
+    matches = [m for m in models if sel.lower() in m.lower()]
+    if len(matches) == 1:
+        _SELECTED_MODEL = matches[0]
+        return True, f"Modelo activo → {matches[0]}"
+    if len(matches) > 1:
+        return False, ("Coincidencia ambigua: " + ", ".join(matches) +
+                       ". Especifica el nombre completo o el índice.")
+
+    return False, (f"No hay ningún modelo cargado que coincida con '{sel}'. "
+                   f"Usa `models` para ver la lista.")
+
+
+def switch_backend(selector):
+    """Cambia el backend de modelo activo (`lmstudio` | `ollama`) y reconstruye
+    el cliente OpenAI. Resetea la selección manual de modelo (cada backend tiene
+    sus propios modelos). Devuelve (ok, mensaje).
+
+    selector="" / "status" → informa del backend actual sin cambiarlo.
+    """
+    global _ACTIVE_BACKEND, _SELECTED_MODEL, client
+
+    sel = (selector or "").strip().lower()
+    cur = active_backend_cfg()
+
+    if sel in ("", "status"):
+        return True, (f"Backend activo: {_ACTIVE_BACKEND} ({cur['label']}) "
+                      f"→ {cur['base_url']}")
+
+    # Alias cómodos.
+    aliases = {
+        "lm": "lmstudio", "lmstudio": "lmstudio", "local": "lmstudio",
+        "ollama": "ollama", "cloud": "ollama", "ollama-cloud": "ollama",
+    }
+    target = aliases.get(sel, sel)
+
+    if target not in BACKENDS:
+        return False, (f"Backend desconocido: '{selector}'. "
+                       f"Opciones: {', '.join(BACKENDS)}.")
+
+    cfg = BACKENDS[target]
+
+    # Validación de API key para backends que la requieren.
+    if cfg.get("needs_key"):
+        key = os.environ.get("OLLAMA_API_KEY", "")
+        if not key:
+            return False, (f"El backend '{target}' ({cfg['label']}) necesita "
+                           f"OLLAMA_API_KEY. Añádela a ~/ai-agent-kali/.env "
+                           f"(OLLAMA_API_KEY=...) y reinicia, o expórtala en el "
+                           f"entorno.")
+
+    _ACTIVE_BACKEND = target
+    _SELECTED_MODEL = None          # cada backend tiene su propio catálogo
+    client = build_client()         # reapunta todas las llamadas al nuevo host
+
+    # Sondeo rápido de modelos para dar feedback útil.
+    models = get_lmstudio_models()
+    sample = ", ".join(models[:4]) + ("…" if len(models) > 4 else "")
+    return True, (f"Backend → {target} ({cfg['label']})  ·  {cfg['base_url']}\n"
+                  f"Modelo activo: {get_active_model()}\n"
+                  f"Modelos: {sample}")
 
 
 def get_mullvad_status():
@@ -5260,7 +5627,8 @@ def build_commands_panel():
         ("General", [
             ("help / ayuda",            "Ayuda extendida"),
             ("comandos / commands",     "Esta tabla de comandos"),
-            ("models / modelos",        "Modelos en LM Studio"),
+            ("models [nombre|índice]",  "Lista modelos / cambia el activo (auto = automático)"),
+            ("backend [nombre]",        "Cambia backend: ollama (nube) / lmstudio (local)"),
             ("tools / herramientas",    "Herramientas instaladas"),
             ("proxy [on/off/status]",   "Control de Tor/proxychains"),
             ("sudo [set/refresh/clear]", "Cachea contraseña sudo (subagentes)"),
@@ -5398,7 +5766,7 @@ def _render_splash_lite(active_model, vpn_status, tailscale_status,
     # `skills`) y sin format_list de "Models exposed" para ahorrar líneas.
     runtime_section = make_section([
         ("Model",        active_model),
-        ("Backend",      LMSTUDIO_BASE_URL),
+        ("Backend",      f"{active_backend_cfg()['label']} · {backend_base_url()}"),
         ("VPN",          vpn_status),
         ("Tailscale",    tailscale_status),
         ("Scope Memory", "Enabled"),
@@ -5435,7 +5803,7 @@ def show_splash():
     console.clear()
 
     models = get_lmstudio_models()
-    active_model = models[0] if models else MODEL_NAME_FALLBACK
+    active_model = get_active_model()
     vpn_status = get_mullvad_status()
     tailscale_status = get_tailscale_status()
 
@@ -5493,7 +5861,7 @@ def show_splash():
     runtime_section = make_section([
         ("Model", active_model),
         ("Models exposed", format_list(models, 4)),
-        ("Backend", LMSTUDIO_BASE_URL),
+        ("Backend", f"{active_backend_cfg()['label']} · {backend_base_url()}"),
         ("VPN", vpn_status),
         ("Tailscale", tailscale_status),
         ("Scope Memory", "Enabled"),
@@ -7067,15 +7435,17 @@ PROXY_WRAPPERS = {
 }
 
 
-def _proxy_binary():
-    """Binario disponible según PROXY_MODE. None si no hay (o modo off)."""
-    if PROXY_MODE == "off":
+def _proxy_binary(mode=None):
+    """Binario disponible según `mode` (por defecto, PROXY_MODE global).
+    None si no hay (o modo off)."""
+    mode = PROXY_MODE if mode is None else mode
+    if mode == "off":
         return None
-    if PROXY_MODE == "proxychains":
+    if mode == "proxychains":
         for b in ("proxychains4", "proxychains"):
             if shutil.which(b):
                 return b
-    if PROXY_MODE == "torify":
+    if mode == "torify":
         for b in ("torify", "torsocks"):
             if shutil.which(b):
                 return b
@@ -7118,13 +7488,16 @@ def _is_network_command(command):
     return False
 
 
-def maybe_wrap_with_proxy(command):
+def maybe_wrap_with_proxy(command, proxy_mode=None):
     """Devuelve (comando_efectivo, binario_proxy_usado_o_None).
     Si el comando es de red y hay proxy disponible, lo envuelve en una subshell
-    para que la cadena entera (con && ; |) herede el LD_PRELOAD."""
+    para que la cadena entera (con && ; |) herede el LD_PRELOAD.
+
+    `proxy_mode` permite aislar el modo por agente (subagentes) sin tocar el
+    global PROXY_MODE del proceso principal."""
     if not _is_network_command(command):
         return command, None
-    binary = _proxy_binary()
+    binary = _proxy_binary(proxy_mode)
     if not binary:
         return command, None
     if binary in ("proxychains4", "proxychains"):
@@ -7191,16 +7564,6 @@ def _socks_alive(host, port):
         return rc == 0
     except Exception:
         return False
-
-
-def _check_proxychains_socks_alive():
-    """¿Está vivo el SOCKS configurado en proxychains? Devuelve
-    (alive, host, port). `alive` es None si no hay conf legible."""
-    endpoint = _proxychains_socks_endpoint()
-    if endpoint is None:
-        return (None, None, None)
-    host, port = endpoint
-    return (_socks_alive(host, port), host, port)
 
 
 # Tipos de SOCKS que el agente sabe levantar automáticamente.
@@ -8315,11 +8678,49 @@ def _count_file_lines(path):
         return None
 
 
+# Herramientas que casi siempre tardan más que el timeout base aunque no
+# usen un wordlist (escaneos completos, fuzzing, cracking, enumeración).
+_LONG_RUNNING_TOOLS = {
+    "nmap", "masscan", "rustscan", "naabu", "unicornscan",
+    "gobuster", "feroxbuster", "ffuf", "dirb", "dirsearch", "wfuzz",
+    "nuclei", "nikto", "wpscan", "joomscan", "droopescan", "wapiti",
+    "sqlmap", "hydra", "medusa", "patator", "ncrack", "john", "hashcat",
+    "amass", "subfinder", "assetfinder", "findomain", "sublist3r",
+    "dnsx", "puredns", "dnsrecon", "dnsenum", "fierce",
+    "katana", "gau", "waybackurls", "hakrawler", "httpx", "httprobe",
+    "enum4linux", "enum4linux-ng", "smbmap", "smbclient", "rpcclient",
+    "crackmapexec", "netexec", "cme", "responder", "mitm6",
+}
+
+
+def _command_is_long_running(command):
+    """True si algún subcomando usa una herramienta de larga duración."""
+    for sub in re.split(r"(?:&&|\|\||;|\|)", command or ""):
+        tokens = sub.strip().split()
+        i = 0
+        while i < len(tokens) and (
+            tokens[i] == "sudo"
+            or ("=" in tokens[i].split("/")[-1] and not tokens[i].startswith("-"))
+        ):
+            i += 1
+        if i >= len(tokens):
+            continue
+        tool = os.path.basename(tokens[i])
+        if tool in _LONG_RUNNING_TOOLS or tool.startswith("impacket-"):
+            return True
+    return False
+
+
 def _compute_timeout_for_command(command):
-    """Calcula el timeout apropiado para `command` según los wordlists que
-    use. Devuelve (timeout_segundos, motivo_str_o_None) donde motivo se
-    imprime al operador cuando se aplica el timeout extendido.
+    """Calcula el timeout apropiado para `command` según la herramienta y
+    los wordlists que use. Devuelve (timeout_segundos, motivo_str_o_None)
+    donde motivo se imprime al operador cuando se aplica el extendido.
     """
+    if _command_is_long_running(command):
+        return COMMAND_TIMEOUT_S_LARGE, (
+            f"herramienta de larga duración → timeout extendido a "
+            f"{COMMAND_TIMEOUT_S_LARGE}s ({COMMAND_TIMEOUT_S_LARGE // 60} min)"
+        )
     wordlists = _detect_wordlist_paths(command)
     if not wordlists:
         return COMMAND_TIMEOUT_S, None
@@ -8497,12 +8898,17 @@ def _enrich_output_with_diagnostics(command, output):
     return output
 
 
-def _handle_agent_meta_action(fix_cmd):
+def _handle_agent_meta_action(fix_cmd, proxy_mode=None):
     """Si fix_cmd es una meta-acción del agente (no un comando de shell real),
     ejecuta la acción y devuelve un dict descriptivo. Si no, devuelve None.
 
     Disponible TANTO en el autopilot como en turnos normales (run_command la
     detecta antes de tratar el comando como shell).
+
+    `proxy_mode`: si no es None (subagente con estado propio), los cambios de
+    proxy NO se aplican al global del proceso; se devuelven en
+    `meta["proxy_mode"]` para que el llamador actualice su propio estado.
+    Esto evita que un subagente desactive el proxy de todo el agente.
 
     Meta-acciones soportadas:
       agent:proxy off            → PROXY_MODE = "off"
@@ -8515,6 +8921,7 @@ def _handle_agent_meta_action(fix_cmd):
       agent:learn <texto>        → guarda <texto> como lección persistente
     """
     global PROXY_MODE
+    scoped = proxy_mode is not None
     raw = (fix_cmd or "").strip()
     norm = raw.lower()
     if not norm.startswith("agent:"):
@@ -8536,20 +8943,30 @@ def _handle_agent_meta_action(fix_cmd):
         return {"action": "learn", "ok": True, "path": path,
                 "log": f"lección guardada en {rel}"}
 
+    def _apply_proxy(new):
+        global PROXY_MODE
+        nonlocal proxy_mode
+        prev = proxy_mode if scoped else PROXY_MODE
+        if scoped:
+            proxy_mode = new
+        else:
+            PROXY_MODE = new
+        return prev
+
     if norm in ("agent:proxy off", "agent:proxy=off"):
-        prev = PROXY_MODE
-        PROXY_MODE = "off"
+        prev = _apply_proxy("off")
         return {"action": "proxy", "from": prev, "to": "off",
+                "proxy_mode": "off",
                 "log": f"PROXY_MODE: {prev} → off (siguiente reintento sin proxy)"}
     if norm in ("agent:proxy on", "agent:proxy=on", "agent:proxy proxychains"):
-        prev = PROXY_MODE
-        PROXY_MODE = "proxychains"
+        prev = _apply_proxy("proxychains")
         return {"action": "proxy", "from": prev, "to": "proxychains",
+                "proxy_mode": "proxychains",
                 "log": f"PROXY_MODE: {prev} → proxychains"}
     if norm in ("agent:proxy torify", "agent:proxy=torify"):
-        prev = PROXY_MODE
-        PROXY_MODE = "torify"
+        prev = _apply_proxy("torify")
         return {"action": "proxy", "from": prev, "to": "torify",
+                "proxy_mode": "torify",
                 "log": f"PROXY_MODE: {prev} → torify"}
 
     if norm.startswith("agent:tor "):
@@ -8827,12 +9244,13 @@ def troubleshoot_loop(failed_command, failed_output):
         else:
             # Ejecutar el fix como shell normal, sin confirmación
             try:
-                fix_result = run_command(fix_cmd, auto=True)
+                fix_res = run_command(fix_cmd, auto=True)
+                fix_result = fix_res.output
+                fix_rc = fix_res.rc
             except KeyboardInterrupt:
                 attempts.append({"attempt": attempt, "fix": fix_cmd, "interrupted": True})
                 console.print(f"[bold {RED}]⚠ Autopilot interrumpido por el usuario.[/]")
                 break
-            fix_rc = LAST_COMMAND_RC
             if ACTIVE_TARGET:
                 append_timeline_entry(f"[autopilot fix] {fix_cmd}", fix_result)
 
@@ -8857,8 +9275,9 @@ def troubleshoot_loop(failed_command, failed_output):
                     console.print(
                         f"[dim]›  [{idx+1}/{len(pending_parts)}] {part[:80]}[/]"
                     )
-                    sub_result = run_command(part, auto=True)
-                    sub_rc = LAST_COMMAND_RC
+                    part_res = run_command(part, auto=True)
+                    sub_result = part_res.output
+                    sub_rc = part_res.rc
                     retry_outputs.append(
                         f"[sub-comando rc={sub_rc}] {part}\n{sub_result}"
                     )
@@ -8880,8 +9299,9 @@ def troubleshoot_loop(failed_command, failed_output):
             else:
                 console.print()
                 console.print(f"[dim]› Reintentando comando original…[/]")
-                retry_result = run_command(failed_command, auto=True)
-                retry_rc = LAST_COMMAND_RC
+                retry_res = run_command(failed_command, auto=True)
+                retry_result = retry_res.output
+                retry_rc = retry_res.rc
                 if ACTIVE_TARGET:
                     append_timeline_entry(
                         f"[autopilot retry] {failed_command}", retry_result
@@ -8985,10 +9405,21 @@ def _print_troubleshoot_summary(result):
     ))
 
 
-def run_command(command, auto=False):
-    """Ejecuta `command`. Si `auto=True` se salta TODAS las confirmaciones
-    (modo autopilot de troubleshooting). En condiciones normales mantiene la
+def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
+                proxy_mode=None):
+    """Ejecuta `command` y devuelve un `CommandResult`.
+
+    Si `auto=True` se salta TODAS las confirmaciones (modo autopilot de
+    troubleshooting y subagentes). En condiciones normales mantiene la
     lógica de clasificación y AUTO_EXECUTE.
+
+    Aislamiento por agente:
+      · `target`: target contra el que se comprueba anti-duplicación. Si se
+        omite, usa el `ACTIVE_TARGET` global (agente principal). Un subagente
+        pasa SIEMPRE el suyo (incluido `None` para goals ad-hoc).
+      · `proxy_mode`: modo de proxy efectivo. Si es None usa `PROXY_MODE`
+        global. Un subagente pasa el suyo y las meta-acciones `agent:proxy`
+        solo lo modifican a él, nunca al proceso principal.
 
     Antes de cualquier procesamiento:
     1) Detecta meta-acciones `agent:proxy …` / `agent:tor …` y las aplica
@@ -9000,10 +9431,15 @@ def run_command(command, auto=False):
     """
     global LAST_COMMAND_RC
 
+    eff_target = ACTIVE_TARGET if target is _NO_TARGET_SENTINEL else target
+    eff_proxy = PROXY_MODE if proxy_mode is None else proxy_mode
+
     # 1) META-ACCIONES — sin shell, devolución inmediata
-    meta = _handle_agent_meta_action(command)
+    meta = _handle_agent_meta_action(command, proxy_mode=proxy_mode)
     if meta:
-        LAST_COMMAND_RC = 0
+        LAST_COMMAND_RC = 0  # alias legacy, no usar en flujos concurrentes
+        if meta.get("proxy_mode") is not None:
+            eff_proxy = meta["proxy_mode"]
         _q_print()
         _q_print(Panel(
             f"[bold {PURPLE}]» Meta-acción del agente[/]\n\n"
@@ -9012,7 +9448,11 @@ def run_command(command, auto=False):
             border_style=PURPLE,
             box=ROUNDED,
         ))
-        return f"[Meta-acción aplicada · {meta.get('log', '?')}]"
+        return CommandResult(
+            command=command, rc=0,
+            output=f"[Meta-acción aplicada · {meta.get('log', '?')}]",
+            meta=meta, proxy_mode=eff_proxy,
+        )
 
     # 2) BYPASS DE PROXY PARA UN COMANDO (single-shot)
     no_proxy_single = False
@@ -9051,9 +9491,9 @@ def run_command(command, auto=False):
     duplicate_runs = []
     saturated_tool = None
     saturated_count = 0
-    if ACTIVE_TARGET:
-        duplicate_runs = find_duplicate_runs(command, ACTIVE_TARGET)
-        is_sat, sat_tool, sat_count = _tool_is_saturated(command, ACTIVE_TARGET)
+    if eff_target:
+        duplicate_runs = find_duplicate_runs(command, eff_target)
+        is_sat, sat_tool, sat_count = _tool_is_saturated(command, eff_target)
         if is_sat:
             saturated_tool = sat_tool
             saturated_count = sat_count
@@ -9067,7 +9507,7 @@ def run_command(command, auto=False):
         _q_print(Panel(
             f"[bold {RED}]⚠ ESCANEO YA REALIZADO[/]\n\n"
             f"[{WHITE}]Mismo tool + target + flags clave detectados en "
-            f"`targets/{ACTIVE_TARGET}/_runs.md`.[/]\n\n"
+            f"`targets/{eff_target}/_runs.md`.[/]\n\n"
             f"[bold {WHITE}]Run anterior:[/] [{prev['ts']}] · "
             f"rc={prev['rc']}\n"
             f"[bold {WHITE}]Comando:[/] [{CYAN}]{prev['command']}[/]\n"
@@ -9088,7 +9528,7 @@ def run_command(command, auto=False):
             f"[bold {MAGENTA}]⚠ HERRAMIENTA SATURADA[/]\n\n"
             f"[{WHITE}]`{saturated_tool}` ya tiene "
             f"[bold]{saturated_count}[/] runs en "
-            f"`targets/{ACTIVE_TARGET}/_runs.md` (umbral: "
+            f"`targets/{eff_target}/_runs.md` (umbral: "
             f"{_TOOL_SATURATION_THRESHOLD}). El modelo propone otra "
             f"variante, pero la regla anti-loop dice que el siguiente "
             f"paso debería ser de OTRA categoría del tools_master.[/]\n\n"
@@ -9110,7 +9550,9 @@ def run_command(command, auto=False):
     if no_proxy_single:
         effective_command, proxy_used = command, None
     else:
-        effective_command, proxy_used = maybe_wrap_with_proxy(command)
+        effective_command, proxy_used = maybe_wrap_with_proxy(
+            command, proxy_mode=eff_proxy
+        )
     proxy_note = ""
     if proxy_used:
         if proxy_used in ("proxychains4", "proxychains"):
@@ -9226,8 +9668,12 @@ def run_command(command, auto=False):
             prompt_msg = prompt_msg.split("\n")[-1]
         confirm = input(prompt_msg).strip().lower()
         if confirm not in ("s", "i"):
-            LAST_COMMAND_RC = -1  # cancelado
-            return "Comando cancelado por el usuario."
+            LAST_COMMAND_RC = -1  # alias legacy
+            return CommandResult(
+                command=command, rc=-1, cancelled=True,
+                output="Comando cancelado por el usuario.",
+                proxy_mode=eff_proxy,
+            )
         # i (explícito) o s con auto_interactive=True → modo interactivo.
         if confirm == "i":
             use_interactive = True
@@ -9242,11 +9688,15 @@ def run_command(command, auto=False):
             auto=bool(auto),
         ))
     except HookAbort as e:
-        LAST_COMMAND_RC = -1
+        LAST_COMMAND_RC = -1  # alias legacy
         _q_print(
             f"[bold {RED}]› hook before_command abortó la ejecución: {e}[/]"
         )
-        return f"Comando cancelado por hook before_command: {e}"
+        return CommandResult(
+            command=command, rc=-1, cancelled=True,
+            output=f"Comando cancelado por hook before_command: {e}",
+            proxy_mode=eff_proxy,
+        )
 
     final_stdout, final_stderr, final_rc = "", "", 0
     final_output = ""
@@ -9291,18 +9741,21 @@ def run_command(command, auto=False):
     # `sudo -v` ANTES (interactivo), y sudo cachea durante ~15 min.
     if _command_uses_sudo(command):
         if not _ensure_sudo_credentials():
-            LAST_COMMAND_RC = -1
-            return (
-                "Comando abortado: sudo necesitaba contraseña y no se "
-                "pudo autenticar (cancelado por el operador o credenciales "
-                "incorrectas)."
+            LAST_COMMAND_RC = -1  # alias legacy
+            return CommandResult(
+                command=command, rc=-1, cancelled=True,
+                output=(
+                    "Comando abortado: sudo necesitaba contraseña y no se "
+                    "pudo autenticar (cancelado por el operador o "
+                    "credenciales incorrectas)."
+                ),
+                proxy_mode=eff_proxy,
             )
 
     try:
         t0 = time.time()
         stdout, stderr, rc = _exec_with_spinner(effective_command, timeout_s)
         duration = round(time.time() - t0, 3)
-        LAST_COMMAND_RC = rc
         final_stdout, final_stderr, final_rc = stdout, stderr, rc
 
         # ¿Falló por herramienta faltante? Auto-install + reintento (1 vez).
@@ -9322,20 +9775,16 @@ def run_command(command, auto=False):
                         effective_command, timeout_s
                     )
                     duration = round(time.time() - t0 + (time.time() - t1), 3)
-                    LAST_COMMAND_RC = rc2
                     final_stdout, final_stderr, final_rc = stdout2, stderr2, rc2
                     chain.append(f"[Reintento tras instalar '{missing}' · exit {rc2}]")
                     chain.append(_format_command_output(stdout2, stderr2))
                 except subprocess.TimeoutExpired:
-                    LAST_COMMAND_RC = 124  # timeout convencional
-                    final_rc = 124
+                    final_rc = 124  # timeout convencional
                     chain.append("Error: el reintento superó el tiempo máximo.")
                 except Exception as e:
-                    LAST_COMMAND_RC = 1
                     final_rc = 1
                     chain.append(f"Error en reintento: {e}")
             else:
-                LAST_COMMAND_RC = rc
                 final_rc = rc
                 chain.append(
                     f"⚠ No se pudo instalar '{missing}' automáticamente. "
@@ -9353,7 +9802,6 @@ def run_command(command, auto=False):
             )
 
     except subprocess.TimeoutExpired as e:
-        LAST_COMMAND_RC = 124
         final_rc = 124
         duration = float(getattr(e, "timeout", timeout_s) or timeout_s)
         # Preservar el output capturado HASTA el timeout. Sin esto, los
@@ -9379,7 +9827,6 @@ def run_command(command, auto=False):
             f"{timeout_banner}\n\n{partial}" if partial.strip() else timeout_banner,
         )
     except Exception as e:
-        LAST_COMMAND_RC = 1
         final_rc = 1
         duration = locals().get("duration", 0.0)
         final_output = f"Error ejecutando comando: {e}"
@@ -9408,7 +9855,25 @@ def run_command(command, auto=False):
             auto=bool(auto),
         ))
 
-    return final_output
+    # Alias legacy para hooks/plugins que aún lean el global. El flujo interno
+    # usa SIEMPRE el CommandResult devuelto.
+    LAST_COMMAND_RC = final_rc
+
+    error_class = None
+    if final_rc != 0:
+        error_class = _classify_command_failure(final_stderr, final_rc)
+
+    return CommandResult(
+        command=command,
+        rc=final_rc,
+        output=final_output,
+        stdout=final_stdout,
+        stderr=final_stderr,
+        duration_s=float(duration or 0.0),
+        artifacts=list(output_files or []),
+        error_class=error_class,
+        proxy_mode=eff_proxy,
+    )
 
 
 # ============================================================
@@ -9424,7 +9889,11 @@ def print_help():
 [bold {WHITE}]comandos / commands[/bold {WHITE}]     Tabla compacta con todos los comandos.
 [bold {WHITE}]refresh / refrescar[/bold {WHITE}]     Redibuja el splash.
 [bold {WHITE}]clear / limpiar[/bold {WHITE}]         Igual que refresh.
-[bold {WHITE}]models / modelos[/bold {WHITE}]        Lista los modelos expuestos por LM Studio.
+[bold {WHITE}]models [nombre|índice][/bold {WHITE}]  Lista modelos de LM Studio (con estado/contexto) y marca el activo.
+                        Con argumento cambia el modelo activo: `models 2` o `models qwen`.
+                        `models auto` vuelve al modo automático (primer modelo cargado).
+[bold {WHITE}]backend [nombre][/bold {WHITE}]        Cambia el backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local).
+                        Sin argumento muestra el backend activo y las opciones. Ollama Cloud usa OLLAMA_API_KEY.
 [bold {WHITE}]tools / herramientas[/bold {WHITE}]    Herramientas instaladas y faltantes.
 [bold {WHITE}]proxy [on/off/status][/bold {WHITE}]   Estado y control del enrutado por Tor/proxychains.
 [bold {WHITE}]salir / exit / quit[/bold {WHITE}]     Cierra el agente.
@@ -9494,7 +9963,8 @@ def print_commands():
         ("General",  "comandos / commands",     "Esta tabla con todos los comandos disponibles"),
         ("General",  "refresh / refrescar",     "Limpia pantalla y redibuja el splash"),
         ("General",  "clear / limpiar",         "Igual que refresh"),
-        ("General",  "models / modelos",        "Lista los modelos expuestos por LM Studio"),
+        ("General",  "models [nombre|índice]",  "Lista modelos (estado/contexto) y cambia el activo; `models auto` = automático"),
+        ("General",  "backend [nombre]",        "Cambia backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local)"),
         ("General",  "tools / herramientas",    "Tabla de herramientas instaladas vs faltantes"),
         ("General",  "proxy [on/off/status]",   "Estado y control del enrutado por Tor/proxychains"),
         ("General",  "sudo [status|refresh|set|clear]", "Gestiona la password sudo. `sudo refresh` refresca el caché (15 min). `sudo set` almacena la password en memoria (no a disco) para que subagentes/autopilot la usen sin pedirla. `sudo clear` la borra."),
@@ -9513,6 +9983,9 @@ def print_commands():
         ("Subagentes", "subagent kill <nombre>",                "Detiene un subagente en ejecución"),
 
         ("Orquestación", "goal <descripción del objetivo>",     f"Lanza orquestador goal-driven (max {GOAL_MAX_PHASES} fases, hasta {MAX_CONCURRENT_SUBAGENTS} subagentes/fase). El LLM planifica, ejecuta, evalúa y replanifica hasta cumplir o bloquear."),
+        ("Orquestación", "goal ... || criteria: ... || budget: ...", "Añade criterios de éxito verificables por el agente (file_exists, file_contains, cmd_rc, port_open) y presupuesto (tiempo/comandos). El agente NO acepta GOAL_DONE si los criterios fallan."),
+        ("Orquestación", "goal spec <ruta>",                     "Carga la especificación del objetivo desde un archivo (misma sintaxis que la línea, puede ser multilínea)."),
+        ("Autonomía",  "auto [on|off|status|steps <N>|<N>]",     f"Modo autónomo del agente principal: tras cada COMANDO analiza y ejecuta el siguiente sin esperar input (máx {AUTO_CONTINUE_MAX_STEPS} pasos/turno)."),
         ("Orquestación", "goal status",                         "Muestra el estado del goal activo (fase, subagentes lanzados, motivo)"),
         ("Orquestación", "goal show",                           "Panel-resumen completo del goal en curso o último terminado"),
         ("Orquestación", "goal list",                           "Lista todos los goals persistidos en disco (incl. terminados y huérfanos)"),
@@ -9561,15 +10034,55 @@ def print_commands():
 
 
 def print_models():
-    models = get_lmstudio_models()
+    detailed = get_lmstudio_models_detailed()
+    active = get_active_model()
 
-    table = Table(title="Modelos expuestos por LM Studio", border_style=ORANGE)
+    table = Table(title=f"Modelos · {active_backend_cfg()['label']}",
+                  border_style=ORANGE)
+    table.add_column("#", style=PURPLE, no_wrap=True, justify="right")
+    table.add_column("", style=f"bold {GREEN}", no_wrap=True)  # marca activo
     table.add_column("Modelo", style=WHITE)
+    table.add_column("Estado", no_wrap=True)
+    table.add_column("Contexto", no_wrap=True, justify="right")
+    table.add_column("Capacidades", style=CYAN)
 
-    for model in models:
-        table.add_row(model)
+    for i, m in enumerate(detailed, start=1):
+        is_active = (m["id"] == active)
+        marker = "●" if is_active else ""
+
+        state = m.get("state") or "unknown"
+        if state == "loaded":
+            state_cell = f"[bold {GREEN}]loaded[/]"
+        elif state == "unknown":
+            state_cell = "[grey50]—[/]"
+        else:
+            state_cell = f"[{ORANGE}]{state}[/]"
+
+        # Contexto: cargado/máx si los conocemos.
+        loaded_ctx = m.get("loaded_ctx")
+        max_ctx = m.get("max_ctx")
+        if loaded_ctx and max_ctx:
+            ctx_cell = f"{loaded_ctx:,}/{max_ctx:,}"
+        elif max_ctx:
+            ctx_cell = f"máx {max_ctx:,}"
+        else:
+            ctx_cell = "—"
+
+        caps = ", ".join(m.get("caps") or []) or "—"
+
+        name_cell = f"[bold {GREEN}]{m['id']}[/]" if is_active else m["id"]
+        table.add_row(str(i), marker, name_cell, state_cell, ctx_cell, caps)
 
     console.print(table)
+
+    mode = "manual" if _SELECTED_MODEL else "automático (primer modelo cargado)"
+    console.print(
+        f"[dim]Activo (●): [bold {GREEN}]{active}[/]  ·  selección: {mode}[/]"
+    )
+    console.print(
+        f"[dim]Cambiar: [bold {CYAN}]models <nombre|índice>[/]   ·   "
+        f"volver a automático: [bold {CYAN}]models auto[/][/]"
+    )
 
 
 def _print_proxy_status():
@@ -10548,10 +11061,1551 @@ def resolve_at_mentions(user_input):
 
 
 # ============================================================
+# BUCLE AUTÓNOMO DEL AGENTE PRINCIPAL
+# ============================================================
+
+def _build_analysis_prompt():
+    """Prompt que se envía tras ejecutar un comando. Si el modo autónomo
+    está activo, el COMANDO que proponga el modelo se ejecutará solo."""
+    prompt = (
+        "Analiza la salida anterior en detalle: extrae y explica los datos "
+        "relevantes (IPs, puertos, servicios, versiones, usuarios, hashes, "
+        "archivos, errores, hallazgos). Termina con un bloque "
+        "**Siguientes pasos:** que liste 2-4 acciones concretas y "
+        "priorizadas (1 línea cada una). Si hay un siguiente paso obvio "
+        "y barato, propónlo además como bloque `COMANDO:` al final."
+    )
+    if AUTO_CONTINUE:
+        prompt += (
+            "\n\nMODO AUTÓNOMO ACTIVO: si propones un `COMANDO:`, el agente "
+            "lo ejecutará automáticamente y volverá a pedirte análisis. Sigue "
+            "iterando hasta cumplir el objetivo o hasta que no haya un paso "
+            "concreto que ejecutar. Si necesitas una decisión del operador, "
+            "NO emitas COMANDO y pídela explícitamente."
+        )
+    if ACTIVE_TARGET:
+        prompt += (
+            f"\n\nOBLIGATORIO — Persistencia del trabajo en target '{ACTIVE_TARGET}':\n"
+            f"Emite AL MENOS UN bloque [[TARGET_UPDATE: archivo.md]] al final de "
+            f"tu respuesta con los hallazgos de esta iteración. Mapeo recordatorio:\n"
+            f"  - hosts/puertos/servicios/endpoints/subdominios  → attack-surface.md\n"
+            f"  - DNS/ASN/hosting/tecnologías/certs              → infrastructure.md\n"
+            f"  - correos/usuarios/repos/leaks                   → identities.md\n"
+            f"  - SSIDs/BSSIDs/wifi                              → wifi.md\n"
+            f"  - decisiones, TODOs, hilos sueltos, atajos       → notes.md\n"
+            f"Si la salida fue vacía o no aportó nada accionable, emite al menos "
+            f"un bloque hacia notes.md con una entrada del tipo:\n"
+            f"  ## [YYYY-MM-DD HH:MM] <herramienta> · sin hallazgos\n"
+            f"  Detalle breve de por qué (timeout, host no responde, etc.).\n"
+            f"De este modo el informe final tendrá trazabilidad completa de la fase."
+        )
+    return prompt
+
+
+def _execute_main_command(command):
+    """Ejecuta un comando del agente principal y hace todo el post-proceso
+    que antes vivía inline en main(): timeline/runs, autopilot de
+    troubleshooting y panel de resultado.
+
+    Devuelve (result_text, rc).
+    """
+    res = run_command(command)
+    rc = res.rc
+    result = res.output
+
+    # AUTOMÁTICO: append a _timeline.md (bitácora narrativa) y a _runs.md
+    # (checklist estructurada para anti-duplicación).
+    if ACTIVE_TARGET:
+        timeline_path = append_timeline_entry(command, result)
+        runs_path = append_runs_entry(command, rc)
+        notes = []
+        if timeline_path:
+            notes.append(os.path.relpath(timeline_path, WORKSPACE))
+        if runs_path:
+            notes.append(os.path.relpath(runs_path, WORKSPACE))
+        if notes:
+            console.print(f"[dim]› anotado en {' · '.join(notes)}[/]")
+
+    # AUTOPILOT de troubleshooting: si el comando falló y el modo está
+    # activo, entrar al bucle de auto-fix antes del análisis del modelo.
+    if (TROUBLESHOOT_AUTOPILOT
+            and rc != 0 and rc != -1
+            and not _is_benign_nonzero_rc(command, rc)):
+        ts_outcome = troubleshoot_loop(command, result)
+        _print_troubleshoot_summary(ts_outcome)
+        if ts_outcome["resolved"]:
+            result = ts_outcome["final_output"]
+        else:
+            result = (
+                f"[Comando original `{command}` falló y el autopilot "
+                f"no pudo resolverlo tras {len(ts_outcome['attempts'])} "
+                f"intentos.]\n\n{ts_outcome['final_output']}"
+            )
+
+    if not STREAM_COMMAND_OUTPUT:
+        console.print()
+        console.print(Panel(
+            Text.from_ansi(result),
+            title=f"[bold {ORANGE}]Resultado[/bold {ORANGE}]",
+            border_style=ORANGE,
+            box=ROUNDED,
+        ))
+
+    return result, rc
+
+
+def run_autonomous_turn(user_input, max_steps=None):
+    """Ciclo completo de un turno del operador:
+
+        prompt → LLM → COMANDO → ejecutar → resultado → análisis → COMANDO → …
+
+    Antes, tras el análisis se descartaba el COMANDO propuesto y el
+    operador tenía que escribir "sigue" en cada iteración. Ahora, con
+    AUTO_CONTINUE activo, el bucle continúa hasta que el modelo deje de
+    proponer comandos, el operador cancele, o se alcance `max_steps`.
+    """
+    max_steps = AUTO_CONTINUE_MAX_STEPS if max_steps is None else max_steps
+    answer = ask_model(user_input)
+    steps_done = 0
+    recent_cmds = []
+
+    while True:
+        command = extract_command(answer)
+        remember_command_rationale(answer)
+        if not command:
+            return
+
+        # Guard anti-bucle: el modelo a veces re-emite el mismo COMANDO.
+        norm = _normalize_cmd_for_compare(command)
+        recent_cmds.append(norm)
+        if recent_cmds.count(norm) >= 3:
+            console.print(
+                f"[bold {RED}]› auto-continue detenido: el modelo propuso "
+                f"{recent_cmds.count(norm)} veces el mismo comando.[/] "
+                f"[dim]Revisa el estado y reformula el objetivo.[/]"
+            )
+            return
+
+        result, rc = _execute_main_command(command)
+
+        if rc == -1:
+            # Cancelación consciente del operador: no analizamos ni seguimos.
+            cancel_note = (
+                f"[Comando cancelado por el operador — sin análisis "
+                f"automático. Cuando quieras retomar, escribe la "
+                f"siguiente acción o pide 'siguientes pasos'.]"
+            )
+            console.print(f"[dim]› {cancel_note}[/]")
+            history.append({
+                "role": "user",
+                "content": f"Resultado del comando:\n{result}\n\n{cancel_note}"
+            })
+            save_session()
+            return
+
+        history.append({
+            "role": "user",
+            "content": f"Resultado del comando:\n{result}"
+        })
+        save_session()
+
+        steps_done += 1
+        if not AUTO_CONTINUE:
+            # Comportamiento clásico: un solo análisis y volver al prompt.
+            ask_model(_build_analysis_prompt())
+            return
+
+        if steps_done >= max_steps:
+            console.print(
+                f"[bold {ORANGE}]› auto-continue: límite de {max_steps} "
+                f"pasos alcanzado.[/] [dim]Escribe 'auto steps N' para "
+                f"subirlo o continúa manualmente.[/]"
+            )
+            ask_model(
+                _build_analysis_prompt()
+                + "\n\n[LÍMITE DE PASOS ALCANZADO: NO emitas COMANDO; "
+                  "resume el estado y pide instrucciones al operador.]"
+            )
+            return
+
+        answer = ask_model(_build_analysis_prompt())
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
-def main():
+# ============================================================
+# DESPACHO DEL REPL (tabla de handlers)
+# ============================================================
+# Cada comando interno vive en su propio handler. `main()` ya no tiene
+# una cadena gigante de if/elif: consulta esta tabla en orden.
+
+_REPL_HANDLED = object()      # comando atendido; volver al prompt
+_REPL_FALLTHROUGH = object()  # no es comando; enviar al modelo
+_REPL_EXIT = object()         # salir del REPL
+
+
+def _repl_salir(user_input, cmd_lower, first_word):
+    """Handler REPL: salir, exit, quit."""
+    return _REPL_EXIT
+
+
+def _repl_help(user_input, cmd_lower, first_word):
+    """Handler REPL: help, ayuda."""
+    print_help()
+    return _REPL_HANDLED
+
+
+def _repl_comandos(user_input, cmd_lower, first_word):
+    """Handler REPL: comandos, commands."""
+    print_commands()
+    return _REPL_HANDLED
+
+
+def _repl_refresh(user_input, cmd_lower, first_word):
+    """Handler REPL: refresh, refrescar, clear, limpiar."""
+    show_splash()
+    return _REPL_HANDLED
+
+
+def _repl_models(user_input, cmd_lower, first_word):
+    """Handler REPL: models, modelos, model, modelo."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) < 2:
+        # Sin argumento → listar.
+        print_models()
+        return _REPL_HANDLED
+    ok, msg = set_active_model(parts[1].strip())
+    if ok:
+        console.print(f"[bold {GREEN}]✓[/] {msg}")
+    else:
+        console.print(f"[bold {RED}]✗[/] {msg}")
+    return _REPL_HANDLED
+
+
+def _repl_backend(user_input, cmd_lower, first_word):
+    """Handler REPL: backend, backends."""
+    parts = user_input.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not arg:
+        # Sin argumento → mostrar backend actual + opciones disponibles.
+        cur = active_backend_cfg()
+        console.print(
+            f"[bold {CYAN}]Backend activo:[/] {_ACTIVE_BACKEND} "
+            f"({cur['label']}) → {backend_base_url()}")
+        console.print(f"[dim]Modelo activo: {get_active_model()}[/]")
+        console.print(f"[dim]Disponibles:[/]")
+        for name, cfg in BACKENDS.items():
+            mark = "●" if name == _ACTIVE_BACKEND else "○"
+            note = ""
+            if cfg.get("needs_key") and not os.environ.get("OLLAMA_API_KEY"):
+                note = "  [dim](falta OLLAMA_API_KEY)[/]"
+            console.print(f"  [bold {CYAN}]{mark}[/] {name:10} "
+                          f"{cfg['label']} · {cfg['base_url']}{note}")
+        console.print(f"[dim]Cambiar: [bold {CYAN}]backend ollama[/] / "
+                      f"[bold {CYAN}]backend lmstudio[/][/]")
+        return _REPL_HANDLED
+    ok, msg = switch_backend(arg)
+    if ok:
+        console.print(f"[bold {GREEN}]✓[/] {msg}")
+    else:
+        console.print(f"[bold {RED}]✗[/] {msg}")
+    return _REPL_HANDLED
+
+
+def _repl_tools(user_input, cmd_lower, first_word):
+    """Handler REPL: tools, herramientas."""
+    print_tools()
+    return _REPL_HANDLED
+
+
+def _repl_copy(user_input, cmd_lower, first_word):
+    """Handler REPL: copy, c, copiar."""
+    if not _PROPOSED_COMMAND_HISTORY:
+        console.print(
+            f"[{ORANGE}]no hay comandos propuestos todavía en esta sesión[/]"
+        )
+        return _REPL_HANDLED
+    parts = user_input.split()
+    idx = 1
+    if len(parts) >= 2 and parts[1].isdigit():
+        idx = max(1, int(parts[1]))
+    if idx > len(_PROPOSED_COMMAND_HISTORY):
+        console.print(
+            f"[{ORANGE}]solo hay {len(_PROPOSED_COMMAND_HISTORY)} "
+            f"comando(s) en el historial; usa `copy 1`..`copy "
+            f"{len(_PROPOSED_COMMAND_HISTORY)}`[/]"
+        )
+        return _REPL_HANDLED
+    text = _PROPOSED_COMMAND_HISTORY[-idx]
+    res = copy_command_to_clipboard(text)
+    methods = []
+    if res["osc52"]:
+        methods.append("OSC 52 (terminal/SSH)")
+    if res["native"]:
+        methods.append(res["native"])
+    if methods:
+        console.print(
+            f"[bold {GREEN}]✓ copiado al portapapeles[/]  "
+            f"[dim](vía {', '.join(methods)})[/]"
+        )
+        preview = text if len(text) <= 80 else text[:77] + "..."
+        console.print(f"[dim]   {preview}[/]")
+    else:
+        console.print(
+            f"[bold {RED}]✗ no se pudo copiar[/] "
+            f"(sin OSC 52 ni binario nativo de clipboard disponible). "
+            f"Instala uno de: xclip, wl-clipboard, xsel."
+        )
+    return _REPL_HANDLED
+
+
+def _repl_view(user_input, cmd_lower, first_word):
+    """Handler REPL: view, ver, cat."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) < 2:
+        console.print(f"[{ORANGE}]uso: view <ruta>[/]")
+        return _REPL_HANDLED
+    r = apply_file_read(parts[1].strip())
+    if r["ok"]:
+        lexer = _guess_syntax_lexer(r["path"]) or "text"
+        # Reconstruir contenido sin las líneas numeradas (Syntax las pone)
+        lines = [
+            ln.split("\t", 1)[1] if "\t" in ln else ln
+            for ln in r["content"].splitlines()
+        ]
+        console.print(Panel(
+            Syntax("\n".join(lines), lexer, line_numbers=True,
+                   theme="dracula", word_wrap=False),
+            title=f"[bold {ORANGE}]view[/]  ·  [{WHITE}]{r['path']}[/]  "
+                  f"[grey50]({r['shown_lines']}/{r['total_lines']} líneas"
+                  + (", truncado" if r["truncated"] else "") + ")[/]",
+            border_style=ORANGE, box=ROUNDED, padding=(0, 0),
+        ))
+    else:
+        console.print(f"[bold {RED}]✗[/] {r['error']}")
+    return _REPL_HANDLED
+
+
+def _repl_diff(user_input, cmd_lower, first_word):
+    """Handler REPL: diff."""
+    # diff <path1> <path2>: diff entre dos archivos del workspace
+    parts = user_input.split()
+    if len(parts) != 3:
+        console.print(f"[{ORANGE}]uso: diff <ruta1> <ruta2>[/]")
+        return _REPL_HANDLED
+    ok1, full1, rel1 = _validate_workspace_path(parts[1])
+    ok2, full2, rel2 = _validate_workspace_path(parts[2])
+    if not ok1:
+        console.print(f"[bold {RED}]✗[/] {full1}")
+        return _REPL_HANDLED
+    if not ok2:
+        console.print(f"[bold {RED}]✗[/] {full2}")
+        return _REPL_HANDLED
+    try:
+        with open(full1, encoding="utf-8") as f: c1 = f.read()
+        with open(full2, encoding="utf-8") as f: c2 = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        console.print(f"[bold {RED}]✗[/] read: {e}")
+        return _REPL_HANDLED
+    dl = list(difflib.unified_diff(
+        c1.splitlines(), c2.splitlines(),
+        fromfile=f"a/{rel1}", tofile=f"b/{rel2}", n=3,
+    ))
+    console.print(render_file_diff_panel(f"{rel1} ↔ {rel2}", dl, kind="edit"))
+    return _REPL_HANDLED
+
+
+def _repl_edit(user_input, cmd_lower, first_word):
+    """Handler REPL: edit, editar."""
+    # edit <ruta>: prompt interactivo old/new (multilínea con `EOF`)
+    parts = user_input.split(maxsplit=1)
+    if len(parts) < 2:
+        console.print(f"[{ORANGE}]uso: edit <ruta>  (luego pegas OLD, EOF, NEW, EOF)[/]")
+        return _REPL_HANDLED
+    path = parts[1].strip()
+    console.print(f"[dim]» pega el texto OLD (línea con solo 'EOF' para terminar):[/]")
+    old_lines = []
+    try:
+        while True:
+            line = input()
+            if line.strip() == "EOF": break
+            old_lines.append(line)
+    except (EOFError, KeyboardInterrupt):
+        console.print(f"[dim]cancelado[/]")
+        return _REPL_HANDLED
+    console.print(f"[dim]» pega el texto NEW (línea con solo 'EOF' para terminar):[/]")
+    new_lines = []
+    try:
+        while True:
+            line = input()
+            if line.strip() == "EOF": break
+            new_lines.append(line)
+    except (EOFError, KeyboardInterrupt):
+        console.print(f"[dim]cancelado[/]")
+        return _REPL_HANDLED
+    old_s = "\n".join(old_lines)
+    new_s = "\n".join(new_lines)
+    # Reutilizamos el wire-up del modelo: construimos un answer "ficticio"
+    # con el bloque FILE_EDIT (formato V2 — el único soportado) y lo
+    # procesamos.
+    synthetic = (
+        f"[[FILE_EDIT: {path}]]\n"
+        f"[[OLD]]\n{old_s}\n[[/OLD]]\n"
+        f"[[NEW]]\n{new_s}\n[[/NEW]]\n"
+        f"[[/FILE_EDIT]]"
+    )
+    process_file_blocks(synthetic)
+    return _REPL_HANDLED
+
+
+def _repl_write(user_input, cmd_lower, first_word):
+    """Handler REPL: write, escribir."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) < 2:
+        console.print(f"[{ORANGE}]uso: write <ruta>  (luego pegas contenido, EOF para terminar)[/]")
+        return _REPL_HANDLED
+    path = parts[1].strip()
+    console.print(f"[dim]» pega el contenido (línea con solo 'EOF' para terminar):[/]")
+    lines = []
+    try:
+        while True:
+            line = input()
+            if line.strip() == "EOF": break
+            lines.append(line)
+    except (EOFError, KeyboardInterrupt):
+        console.print(f"[dim]cancelado[/]")
+        return _REPL_HANDLED
+    synthetic = (
+        f"[[FILE_WRITE: {path}]]\n"
+        + "\n".join(lines) + "\n"
+        + f"[[/FILE_WRITE]]"
+    )
+    process_file_blocks(synthetic)
+    return _REPL_HANDLED
+
+
+def _repl_sudo(user_input, cmd_lower, first_word):
+    """Handler REPL: sudo, sudopass, password."""
+    parts = user_input.split(maxsplit=1)
+    sub = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+    if sub in ("status", "estado", ""):
+        cache_ok = _sudo_cache_valid()
+        with _sudo_password_lock:
+            has_stored = _STORED_SUDO_PASSWORD is not None
+        console.print(Panel(
+            f"[bold]Caché de sudo:[/] "
+            + (f"[bold {GREEN}]vigente[/] (no pedirá password "
+               f"durante ~15 min)" if cache_ok else
+               f"[bold {RED}]expirado/no vigente[/]") + "\n"
+            f"[bold]Password almacenada en memoria:[/] "
+            + (f"[bold {GREEN}]sí[/] (subagentes y autopilot la usan "
+               f"automáticamente)" if has_stored else
+               f"[bold {GRAY}]no[/]") + "\n\n"
+            f"[dim]Subcomandos:[/]\n"
+            f"[dim]  sudo refresh   · pide password ahora y refresca el caché (15 min)[/]\n"
+            f"[dim]  sudo set       · pide password y la almacena en memoria del proceso[/]\n"
+            f"[dim]                  (no se persiste a disco; subagentes pueden usarla)[/]\n"
+            f"[dim]  sudo clear     · borra la password almacenada[/]\n"
+            f"[dim]  sudo status    · esta vista[/]",
+            title=f"[bold {ORANGE}]Sudo[/]",
+            border_style=ORANGE, box=ROUNDED, padding=(1, 2),
+        ))
+        return _REPL_HANDLED
+
+    if sub in ("refresh", "refrescar", "v"):
+        console.print(
+            f"[dim]› Pidiendo password para refrescar el caché de sudo…[/]"
+        )
+        try:
+            rc = subprocess.call(["sudo", "-v"])
+            if rc == 0:
+                console.print(
+                    f"[bold {GREEN}]✓ Caché de sudo refrescado. "
+                    f"Vigente ~15 min.[/]"
+                )
+            else:
+                console.print(
+                    f"[{RED}]✗ sudo -v devolvió rc={rc}.[/]"
+                )
+        except KeyboardInterrupt:
+            console.print()
+            console.print(f"[{RED}]› cancelado.[/]")
+        return _REPL_HANDLED
+
+    if sub in ("set", "guardar", "almacenar"):
+        try:
+            pw = getpass.getpass(
+                "Password sudo (no se guarda a disco, solo en memoria): "
+            )
+        except (EOFError, KeyboardInterrupt):
+            console.print(f"\n[{RED}]› cancelado.[/]")
+            return _REPL_HANDLED
+        if not pw:
+            console.print(f"[{RED}]› password vacía, no se almacena.[/]")
+            return _REPL_HANDLED
+        console.print(f"[dim]› Validando…[/]")
+        if _set_stored_sudo_password(pw):
+            console.print(
+                f"[bold {GREEN}]✓ Password validada y almacenada en "
+                f"memoria.[/]\n"
+                f"[dim]Subagentes y autopilot la usarán automáticamente "
+                f"cuando un comando requiera sudo. `sudo clear` para "
+                f"borrarla. Se pierde al salir del agente.[/]"
+            )
+        else:
+            console.print(
+                f"[bold {RED}]✗ Password incorrecta o sudo rechazó la "
+                f"autenticación.[/] No se almacenó nada."
+            )
+        return _REPL_HANDLED
+
+    if sub in ("clear", "limpiar", "borrar", "forget"):
+        _clear_stored_sudo_password()
+        # También invalidamos el caché por completo
+        try:
+            subprocess.run(["sudo", "-k"], capture_output=True, timeout=3)
+        except Exception:
+            pass
+        console.print(
+            f"[bold {CYAN}]Password borrada de memoria · "
+            f"caché de sudo invalidado.[/]"
+        )
+        return _REPL_HANDLED
+
+    console.print(
+        f"[{RED}]Uso: sudo [status|refresh|set|clear][/]"
+    )
+    return _REPL_HANDLED
+
+
+def _repl_timeout(user_input, cmd_lower, first_word):
+    """Handler REPL: timeout."""
+    parts = user_input.split(maxsplit=2)
+    sub = parts[1].strip().lower() if len(parts) > 1 else "status"
+    global COMMAND_TIMEOUT_S, COMMAND_TIMEOUT_S_LARGE, WORDLIST_MEDIUM_THRESHOLD_LINES
+    if sub in ("status", "estado", ""):
+        console.print(
+            f"[bold {WHITE}]Timeout de ejecución de comandos:[/]\n"
+            f"  · base: [bold]{COMMAND_TIMEOUT_S}s[/] "
+            f"({COMMAND_TIMEOUT_S // 60}min {COMMAND_TIMEOUT_S % 60}s)\n"
+            f"  · extendido para wordlists ≥ "
+            f"{WORDLIST_MEDIUM_THRESHOLD_LINES:,} líneas: "
+            f"[bold]{COMMAND_TIMEOUT_S_LARGE}s[/] "
+            f"({COMMAND_TIMEOUT_S_LARGE // 60}min)\n\n"
+            f"[dim]Uso:[/]\n"
+            f"[dim]  timeout <segundos>     · cambia el base (10–7200)[/]\n"
+            f"[dim]  timeout large <N>      · cambia el extendido (60–14400)[/]\n"
+            f"[dim]  timeout threshold <N>  · cambia el umbral de líneas (≥100)[/]\n"
+            f"[dim]  timeout default        · restaura 300/1800/5000[/]"
+        )
+    elif sub in ("default", "reset", "restaurar"):
+        COMMAND_TIMEOUT_S = 300
+        COMMAND_TIMEOUT_S_LARGE = 1800
+        WORDLIST_MEDIUM_THRESHOLD_LINES = 5000
+        console.print(
+            f"[bold {GREEN}]✓ Timeouts reseteados:[/] "
+            f"base=300s · extendido=1800s · umbral=5000 líneas."
+        )
+    elif sub in ("large", "extendido"):
+        if len(parts) < 3:
+            console.print(
+                f"[{RED}]Uso: timeout large <segundos> (60–14400)[/]"
+            )
+        else:
+            try:
+                v = int(parts[2].strip())
+                if v < 60 or v > 14400:
+                    console.print(
+                        f"[{RED}]Rango válido: 60–14400s. Recibido: {v}[/]"
+                    )
+                else:
+                    COMMAND_TIMEOUT_S_LARGE = v
+                    console.print(
+                        f"[bold {GREEN}]✓ Timeout extendido → {v}s "
+                        f"({v // 60}min).[/]"
+                    )
+            except ValueError:
+                console.print(f"[{RED}]Debe ser un entero. Recibido: '{parts[2]}'[/]")
+    elif sub in ("threshold", "umbral"):
+        if len(parts) < 3:
+            console.print(
+                f"[{RED}]Uso: timeout threshold <líneas> (mínimo 100)[/]"
+            )
+        else:
+            try:
+                v = int(parts[2].strip())
+                if v < 100:
+                    console.print(f"[{RED}]Mínimo 100 líneas. Recibido: {v}[/]")
+                else:
+                    WORDLIST_MEDIUM_THRESHOLD_LINES = v
+                    console.print(
+                        f"[bold {GREEN}]✓ Umbral wordlist → {v:,} líneas. "
+                        f"A partir de ese tamaño se aplica el timeout extendido.[/]"
+                    )
+            except ValueError:
+                console.print(f"[{RED}]Debe ser un entero. Recibido: '{parts[2]}'[/]")
+    else:
+        # `timeout <N>` → cambia el base
+        try:
+            v = int(sub)
+            if v < 10 or v > 7200:
+                console.print(
+                    f"[{RED}]Rango válido para timeout base: 10–7200s. "
+                    f"Recibido: {v}[/]"
+                )
+            else:
+                COMMAND_TIMEOUT_S = v
+                console.print(
+                    f"[bold {GREEN}]✓ Timeout base → {v}s "
+                    f"({v // 60}min {v % 60}s).[/]"
+                )
+        except ValueError:
+            console.print(
+                f"[{RED}]Uso: timeout [<segundos> | large <N> | "
+                f"threshold <N> | default | status][/]"
+            )
+    return _REPL_HANDLED
+
+
+def _repl_auto(user_input, cmd_lower, first_word):
+    """Handler REPL: auto, autonomo, autónomo."""
+    global AUTO_CONTINUE, AUTO_CONTINUE_MAX_STEPS
+    parts = user_input.split(maxsplit=2)
+    sub = parts[1].strip().lower() if len(parts) > 1 else "status"
+    if sub in ("status", "estado", ""):
+        console.print(
+            f"[bold {CYAN}]Modo autónomo:[/] "
+            f"{'[green]ON[/]' if AUTO_CONTINUE else '[red]OFF[/]'}  ·  "
+            f"máx. pasos por turno: [bold]{AUTO_CONTINUE_MAX_STEPS}[/]\n"
+            f"[dim]El agente ejecuta el COMANDO que proponga su propio "
+            f"análisis y sigue iterando sin esperar a que escribas "
+            f"'sigue'. `auto off` para volver al modo clásico; "
+            f"`auto steps <N>` para cambiar el límite.[/]"
+        )
+    elif sub in ("on", "activar", "si", "sí"):
+        AUTO_CONTINUE = True
+        console.print(f"[bold {GREEN}]✓ Modo autónomo ON[/] "
+                      f"(máx. {AUTO_CONTINUE_MAX_STEPS} pasos/turno).")
+    elif sub in ("off", "desactivar", "no"):
+        AUTO_CONTINUE = False
+        console.print(f"[bold {CYAN}]Modo autónomo OFF[/] — un comando "
+                      f"por turno, como antes.")
+    elif sub in ("steps", "pasos", "max", "límite", "limite"):
+        if len(parts) < 3 or not parts[2].strip().isdigit():
+            console.print(f"[{RED}]Uso: auto steps <N> (1–500)[/]")
+        else:
+            v = int(parts[2].strip())
+            if v < 1 or v > 500:
+                console.print(f"[{RED}]Rango válido: 1–500.[/]")
+            else:
+                AUTO_CONTINUE_MAX_STEPS = v
+                console.print(f"[bold {GREEN}]✓ Límite autónomo → "
+                              f"{v} pasos/turno.[/]")
+    else:
+        # `auto <N>` como atajo
+        try:
+            v = int(sub)
+            if 1 <= v <= 500:
+                AUTO_CONTINUE_MAX_STEPS = v
+                AUTO_CONTINUE = True
+                console.print(f"[bold {GREEN}]✓ Modo autónomo ON · "
+                              f"{v} pasos/turno.[/]")
+            else:
+                console.print(f"[{RED}]Rango válido: 1–500.[/]")
+        except ValueError:
+            console.print(
+                f"[{RED}]Uso: auto [on|off|status|steps <N>|"
+                f"<N>][/]"
+            )
+    return _REPL_HANDLED
+
+
+def _repl_goal(user_input, cmd_lower, first_word):
+    """Handler REPL: goal, objetivo."""
+    tokens = user_input.split(maxsplit=1)
+    rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+    if rest.lower() in ("", "status", "estado"):
+        with _goal_lock:
+            gr = _active_goal_orch
+        if not gr:
+            console.print(
+                f"[dim]No hay goal activo. Lanza uno con `goal "
+                f"<descripción del objetivo>`.[/]"
+            )
+        else:
+            status_color = {
+                "running": "yellow", "done": GREEN,
+                "blocked": "#fbbf24", "exhausted": MAGENTA,
+                "budget_exhausted": "#f97316",
+                "killed": "#fbbf24", "failed": RED, "pending": CYAN,
+            }.get(gr.status, "white")
+            crit_status = ""
+            if getattr(gr, "criteria", None):
+                last_v = (gr.verifications[-1]
+                          if getattr(gr, "verifications", None) else None)
+                if last_v and last_v.get("results"):
+                    crit_status = "\n[bold]Criterios:[/] " + " · ".join(
+                        ("✓ " if r["ok"] else "✗ ") + r["criterion"]
+                        for r in last_v["results"]
+                    )
+                else:
+                    crit_status = ("\n[bold]Criterios:[/] "
+                                   + " · ".join(gr.criteria))
+            budget_status = ""
+            if getattr(gr, "budget_commands", None):
+                b = _goal_budget_status(gr)
+                budget_status = (
+                    f"\n[bold]Presupuesto:[/] "
+                    f"{b['elapsed_s']/60:.0f} min · "
+                    f"{b['commands_used']}/{b['budget_commands']} cmds"
+                )
+            console.print(Panel(
+                f"[bold]Goal:[/] {gr.goal}\n"
+                f"[bold]Estado:[/] [{status_color}]{gr.status}[/]  ·  "
+                f"Fase: {gr.current_phase}/{gr.max_phases}\n"
+                f"[bold]Target:[/] [bold {PURPLE}]{gr.target or '(ninguno — modo ad-hoc)'}[/]  ·  "
+                f"Started: {gr.started_at}\n"
+                f"[bold]Subagentes por fase:[/] "
+                + " · ".join(
+                    f"F{ph['n']}={len(ph.get('subagent_names', []))}"
+                    for ph in gr.phases
+                ) + crit_status + budget_status + (
+                    f"\n[bold]Motivo:[/] {gr.outcome_reason}"
+                    if gr.outcome_reason else ""
+                ) + (
+                    f"\n[dim]Log: "
+                    f"{os.path.relpath(gr.log_path, WORKSPACE)}[/]"
+                ),
+                title=f"[bold {PURPLE}]Goal orchestrator[/]",
+                border_style=PURPLE, box=ROUNDED, padding=(1, 2),
+            ))
+        return _REPL_HANDLED
+
+    if rest.lower() in ("kill", "stop", "parar", "abort"):
+        if kill_goal():
+            console.print(
+                f"[bold {CYAN}]Kill solicitado al goal activo. "
+                f"Terminará tras la fase actual.[/]"
+            )
+        else:
+            console.print(
+                f"[{RED}]No hay goal activo para detener.[/]"
+            )
+        return _REPL_HANDLED
+
+    if rest.lower() in ("show", "ver", "log"):
+        with _goal_lock:
+            gr = _active_goal_orch
+        if not gr:
+            console.print(f"[{RED}]No hay goal activo.[/]")
+        else:
+            _print_goal_finished_panel(gr)
+        return _REPL_HANDLED
+
+    # `goal list` — lista todos los goals persistidos en disco
+    if rest.lower() in ("list", "listar", "ls"):
+        persisted = list_persisted_goals()
+        if not persisted:
+            console.print(
+                f"[dim]No hay goals persistidos en "
+                f"memory/subagents/.[/]"
+            )
+            return _REPL_HANDLED
+        table = Table(
+            title=f"Goals persistidos ({len(persisted)})",
+            border_style=PURPLE, box=ROUNDED,
+        )
+        table.add_column("ID", style=CYAN, no_wrap=True)
+        table.add_column("Status", no_wrap=True)
+        table.add_column("Target", style=PURPLE, no_wrap=True)
+        table.add_column("Fase", no_wrap=True)
+        table.add_column("Started", style=GRAY, no_wrap=True)
+        table.add_column("Goal", style=WHITE)
+        color_map = {
+            "running": "yellow", "pending": "yellow",
+            "done": GREEN, "blocked": "#fbbf24",
+            "exhausted": MAGENTA, "budget_exhausted": "#f97316",
+            "killed": "#fbbf24", "failed": RED,
+        }
+        for g in persisted[:30]:
+            c = color_map.get(g.get("status", ""), "white")
+            goal_short = g.get("goal", "")[:60]
+            if len(g.get("goal", "")) > 60:
+                goal_short += "…"
+            table.add_row(
+                g.get("id", "?"),
+                f"[{c}]{g.get('status', '?')}[/]",
+                g.get("target", "?"),
+                f"{g.get('current_phase', 0)}/{g.get('max_phases', '?')}",
+                g.get("started_at", "?")[:16],
+                goal_short,
+            )
+        console.print(table)
+        console.print(
+            f"[dim]Resumir: [bold]goal resume <id>[/]  ·  "
+            f"Borrar estado: [bold]goal discard <id>[/][/]"
+        )
+        return _REPL_HANDLED
+
+    # `goal resume [id]` — reanuda un goal interrumpido
+    if rest.lower().startswith("resume") or rest.lower().startswith("reanudar") or rest.lower().startswith("retomar"):
+        parts_r = rest.split(maxsplit=1)
+        if len(parts_r) > 1:
+            target_id = parts_r[1].strip()
+        else:
+            orphans = list_orphan_goals()
+            if not orphans:
+                console.print(
+                    f"[dim]No hay goals huérfanos para reanudar. "
+                    f"Usa `goal list` para ver todos los persistidos.[/]"
+                )
+                return _REPL_HANDLED
+            target_id = orphans[0].get("id")
+            console.print(
+                f"[dim]› Reanudando el huérfano más reciente: "
+                f"[bold]{target_id}[/][/]"
+            )
+        gr, err = resume_goal(target_id)
+        if err:
+            console.print(f"[{RED}]✗ {err}[/]")
+        else:
+            n_done = len(gr.phases)
+            n_left = gr.max_phases - gr.current_phase
+            console.print()
+            console.print(Panel(
+                f"[bold {GREEN}]✓ Goal '{gr.id}' reanudado[/]\n\n"
+                f"[bold {WHITE}]Goal:[/] {gr.goal[:200]}"
+                f"{'…' if len(gr.goal) > 200 else ''}\n"
+                f"[bold {WHITE}]Target:[/] {gr.target}\n"
+                f"[bold {WHITE}]Fases completadas previamente:[/] "
+                f"{n_done} ({', '.join('F'+str(p['n']) for p in gr.phases) or 'ninguna'})\n"
+                f"[bold {WHITE}]Fases restantes:[/] {n_left}\n\n"
+                f"[dim]El orquestador continúa desde fase "
+                f"{gr.current_phase + 1}. Las fases ya ejecutadas NO "
+                f"se repiten — su evidencia ya está en los archivos "
+                f"del target.[/]",
+                title=f"[bold {GREEN}]» Goal reanudado[/]",
+                border_style=GREEN, box=ROUNDED, padding=(1, 2),
+            ))
+        return _REPL_HANDLED
+
+    # `goal discard <id>` — borra el estado persistido
+    if rest.lower().startswith("discard") or rest.lower().startswith("descartar"):
+        parts_d = rest.split(maxsplit=1)
+        if len(parts_d) < 2:
+            console.print(
+                f"[{RED}]Uso: goal discard <id>[/]"
+            )
+            return _REPL_HANDLED
+        gid = parts_d[1].strip()
+        if discard_goal_state(gid):
+            console.print(
+                f"[bold {CYAN}]Estado del goal '{gid}' descartado. "
+                f"El log de ejecución sigue en disco.[/]"
+            )
+        else:
+            console.print(
+                f"[{RED}]No existe estado persistido para goal '{gid}'.[/]"
+            )
+        return _REPL_HANDLED
+
+    # `goal spec <ruta>` → leer especificación de archivo
+    if rest.lower().startswith(("spec ", "especificacion ", "especificación ")):
+        spec_path = rest.split(maxsplit=1)[1].strip()
+        full_spec = _goal_resolve_path(spec_path)
+        try:
+            with open(full_spec, "r", encoding="utf-8") as f:
+                rest = f.read()
+        except OSError as e:
+            console.print(f"[{RED}]✗ no se pudo leer {spec_path}: {e}[/]")
+            return _REPL_HANDLED
+        console.print(
+            f"[dim]› spec cargada de "
+            f"{os.path.relpath(full_spec, WORKSPACE)}[/]"
+        )
+
+    # `goal <texto>` → lanzar
+    goal_run, err = start_goal(rest)
+    if err:
+        console.print(f"[{RED}]✗ {err}[/]")
+    else:
+        criteria_str = (
+            "\n".join(f"  · {c}" for c in goal_run.criteria)
+            if goal_run.criteria else
+            "  (ninguno — el LLM decide cuándo terminar)"
+        )
+        console.print()
+        console.print(Panel(
+            f"[bold {GREEN}]✓ Goal lanzado · id {goal_run.id}[/]\n\n"
+            f"[bold {WHITE}]Goal:[/] {goal_run.goal[:300]}"
+            f"{'…' if len(goal_run.goal) > 300 else ''}\n"
+            f"[bold {WHITE}]Target:[/] {goal_run.target or '(ninguno — modo ad-hoc)'}\n"
+            f"[bold {WHITE}]Max fases:[/] {goal_run.max_phases}  ·  "
+            f"[bold {WHITE}]Max subagentes por fase:[/] "
+            f"{MAX_CONCURRENT_SUBAGENTS}\n"
+            f"[bold {WHITE}]Verificación objetiva:[/]\n{criteria_str}\n"
+            f"[bold {WHITE}]Presupuesto:[/] "
+            f"{goal_run.budget_seconds/3600:.1f}h · "
+            f"{goal_run.budget_commands} comandos\n\n"
+            f"[dim]El orquestador planifica fase a fase, "
+            f"lanza subagentes en paralelo, espera y replanifica. "
+            f"Te aviso cuando termine.\n"
+            f"`goal status` para ver estado · "
+            f"`goal kill` para detener.\n"
+            f"Log: {os.path.relpath(goal_run.log_path, WORKSPACE)}[/]",
+            title=f"[bold {GREEN}]» Goal-driven orchestration[/]",
+            border_style=GREEN, box=ROUNDED, padding=(1, 2),
+        ))
+    return _REPL_HANDLED
+
+
+def _repl_subagent(user_input, cmd_lower, first_word):
+    """Handler REPL: subagent, subagente, sub."""
+    tokens = user_input.split(maxsplit=3)
+    action = tokens[1].strip().lower() if len(tokens) > 1 else "list"
+
+    if action in ("list", "ls", "status", "estado"):
+        subs = list_subagents()
+        if not subs:
+            console.print(f"[dim]No hay subagentes.[/]")
+        else:
+            table = Table(
+                title="Subagentes",
+                border_style=PURPLE, box=ROUNDED,
+            )
+            table.add_column("Nombre", style=WHITE, no_wrap=True)
+            table.add_column("Status", no_wrap=True)
+            table.add_column("Skill", style=PURPLE, no_wrap=True)
+            table.add_column("Turnos", style=GRAY, no_wrap=True)
+            table.add_column("Cmds", style=GRAY, no_wrap=True)
+            table.add_column("Tarea", style=WHITE)
+            color_map = {
+                "running": "yellow", "done": GREEN,
+                "failed": RED, "killed": "#fbbf24",
+                "exhausted": MAGENTA, "pending": CYAN,
+            }
+            for s in subs:
+                c = color_map.get(s.status, "white")
+                table.add_row(
+                    s.name,
+                    f"[{c}]{s.status}[/]",
+                    s.skill,
+                    f"{s.turns_used}/{s.max_turns}",
+                    str(len(s.commands_run)),
+                    (s.task[:60] + "…") if len(s.task) > 60 else s.task,
+                )
+            console.print(table)
+        return _REPL_HANDLED
+
+    if action in ("new", "spawn", "crear", "lanzar"):
+        # Uso: subagent new <name> <skill> "<tarea>"
+        if len(tokens) < 4:
+            console.print(
+                f"[{RED}]Uso: subagent new <nombre> <skill> "
+                f"<descripción de la tarea>[/]"
+            )
+            return _REPL_HANDLED
+        sname = tokens[2].strip()
+        rest = tokens[3].strip()
+        # Separar skill de la tarea (skill es la primera palabra)
+        rest_tokens = rest.split(maxsplit=1)
+        if len(rest_tokens) < 2:
+            console.print(
+                f"[{RED}]Falta la descripción de la tarea. "
+                f"Uso: subagent new <nombre> <skill> "
+                f"<descripción>[/]"
+            )
+            return _REPL_HANDLED
+        sskill, stask = rest_tokens[0].strip(), rest_tokens[1].strip()
+        stask = stask.strip('"\'')
+        sub, err = spawn_subagent(sname, sskill, stask)
+        if err:
+            console.print(f"[{RED}]✗ {err}[/]")
+        else:
+            console.print()
+            console.print(Panel(
+                f"[bold {GREEN}]✓ Subagente '{sname}' lanzado[/]\n\n"
+                f"[bold {WHITE}]Skill:[/] {sskill}\n"
+                f"[bold {WHITE}]Target:[/] {ACTIVE_TARGET}\n"
+                f"[bold {WHITE}]Max turnos:[/] {sub.max_turns}\n"
+                f"[bold {WHITE}]Tarea:[/] {stask[:200]}"
+                f"{'…' if len(stask) > 200 else ''}\n\n"
+                f"[dim]Trabaja en background. Te aviso cuando "
+                f"termine. `subagent list` para ver progreso, "
+                f"`subagent kill {sname}` para pararlo.\n"
+                f"Log: {os.path.relpath(sub.log_path, WORKSPACE)}[/]",
+                border_style=GREEN, box=ROUNDED, padding=(1, 2),
+            ))
+        return _REPL_HANDLED
+
+    if action in ("kill", "stop", "parar", "abort"):
+        if len(tokens) < 3:
+            console.print(f"[{RED}]Uso: subagent kill <nombre>[/]")
+            return _REPL_HANDLED
+        sname = tokens[2].strip()
+        if kill_subagent(sname):
+            console.print(
+                f"[bold {CYAN}]Kill solicitado a '{sname}'. "
+                f"Terminará tras el turno actual.[/]"
+            )
+        else:
+            console.print(
+                f"[{RED}]No hay subagente activo con nombre '{sname}'.[/]"
+            )
+        return _REPL_HANDLED
+
+    if action in ("show", "ver", "log"):
+        if len(tokens) < 3:
+            console.print(f"[{RED}]Uso: subagent show <nombre>[/]")
+            return _REPL_HANDLED
+        sname = tokens[2].strip()
+        with _subagents_lock:
+            sub = _subagents_registry.get(sname)
+        if not sub:
+            console.print(f"[{RED}]No existe subagente '{sname}'.[/]")
+            return _REPL_HANDLED
+        _print_subagent_finished_panel(sub)
+        return _REPL_HANDLED
+
+    console.print(
+        f"[{RED}]Acciones: new <nombre> <skill> <tarea> · "
+        f"list · show <nombre> · kill <nombre>[/]"
+    )
+    return _REPL_HANDLED
+
+
+def _repl_proxy(user_input, cmd_lower, first_word):
+    """Handler REPL: proxy."""
+    parts = user_input.split(maxsplit=1)
+    sub = parts[1].strip().lower() if len(parts) > 1 else "status"
+    global PROXY_MODE
+    if sub in ("status", "estado", ""):
+        _print_proxy_status()
+    elif sub in ("on", "proxychains"):
+        PROXY_MODE = "proxychains"
+        console.print(f"[bold {GREEN}]✓ Proxy ON (proxychains).[/]")
+        _print_proxy_status()
+    elif sub in ("torify", "torsocks"):
+        PROXY_MODE = "torify"
+        console.print(f"[bold {GREEN}]✓ Proxy ON (torify).[/]")
+        _print_proxy_status()
+    elif sub in ("off", "no"):
+        PROXY_MODE = "off"
+        console.print(f"[bold {CYAN}]Proxy OFF — los comandos van directos.[/]")
+    else:
+        console.print(
+            f"[{RED}]Uso: proxy [on|off|status|proxychains|torify][/]"
+        )
+    return _REPL_HANDLED
+
+
+def _repl_skills(user_input, cmd_lower, first_word):
+    """Handler REPL: skills, habilidades."""
+    print_skills_menu()
+    return _REPL_HANDLED
+
+
+def _repl_compact(user_input, cmd_lower, first_word):
+    """Handler REPL: compact, compactar."""
+    est_before = estimate_tokens(history)
+    new_history = _compact_messages_for_call(list(history))
+    # _compact_messages_for_call respeta el threshold automático.
+    # Para el comando manual lo forzamos saltándonos el threshold:
+    if new_history is history or estimate_tokens(new_history) == est_before:
+        # Forzar truncado independientemente del % usado
+        user_indices = [
+            i for i, m in enumerate(history) if m.get("role") == "user"
+        ]
+        if len(user_indices) <= COMPACT_KEEP_LAST_TURNS:
+            console.print(
+                f"[dim]Sin turnos suficientes para compactar "
+                f"(necesitas > {COMPACT_KEEP_LAST_TURNS} pares user/assistant).[/]"
+            )
+            return _REPL_HANDLED
+        cutoff = user_indices[-COMPACT_KEEP_LAST_TURNS]
+        new_history = []
+        touched = 0
+        for i, m in enumerate(history):
+            if i == 0 or m.get("role") == "system" or i >= cutoff:
+                new_history.append(m)
+                continue
+            original = m.get("content", "") or ""
+            new_content = _compact_message_content(original)
+            if len(new_content) < len(original):
+                nm = dict(m)
+                nm["content"] = new_content
+                new_history.append(nm)
+                touched += 1
+            else:
+                new_history.append(m)
+        if touched == 0:
+            console.print(f"[dim]No había nada que compactar.[/]")
+            return _REPL_HANDLED
+    est_after = estimate_tokens(new_history)
+    saved = est_before - est_after
+    history.clear()
+    history.extend(new_history)
+    save_session()
+    console.print()
+    console.print(Panel(
+        f"[bold {GREEN}]✓ History compactado[/]\n"
+        f"[{WHITE}]{est_before:,} → {est_after:,} tokens "
+        f"(~{saved:,} ahorrados, {saved/max(est_before,1)*100:.1f}%)[/]\n\n"
+        f"[dim]Los últimos {COMPACT_KEEP_LAST_TURNS} turnos quedan intactos. "
+        f"Los resultados de comandos anteriores se mantienen sólo con "
+        f"head+tail (medio sustituido por marcador). El _timeline.md "
+        f"del target sigue guardando el original.[/]",
+        border_style=GREEN,
+        box=ROUNDED,
+        padding=(1, 2),
+    ))
+    return _REPL_HANDLED
+
+
+def _repl_aprende(user_input, cmd_lower, first_word):
+    """Handler REPL: aprende, learn, recuerda."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        console.print(
+            f"[{RED}]Uso: aprende <regla a recordar>[/]\n"
+            f"[dim]Ejemplo: aprende Cuando uses subfinder, "
+            f"desactiva proxychains con `agent:proxy off` antes; "
+            f"LD_PRELOAD lo ignora.[/]"
+        )
+        return _REPL_HANDLED
+    path = save_lesson(parts[1].strip())
+    if not path:
+        console.print(f"[bold {RED}]No se pudo guardar la lección.[/]")
+        return _REPL_HANDLED
+    rel = os.path.relpath(path, WORKSPACE)
+    console.print()
+    console.print(Panel(
+        f"[bold {GREEN}]✓ Lección guardada[/]\n\n"
+        f"[{WHITE}]{parts[1].strip()}[/]\n\n"
+        f"[dim]→ {rel}[/]\n"
+        f"[dim]Se inyecta en el system prompt; el agente la "
+        f"respetará en lo sucesivo.[/]",
+        border_style=GREEN,
+        box=ROUNDED,
+        padding=(1, 2),
+    ))
+    return _REPL_HANDLED
+
+
+def _repl_lecciones(user_input, cmd_lower, first_word):
+    """Handler REPL: lecciones, lessons."""
+    content = list_lessons_raw()
+    has_entry = any(
+        line.strip().startswith("- ")
+        for line in content.splitlines()
+    )
+    if not has_entry:
+        console.print(
+            f"[dim]Sin lecciones guardadas todavía. "
+            f"Usa `aprende <regla>` o el modelo lo hará con "
+            f"`agent:learn <regla>`.[/]"
+        )
+        return _REPL_HANDLED
+    console.print()
+    console.print(Panel(
+        Markdown(content),
+        title=f"[bold {ORANGE}]Lecciones aprendidas[/]",
+        border_style=ORANGE,
+        box=ROUNDED,
+        padding=(1, 2),
+    ))
+    return _REPL_HANDLED
+
+
+def _repl_olvida(user_input, cmd_lower, first_word):
+    """Handler REPL: olvida, forget."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        console.print(
+            f"[{RED}]Uso: olvida <fragmento_del_nombre_de_archivo>[/]\n"
+            f"[dim]Lista los nombres con `lecciones`.[/]"
+        )
+        return _REPL_HANDLED
+    result = forget_lesson(parts[1].strip())
+    if result is None:
+        console.print(
+            f"[bold {RED}]Sin coincidencias para "
+            f"'{parts[1].strip()}'.[/]"
+        )
+    elif isinstance(result, list):
+        console.print(
+            f"[bold {ORANGE}]Varias coincidencias — sé más específico:[/]"
+        )
+        for m in result:
+            console.print(f"  · {m}")
+    else:
+        console.print(
+            f"[bold {GREEN}]✓ Lección olvidada:[/] {result}"
+        )
+    return _REPL_HANDLED
+
+
+def _repl_tools_master(user_input, cmd_lower, first_word):
+    """Handler REPL: tools_master, master."""
+    _print_tools_master_menu()
+    return _REPL_HANDLED
+
+
+def _repl_target(user_input, cmd_lower, first_word):
+    """Handler REPL: target, objetivo."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) == 1:
+        # `target` sin args → menú
+        print_targets_menu()
+        return _REPL_HANDLED
+
+    sub = parts[1].strip()
+    sub_lower = sub.lower()
+
+    if sub_lower in ("reload", "recargar"):
+        if not ACTIVE_TARGET:
+            console.print(f"[{RED}]No hay target activo para recargar.[/]")
+            return _REPL_HANDLED
+        ok, info = load_target(ACTIVE_TARGET)
+        if ok:
+            console.print(
+                f"[bold {GREEN}]✓ Target '{ACTIVE_TARGET}' recargado[/] "
+                f"({info['n_files']} archivos, {_human_size(info['size'])})."
+            )
+            save_session()
+        else:
+            console.print(f"[{RED}]Error al recargar: {info.get('error', '?')}[/]")
+        return _REPL_HANDLED
+
+    if sub_lower in ("unload", "descargar"):
+        if not ACTIVE_TARGET:
+            console.print(f"[{CYAN_DARK}]No hay target activo.[/]")
+            return _REPL_HANDLED
+        prev = ACTIVE_TARGET
+        unload_target()
+        console.print(f"[bold {CYAN}]Target '{prev}' descargado del contexto.[/]")
+        save_session()
+        return _REPL_HANDLED
+
+    # `target <nombre>` → cargar
+    ok, info = load_target(sub)
+    if ok:
+        console.print(
+            f"[bold {GREEN}]✓ Target '{sub}' cargado[/] "
+            f"({info['n_files']} archivos, {_human_size(info['size'])})."
+        )
+        save_session()
+    else:
+        console.print(f"[{RED}]Error: {info.get('error', '?')}[/]")
+    return _REPL_HANDLED
+
+
+def _repl_use(user_input, cmd_lower, first_word):
+    """Handler REPL: use, usar."""
+    # `use <skill>` activa la skill.
+    # `use <skill> <texto...>` activa la skill y envía <texto...> al modelo.
+    tokens = user_input.split(maxsplit=2)
+    skill_name = tokens[1].strip() if len(tokens) > 1 else ""
+    extra_instruction = tokens[2].strip() if len(tokens) > 2 else ""
+
+    if not skill_name:
+        console.print(f"[{RED}]Uso: use <nombre_skill> [instrucción]  (alias: usar)[/]")
+        return _REPL_HANDLED
+    if activate_skill(skill_name):
+        master_loaded = os.path.isfile(
+            os.path.join(TOOLS_MASTER_DIR, f"{skill_name}.md")
+        )
+        master_tag = (
+            f" · [bold {PURPLE}]tools_master/{skill_name}.md cargada[/]"
+            if master_loaded else ""
+        )
+        console.print(
+            f"[bold {GREEN}]✓ Skill '{skill_name}' activada.[/] "
+            f"Activas: {', '.join(ACTIVE_SKILLS)}{master_tag}"
+        )
+        save_session()
+        if extra_instruction:
+            # Reemitimos la instrucción como entrada normal del usuario.
+            # El dispatcher la reenvía directamente al modelo (sin volver a
+            # pasar por la tabla), así "use recon resume" no se interpreta
+            # como el comando `resume`.
+            return (_REPL_FALLTHROUGH, extra_instruction)
+        return _REPL_HANDLED
+    console.print(
+        f"[{RED}]No se encontró skills/{skill_name}/skill.md[/]"
+    )
+    return _REPL_HANDLED
+
+
+def _repl_unuse(user_input, cmd_lower, first_word):
+    """Handler REPL: unuse, quitar."""
+    parts = user_input.split(maxsplit=1)
+    skill_name = parts[1].strip() if len(parts) > 1 else ""
+    if not skill_name:
+        console.print(f"[{RED}]Uso: unuse <nombre_skill> (alias: quitar)[/]")
+        return _REPL_HANDLED
+    if deactivate_skill(skill_name):
+        remaining = ", ".join(ACTIVE_SKILLS) if ACTIVE_SKILLS else "(ninguna)"
+        console.print(
+            f"[bold {CYAN}]Skill '{skill_name}' desactivada.[/] "
+            f"Activas: {remaining}"
+        )
+        save_session()
+    else:
+        console.print(
+            f"[{RED}]La skill '{skill_name}' no estaba activa.[/]"
+        )
+    return _REPL_HANDLED
+
+
+def _repl_sessions(user_input, cmd_lower, first_word):
+    """Handler REPL: sessions, sesiones."""
+    print_sessions_menu()
+    return _REPL_HANDLED
+
+
+def _repl_resume(user_input, cmd_lower, first_word):
+    """Handler REPL: resume, retomar."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) > 1:
+        target_id = parts[1].strip()
+    else:
+        saved = list_saved_sessions(limit=1)
+        if not saved:
+            console.print(f"[{RED}]No hay sesiones guardadas para retomar.[/]")
+            return _REPL_HANDLED
+        target_id = saved[0]["id"]
+    if resume_session(target_id):
+        skills_str = ", ".join(ACTIVE_SKILLS) if ACTIVE_SKILLS else "(ninguna)"
+        target_str = (
+            f" · target: [bold {PURPLE}]{ACTIVE_TARGET}[/]"
+            if ACTIVE_TARGET else ""
+        )
+        console.print(
+            f"[bold {GREEN}]✓ Sesión '{target_id}' retomada[/] "
+            f"({len(history)} mensajes · skills: {skills_str}{target_str})."
+        )
+        # Mostrar el último intercambio prompt/respuesta para
+        # recordar al operador dónde se quedó la sesión.
+        last_user, last_assistant = get_last_exchange()
+        if last_user:
+            # Recorto a un tamaño legible (cap por bloque)
+            USER_CAP = 1500
+            ASS_CAP = 3000
+            user_disp = last_user.strip()
+            if len(user_disp) > USER_CAP:
+                user_disp = user_disp[:USER_CAP] + f"\n\n[…+{len(last_user) - USER_CAP} chars…]"
+            body = [f"[bold {CYAN}]Tú dijiste:[/]\n{user_disp}"]
+            if last_assistant:
+                ass_disp = last_assistant.strip()
+                if len(ass_disp) > ASS_CAP:
+                    ass_disp = ass_disp[:ASS_CAP] + f"\n\n[…+{len(last_assistant) - ASS_CAP} chars…]"
+                body.append("")
+                body.append(f"[bold {ORANGE}]Agente respondió:[/]")
+                body.append(ass_disp)
+            else:
+                body.append("")
+                body.append(
+                    f"[dim](el agente no llegó a responder a este "
+                    f"último prompt)[/]"
+                )
+            console.print()
+            console.print(Panel(
+                "\n".join(body),
+                title=f"[bold {CYAN}]» Último intercambio de la sesión «[/]",
+                border_style=CYAN, box=ROUNDED, padding=(1, 2),
+            ))
+        else:
+            console.print(
+                f"[dim]› Sesión sin intercambios previos del "
+                f"operador (history sólo system messages).[/]"
+            )
+    else:
+        console.print(f"[{RED}]No se pudo cargar la sesión '{target_id}'.[/]")
+    return _REPL_HANDLED
+
+
+def _repl_new(user_input, cmd_lower, first_word):
+    """Handler REPL: new, nueva, nuevo."""
+    start_new_session()
+    console.print(f"[bold {GREEN}]✓ Sesión nueva iniciada (id: {SESSION_ID}).[/]")
+    return _REPL_HANDLED
+
+
+def _repl_report(user_input, cmd_lower, first_word):
+    """Handler REPL: report, informe."""
+    if not ACTIVE_TARGET:
+        console.print(
+            f"[{RED}]No hay target activo.[/] Carga uno con [bold]target <nombre>[/] "
+            f"antes de generar un informe."
+        )
+        return _REPL_HANDLED
+
+    parts_r = user_input.split(maxsplit=1)
+    extra_instructions = parts_r[1].strip() if len(parts_r) > 1 else ""
+
+    # Asegurar que la skill 'reporting' está activa
+    if "reporting" not in ACTIVE_SKILLS:
+        if activate_skill("reporting"):
+            console.print(f"[dim]→ Activando skill 'reporting'.[/]")
+            save_session()
+
+    reporting_prompt = (
+        f"Genera AHORA el informe técnico completo del target activo "
+        f"'{ACTIVE_TARGET}'. Usa TODA la información que tienes en el "
+        f"contexto del target (scope.md, infrastructure.md, identities.md, "
+        f"attack-surface.md, wifi.md, notes.md, _timeline.md) más los "
+        f"comandos ejecutados durante la sesión.\n\n"
+        f"REGLAS DURAS PARA ESTE TURNO:\n"
+        f"- NO emitas ningún bloque [[TARGET_UPDATE]]. NO emitas COMANDO.\n"
+        f"- Devuelve SOLO el informe completo en Markdown, sin comentarios "
+        f"meta ni preámbulos. La primera línea debe ser el título principal "
+        f"con `# `.\n"
+        f"- Sigue la estructura de la skill 'reporting': Resumen ejecutivo, "
+        f"Alcance/Metodología, Resumen de hallazgos (tabla), Detalle de "
+        f"cada hallazgo (Título · ID · Severidad+CVSS · CWE/OWASP · "
+        f"Descripción · Activos · Reproducción · Evidencia · Impacto · "
+        f"Mitigación · Referencias), Anexos.\n"
+        f"- Para cada hallazgo, basa CVSS/severidad en lo que tienes "
+        f"evidenciado. Si algo no está confirmado, márcalo como "
+        f"\"Informativa\" o \"A confirmar\" en lugar de inventar severidad.\n"
+        f"- Si faltan datos críticos (no hay hallazgos confirmados, alcance "
+        f"vacío, etc.), genera igualmente el documento con secciones "
+        f"\"Pendiente de completar\" — el operador rellenará después.\n"
+    )
+    if extra_instructions:
+        reporting_prompt += (
+            f"\nInstrucciones adicionales del operador: {extra_instructions}"
+        )
+
+    console.print(
+        f"[bold {CYAN}]→ Generando informe del target '{ACTIVE_TARGET}'…[/]"
+    )
+
+    answer = ask_model(reporting_prompt)
+
+    # Volcar a reports/
+    os.makedirs(os.path.join(WORKSPACE, "reports"), exist_ok=True)
+    fname = (
+        f"informe-{ACTIVE_TARGET}-"
+        f"{datetime.now().strftime('%Y%m%d-%H%M')}.md"
+    )
+    report_path = os.path.join(WORKSPACE, "reports", fname)
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write((answer or "").strip() + "\n")
+    except OSError as e:
+        console.print(f"[{RED}]Error al escribir el informe: {e}[/]")
+        return _REPL_HANDLED
+
+    # HOOK on_report — indexado, hash, etc. No bloquea aunque falle.
+    run_hook("on_report", _build_hook_ctx(
+        report_path=report_path,
+        report_name=fname,
+    ))
+
+    size_kb = os.path.getsize(report_path) / 1024
+    n_lines = (answer or "").count("\n") + 1
+
+    console.print()
+    console.print(Panel(
+        f"[bold {GREEN}]✓ Informe generado[/]\n"
+        f"[{WHITE}]{report_path}[/]\n\n"
+        f"[dim]{size_kb:.1f} KB · {n_lines} líneas[/]\n\n"
+        f"[dim]Convertir a PDF:[/]\n"
+        f"  [bold]pandoc {os.path.relpath(report_path, WORKSPACE)} "
+        f"-o {os.path.relpath(report_path, WORKSPACE)[:-3]}.pdf "
+        f"--pdf-engine=xelatex[/]",
+        title=f"[bold {ORANGE}]Informe técnico[/]",
+        border_style=GREEN,
+        box=ROUNDED,
+        padding=(1, 2),
+    ))
+    return _REPL_HANDLED
+
+
+_REPL_TABLE = []  # [(kind, frozenset(names), handler)]
+
+
+def _register_repl(kind, names, handler):
+    _REPL_TABLE.append((kind, frozenset(names), handler))
+
+
+_register_repl('exact', ('salir', 'exit', 'quit'), _repl_salir)
+_register_repl('exact', ('help', 'ayuda'), _repl_help)
+_register_repl('exact', ('comandos', 'commands'), _repl_comandos)
+_register_repl('exact', ('refresh', 'refrescar', 'clear', 'limpiar'), _repl_refresh)
+_register_repl('first', ('models', 'modelos', 'model', 'modelo'), _repl_models)
+_register_repl('first', ('backend', 'backends'), _repl_backend)
+_register_repl('exact', ('tools', 'herramientas'), _repl_tools)
+_register_repl('first', ('copy', 'c', 'copiar'), _repl_copy)
+_register_repl('first', ('view', 'ver', 'cat'), _repl_view)
+_register_repl('first', ('diff',), _repl_diff)
+_register_repl('first', ('edit', 'editar'), _repl_edit)
+_register_repl('first', ('write', 'escribir'), _repl_write)
+_register_repl('first', ('sudo', 'sudopass', 'password'), _repl_sudo)
+_register_repl('first', ('timeout',), _repl_timeout)
+_register_repl('first', ('auto', 'autonomo', 'autónomo'), _repl_auto)
+_register_repl('first', ('goal', 'objetivo'), _repl_goal)
+_register_repl('first', ('subagent', 'subagente', 'sub'), _repl_subagent)
+_register_repl('first', ('proxy',), _repl_proxy)
+_register_repl('exact', ('skills', 'habilidades'), _repl_skills)
+_register_repl('exact', ('compact', 'compactar'), _repl_compact)
+_register_repl('first', ('aprende', 'learn', 'recuerda'), _repl_aprende)
+_register_repl('exact', ('lecciones', 'lessons'), _repl_lecciones)
+_register_repl('first', ('olvida', 'forget'), _repl_olvida)
+_register_repl('first', ('tools_master', 'master'), _repl_tools_master)
+_register_repl('first', ('target', 'objetivo'), _repl_target)
+_register_repl('first', ('use', 'usar'), _repl_use)
+_register_repl('first', ('unuse', 'quitar'), _repl_unuse)
+_register_repl('exact', ('sessions', 'sesiones'), _repl_sessions)
+_register_repl('first', ('resume', 'retomar'), _repl_resume)
+_register_repl('exact', ('new', 'nueva', 'nuevo'), _repl_new)
+_register_repl('first', ('report', 'informe'), _repl_report)
+
+
+def _dispatch_repl(user_input):
+    """Resuelve un input del REPL contra la tabla de comandos.
+
+    Devuelve `_REPL_HANDLED`, `_REPL_EXIT`, `_REPL_FALLTHROUGH` o una
+    tupla `(_REPL_FALLTHROUGH, nuevo_input)` cuando el handler quiere
+    reenviar un texto distinto al modelo (p. ej. `use skill <texto>`).
+    """
+    cmd_lower = user_input.lower()
+    first_word = cmd_lower.split(maxsplit=1)[0] if cmd_lower else ""
+    for kind, names, handler in _REPL_TABLE:
+        key = cmd_lower if kind == "exact" else first_word
+        if key in names:
+            return handler(user_input, cmd_lower, first_word)
+    return _REPL_FALLTHROUGH
+
+
+def main(argv=None):
+    # === CLI headless (P1) =============================================
+    # Permite lanzar un goal sin pasar por el REPL:
+    #   python agent.py --goal "..." --target acme --max-phases 12
+    #   python agent.py --goal "..." || criteria: ... (la sintaxis va dentro)
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="MAXIWATT agent — CLI interactiva o goal headless.",
+    )
+    parser.add_argument("--goal", "-g", default=None,
+                        help="objetivo a ejecutar en modo headless")
+    parser.add_argument("--target", "-t", default=None,
+                        help="target a cargar antes del goal")
+    parser.add_argument("--skill", "-s", action="append", default=[],
+                        help="skill a activar (repetible)")
+    parser.add_argument("--max-phases", type=int, default=GOAL_MAX_PHASES,
+                        help=f"máximo de fases del goal (default {GOAL_MAX_PHASES})")
+    parser.add_argument("--no-splash", action="store_true",
+                        help="no dibujar el splash")
+    args = parser.parse_args(argv)
+    headless = bool(args.goal)
+
     os.makedirs(os.path.join(WORKSPACE, "skills"), exist_ok=True)
     os.makedirs(os.path.join(WORKSPACE, "plugins"), exist_ok=True)
     os.makedirs(os.path.join(WORKSPACE, "hooks"), exist_ok=True)
@@ -10577,17 +12631,60 @@ def main():
 
     # Auto-instalación de la extensión VSCode/Cursor (one-time, no-op si
     # ya está instalada o si no estamos dentro de un terminal de editor).
-    try:
-        maybe_install_vscode_extension()
-    except Exception as e:
-        # Nunca abortar el agente por un fallo del bridge — es opcional.
-        console.print(f"[dim]› bridge VSCode auto-install: omitido ({e})[/]")
+    if not headless:
+        try:
+            maybe_install_vscode_extension()
+        except Exception as e:
+            # Nunca abortar el agente por un fallo del bridge — es opcional.
+            console.print(f"[dim]› bridge VSCode auto-install: omitido ({e})[/]")
 
-    show_splash()
+    if not args.no_splash and not headless:
+        show_splash()
 
     # Detectar goals que quedaron en estado "running"/"pending" por
     # un cierre anterior del agente y avisar al operador.
-    check_orphan_goals_at_startup()
+    if not headless:
+        check_orphan_goals_at_startup()
+
+    # === Modo headless: lanzar goal y esperar al resultado ==============
+    if headless:
+        if args.target:
+            ok, info = load_target(args.target)
+            if not ok:
+                console.print(f"[{RED}]✗ target: {info.get('error', '?')}[/]")
+                return 2
+        for sk in args.skill:
+            if not activate_skill(sk):
+                console.print(f"[{RED}]✗ skill '{sk}' no existe[/]")
+                return 2
+        console.print(
+            f"[bold {CYAN}]» goal headless:[/] {args.goal[:300]}"
+        )
+        gr, err = start_goal(args.goal, max_phases=args.max_phases)
+        if err:
+            console.print(f"[{RED}]✗ {err}[/]")
+            return 2
+        console.print(f"[dim]id={gr.id} · log={gr.log_path}[/]")
+        try:
+            gr.thread.join()
+        except KeyboardInterrupt:
+            kill_goal()
+            console.print(f"\n[{RED}]› goal interrumpido por el operador[/]")
+            gr.thread.join(timeout=10)
+        # Resumen legible para humanos + JSON para automatización.
+        _print_goal_finished_panel(gr)
+        last_v = gr.verifications[-1] if getattr(gr, "verifications", None) else {}
+        print(json.dumps({
+            "id": gr.id,
+            "status": gr.status,
+            "reason": gr.outcome_reason,
+            "summary": gr.summary,
+            "report_path": gr.report_path,
+            "phases": gr.current_phase,
+            "criteria_ok": last_v.get("ok"),
+            "criteria": last_v.get("results", []),
+        }, ensure_ascii=False, indent=2))
+        return 0 if gr.status == "done" else 1
 
     # PromptSession con bottom_toolbar dinámico (se refresca cada segundo)
     # para mostrar 📋 N líneas seleccionadas en X mientras el operador
@@ -10637,1100 +12734,12 @@ def main():
             if not user_input:
                 continue
 
-        cmd_lower = user_input.lower()
-        # Primera palabra (para comandos con argumentos: "use <skill>", "resume <id>")
-        first_word = cmd_lower.split(maxsplit=1)[0] if cmd_lower else ""
-
-        if cmd_lower in ("salir", "exit", "quit"):
+        action = _dispatch_repl(user_input)
+        if action is _REPL_EXIT:
             break
-
-        if cmd_lower in ("help", "ayuda"):
-            print_help()
-            continue
-
-        if cmd_lower in ("comandos", "commands"):
-            print_commands()
-            continue
-
-        if cmd_lower in ("refresh", "refrescar", "clear", "limpiar"):
-            show_splash()
-            continue
-
-        if cmd_lower in ("models", "modelos"):
-            print_models()
-            continue
-
-        if cmd_lower in ("tools", "herramientas"):
-            print_tools()
-            continue
-
-        # `copy` / `c` [n]: copia al portapapeles el último comando
-        # propuesto (o el n-ésimo desde el final). Usa OSC 52 (funciona
-        # remoto vía SSH) + fallbacks nativos (xclip, wl-copy, pbcopy...).
-        if first_word in ("copy", "c", "copiar"):
-            if not _PROPOSED_COMMAND_HISTORY:
-                console.print(
-                    f"[{ORANGE}]no hay comandos propuestos todavía en esta sesión[/]"
-                )
-                continue
-            parts = user_input.split()
-            idx = 1
-            if len(parts) >= 2 and parts[1].isdigit():
-                idx = max(1, int(parts[1]))
-            if idx > len(_PROPOSED_COMMAND_HISTORY):
-                console.print(
-                    f"[{ORANGE}]solo hay {len(_PROPOSED_COMMAND_HISTORY)} "
-                    f"comando(s) en el historial; usa `copy 1`..`copy "
-                    f"{len(_PROPOSED_COMMAND_HISTORY)}`[/]"
-                )
-                continue
-            text = _PROPOSED_COMMAND_HISTORY[-idx]
-            res = copy_command_to_clipboard(text)
-            methods = []
-            if res["osc52"]:
-                methods.append("OSC 52 (terminal/SSH)")
-            if res["native"]:
-                methods.append(res["native"])
-            if methods:
-                console.print(
-                    f"[bold {GREEN}]✓ copiado al portapapeles[/]  "
-                    f"[dim](vía {', '.join(methods)})[/]"
-                )
-                preview = text if len(text) <= 80 else text[:77] + "..."
-                console.print(f"[dim]   {preview}[/]")
-            else:
-                console.print(
-                    f"[bold {RED}]✗ no se pudo copiar[/] "
-                    f"(sin OSC 52 ni binario nativo de clipboard disponible). "
-                    f"Instala uno de: xclip, wl-clipboard, xsel."
-                )
-            continue
-
-        # Comandos de edición de archivos (operador) — `view`, `edit`, `diff`.
-        # Las tres operaciones que el modelo puede hacer vía FILE_*, ahora
-        # también disponibles para el operador desde el REPL.
-        if first_word in ("view", "ver", "cat"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2:
-                console.print(f"[{ORANGE}]uso: view <ruta>[/]")
-                continue
-            r = apply_file_read(parts[1].strip())
-            if r["ok"]:
-                lexer = _guess_syntax_lexer(r["path"]) or "text"
-                # Reconstruir contenido sin las líneas numeradas (Syntax las pone)
-                lines = [
-                    ln.split("\t", 1)[1] if "\t" in ln else ln
-                    for ln in r["content"].splitlines()
-                ]
-                console.print(Panel(
-                    Syntax("\n".join(lines), lexer, line_numbers=True,
-                           theme="dracula", word_wrap=False),
-                    title=f"[bold {ORANGE}]view[/]  ·  [{WHITE}]{r['path']}[/]  "
-                          f"[grey50]({r['shown_lines']}/{r['total_lines']} líneas"
-                          + (", truncado" if r["truncated"] else "") + ")[/]",
-                    border_style=ORANGE, box=ROUNDED, padding=(0, 0),
-                ))
-            else:
-                console.print(f"[bold {RED}]✗[/] {r['error']}")
-            continue
-
-        if first_word in ("diff",):
-            # diff <path1> <path2>: diff entre dos archivos del workspace
-            parts = user_input.split()
-            if len(parts) != 3:
-                console.print(f"[{ORANGE}]uso: diff <ruta1> <ruta2>[/]")
-                continue
-            ok1, full1, rel1 = _validate_workspace_path(parts[1])
-            ok2, full2, rel2 = _validate_workspace_path(parts[2])
-            if not ok1:
-                console.print(f"[bold {RED}]✗[/] {full1}"); continue
-            if not ok2:
-                console.print(f"[bold {RED}]✗[/] {full2}"); continue
-            try:
-                with open(full1, encoding="utf-8") as f: c1 = f.read()
-                with open(full2, encoding="utf-8") as f: c2 = f.read()
-            except (OSError, UnicodeDecodeError) as e:
-                console.print(f"[bold {RED}]✗[/] read: {e}"); continue
-            dl = list(difflib.unified_diff(
-                c1.splitlines(), c2.splitlines(),
-                fromfile=f"a/{rel1}", tofile=f"b/{rel2}", n=3,
-            ))
-            console.print(render_file_diff_panel(f"{rel1} ↔ {rel2}", dl, kind="edit"))
-            continue
-
-        if first_word in ("edit", "editar"):
-            # edit <ruta>: prompt interactivo old/new (multilínea con `EOF`)
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2:
-                console.print(f"[{ORANGE}]uso: edit <ruta>  (luego pegas OLD, EOF, NEW, EOF)[/]")
-                continue
-            path = parts[1].strip()
-            console.print(f"[dim]» pega el texto OLD (línea con solo 'EOF' para terminar):[/]")
-            old_lines = []
-            try:
-                while True:
-                    line = input()
-                    if line.strip() == "EOF": break
-                    old_lines.append(line)
-            except (EOFError, KeyboardInterrupt):
-                console.print(f"[dim]cancelado[/]"); continue
-            console.print(f"[dim]» pega el texto NEW (línea con solo 'EOF' para terminar):[/]")
-            new_lines = []
-            try:
-                while True:
-                    line = input()
-                    if line.strip() == "EOF": break
-                    new_lines.append(line)
-            except (EOFError, KeyboardInterrupt):
-                console.print(f"[dim]cancelado[/]"); continue
-            old_s = "\n".join(old_lines)
-            new_s = "\n".join(new_lines)
-            # Reutilizamos el wire-up del modelo: construimos un answer "ficticio"
-            # con el bloque FILE_EDIT (formato V2 — el único soportado) y lo
-            # procesamos.
-            synthetic = (
-                f"[[FILE_EDIT: {path}]]\n"
-                f"[[OLD]]\n{old_s}\n[[/OLD]]\n"
-                f"[[NEW]]\n{new_s}\n[[/NEW]]\n"
-                f"[[/FILE_EDIT]]"
-            )
-            process_file_blocks(synthetic)
-            continue
-
-        if first_word in ("write", "escribir"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2:
-                console.print(f"[{ORANGE}]uso: write <ruta>  (luego pegas contenido, EOF para terminar)[/]")
-                continue
-            path = parts[1].strip()
-            console.print(f"[dim]» pega el contenido (línea con solo 'EOF' para terminar):[/]")
-            lines = []
-            try:
-                while True:
-                    line = input()
-                    if line.strip() == "EOF": break
-                    lines.append(line)
-            except (EOFError, KeyboardInterrupt):
-                console.print(f"[dim]cancelado[/]"); continue
-            synthetic = (
-                f"[[FILE_WRITE: {path}]]\n"
-                + "\n".join(lines) + "\n"
-                + f"[[/FILE_WRITE]]"
-            )
-            process_file_blocks(synthetic)
-            continue
-
-        if first_word in ("sudo", "sudopass", "password"):
-            parts = user_input.split(maxsplit=1)
-            sub = parts[1].strip().lower() if len(parts) > 1 else "status"
-
-            if sub in ("status", "estado", ""):
-                cache_ok = _sudo_cache_valid()
-                with _sudo_password_lock:
-                    has_stored = _STORED_SUDO_PASSWORD is not None
-                console.print(Panel(
-                    f"[bold]Caché de sudo:[/] "
-                    + (f"[bold {GREEN}]vigente[/] (no pedirá password "
-                       f"durante ~15 min)" if cache_ok else
-                       f"[bold {RED}]expirado/no vigente[/]") + "\n"
-                    f"[bold]Password almacenada en memoria:[/] "
-                    + (f"[bold {GREEN}]sí[/] (subagentes y autopilot la usan "
-                       f"automáticamente)" if has_stored else
-                       f"[bold {GRAY}]no[/]") + "\n\n"
-                    f"[dim]Subcomandos:[/]\n"
-                    f"[dim]  sudo refresh   · pide password ahora y refresca el caché (15 min)[/]\n"
-                    f"[dim]  sudo set       · pide password y la almacena en memoria del proceso[/]\n"
-                    f"[dim]                  (no se persiste a disco; subagentes pueden usarla)[/]\n"
-                    f"[dim]  sudo clear     · borra la password almacenada[/]\n"
-                    f"[dim]  sudo status    · esta vista[/]",
-                    title=f"[bold {ORANGE}]Sudo[/]",
-                    border_style=ORANGE, box=ROUNDED, padding=(1, 2),
-                ))
-                continue
-
-            if sub in ("refresh", "refrescar", "v"):
-                console.print(
-                    f"[dim]› Pidiendo password para refrescar el caché de sudo…[/]"
-                )
-                try:
-                    rc = subprocess.call(["sudo", "-v"])
-                    if rc == 0:
-                        console.print(
-                            f"[bold {GREEN}]✓ Caché de sudo refrescado. "
-                            f"Vigente ~15 min.[/]"
-                        )
-                    else:
-                        console.print(
-                            f"[{RED}]✗ sudo -v devolvió rc={rc}.[/]"
-                        )
-                except KeyboardInterrupt:
-                    console.print()
-                    console.print(f"[{RED}]› cancelado.[/]")
-                continue
-
-            if sub in ("set", "guardar", "almacenar"):
-                try:
-                    pw = getpass.getpass(
-                        "Password sudo (no se guarda a disco, solo en memoria): "
-                    )
-                except (EOFError, KeyboardInterrupt):
-                    console.print(f"\n[{RED}]› cancelado.[/]")
-                    continue
-                if not pw:
-                    console.print(f"[{RED}]› password vacía, no se almacena.[/]")
-                    continue
-                console.print(f"[dim]› Validando…[/]")
-                if _set_stored_sudo_password(pw):
-                    console.print(
-                        f"[bold {GREEN}]✓ Password validada y almacenada en "
-                        f"memoria.[/]\n"
-                        f"[dim]Subagentes y autopilot la usarán automáticamente "
-                        f"cuando un comando requiera sudo. `sudo clear` para "
-                        f"borrarla. Se pierde al salir del agente.[/]"
-                    )
-                else:
-                    console.print(
-                        f"[bold {RED}]✗ Password incorrecta o sudo rechazó la "
-                        f"autenticación.[/] No se almacenó nada."
-                    )
-                continue
-
-            if sub in ("clear", "limpiar", "borrar", "forget"):
-                _clear_stored_sudo_password()
-                # También invalidamos el caché por completo
-                try:
-                    subprocess.run(["sudo", "-k"], capture_output=True, timeout=3)
-                except Exception:
-                    pass
-                console.print(
-                    f"[bold {CYAN}]Password borrada de memoria · "
-                    f"caché de sudo invalidado.[/]"
-                )
-                continue
-
-            console.print(
-                f"[{RED}]Uso: sudo [status|refresh|set|clear][/]"
-            )
-            continue
-
-        if first_word in ("timeout",):
-            parts = user_input.split(maxsplit=2)
-            sub = parts[1].strip().lower() if len(parts) > 1 else "status"
-            global COMMAND_TIMEOUT_S, COMMAND_TIMEOUT_S_LARGE, WORDLIST_MEDIUM_THRESHOLD_LINES
-            if sub in ("status", "estado", ""):
-                console.print(
-                    f"[bold {WHITE}]Timeout de ejecución de comandos:[/]\n"
-                    f"  · base: [bold]{COMMAND_TIMEOUT_S}s[/] "
-                    f"({COMMAND_TIMEOUT_S // 60}min {COMMAND_TIMEOUT_S % 60}s)\n"
-                    f"  · extendido para wordlists ≥ "
-                    f"{WORDLIST_MEDIUM_THRESHOLD_LINES:,} líneas: "
-                    f"[bold]{COMMAND_TIMEOUT_S_LARGE}s[/] "
-                    f"({COMMAND_TIMEOUT_S_LARGE // 60}min)\n\n"
-                    f"[dim]Uso:[/]\n"
-                    f"[dim]  timeout <segundos>     · cambia el base (10–7200)[/]\n"
-                    f"[dim]  timeout large <N>      · cambia el extendido (60–14400)[/]\n"
-                    f"[dim]  timeout threshold <N>  · cambia el umbral de líneas (≥100)[/]\n"
-                    f"[dim]  timeout default        · restaura 300/1800/5000[/]"
-                )
-            elif sub in ("default", "reset", "restaurar"):
-                COMMAND_TIMEOUT_S = 300
-                COMMAND_TIMEOUT_S_LARGE = 1800
-                WORDLIST_MEDIUM_THRESHOLD_LINES = 5000
-                console.print(
-                    f"[bold {GREEN}]✓ Timeouts reseteados:[/] "
-                    f"base=300s · extendido=1800s · umbral=5000 líneas."
-                )
-            elif sub in ("large", "extendido"):
-                if len(parts) < 3:
-                    console.print(
-                        f"[{RED}]Uso: timeout large <segundos> (60–14400)[/]"
-                    )
-                else:
-                    try:
-                        v = int(parts[2].strip())
-                        if v < 60 or v > 14400:
-                            console.print(
-                                f"[{RED}]Rango válido: 60–14400s. Recibido: {v}[/]"
-                            )
-                        else:
-                            COMMAND_TIMEOUT_S_LARGE = v
-                            console.print(
-                                f"[bold {GREEN}]✓ Timeout extendido → {v}s "
-                                f"({v // 60}min).[/]"
-                            )
-                    except ValueError:
-                        console.print(f"[{RED}]Debe ser un entero. Recibido: '{parts[2]}'[/]")
-            elif sub in ("threshold", "umbral"):
-                if len(parts) < 3:
-                    console.print(
-                        f"[{RED}]Uso: timeout threshold <líneas> (mínimo 100)[/]"
-                    )
-                else:
-                    try:
-                        v = int(parts[2].strip())
-                        if v < 100:
-                            console.print(f"[{RED}]Mínimo 100 líneas. Recibido: {v}[/]")
-                        else:
-                            WORDLIST_MEDIUM_THRESHOLD_LINES = v
-                            console.print(
-                                f"[bold {GREEN}]✓ Umbral wordlist → {v:,} líneas. "
-                                f"A partir de ese tamaño se aplica el timeout extendido.[/]"
-                            )
-                    except ValueError:
-                        console.print(f"[{RED}]Debe ser un entero. Recibido: '{parts[2]}'[/]")
-            else:
-                # `timeout <N>` → cambia el base
-                try:
-                    v = int(sub)
-                    if v < 10 or v > 7200:
-                        console.print(
-                            f"[{RED}]Rango válido para timeout base: 10–7200s. "
-                            f"Recibido: {v}[/]"
-                        )
-                    else:
-                        COMMAND_TIMEOUT_S = v
-                        console.print(
-                            f"[bold {GREEN}]✓ Timeout base → {v}s "
-                            f"({v // 60}min {v % 60}s).[/]"
-                        )
-                except ValueError:
-                    console.print(
-                        f"[{RED}]Uso: timeout [<segundos> | large <N> | "
-                        f"threshold <N> | default | status][/]"
-                    )
-            continue
-
-        if first_word in ("goal", "objetivo"):
-            tokens = user_input.split(maxsplit=1)
-            rest = tokens[1].strip() if len(tokens) > 1 else ""
-
-            if rest.lower() in ("", "status", "estado"):
-                with _goal_lock:
-                    gr = _active_goal_orch
-                if not gr:
-                    console.print(
-                        f"[dim]No hay goal activo. Lanza uno con `goal "
-                        f"<descripción del objetivo>`.[/]"
-                    )
-                else:
-                    status_color = {
-                        "running": "yellow", "done": GREEN,
-                        "blocked": "#fbbf24", "exhausted": MAGENTA,
-                        "killed": "#fbbf24", "failed": RED, "pending": CYAN,
-                    }.get(gr.status, "white")
-                    console.print(Panel(
-                        f"[bold]Goal:[/] {gr.goal}\n"
-                        f"[bold]Estado:[/] [{status_color}]{gr.status}[/]  ·  "
-                        f"Fase: {gr.current_phase}/{gr.max_phases}\n"
-                        f"[bold]Target:[/] [bold {PURPLE}]{gr.target or '(ninguno — modo ad-hoc)'}[/]  ·  "
-                        f"Started: {gr.started_at}\n"
-                        f"[bold]Subagentes por fase:[/] "
-                        + " · ".join(
-                            f"F{ph['n']}={len(ph.get('subagent_names', []))}"
-                            for ph in gr.phases
-                        ) + (
-                            f"\n[bold]Motivo:[/] {gr.outcome_reason}"
-                            if gr.outcome_reason else ""
-                        ) + (
-                            f"\n[dim]Log: "
-                            f"{os.path.relpath(gr.log_path, WORKSPACE)}[/]"
-                        ),
-                        title=f"[bold {PURPLE}]Goal orchestrator[/]",
-                        border_style=PURPLE, box=ROUNDED, padding=(1, 2),
-                    ))
-                continue
-
-            if rest.lower() in ("kill", "stop", "parar", "abort"):
-                if kill_goal():
-                    console.print(
-                        f"[bold {CYAN}]Kill solicitado al goal activo. "
-                        f"Terminará tras la fase actual.[/]"
-                    )
-                else:
-                    console.print(
-                        f"[{RED}]No hay goal activo para detener.[/]"
-                    )
-                continue
-
-            if rest.lower() in ("show", "ver", "log"):
-                with _goal_lock:
-                    gr = _active_goal_orch
-                if not gr:
-                    console.print(f"[{RED}]No hay goal activo.[/]")
-                else:
-                    _print_goal_finished_panel(gr)
-                continue
-
-            # `goal list` — lista todos los goals persistidos en disco
-            if rest.lower() in ("list", "listar", "ls"):
-                persisted = list_persisted_goals()
-                if not persisted:
-                    console.print(
-                        f"[dim]No hay goals persistidos en "
-                        f"memory/subagents/.[/]"
-                    )
-                    continue
-                table = Table(
-                    title=f"Goals persistidos ({len(persisted)})",
-                    border_style=PURPLE, box=ROUNDED,
-                )
-                table.add_column("ID", style=CYAN, no_wrap=True)
-                table.add_column("Status", no_wrap=True)
-                table.add_column("Target", style=PURPLE, no_wrap=True)
-                table.add_column("Fase", no_wrap=True)
-                table.add_column("Started", style=GRAY, no_wrap=True)
-                table.add_column("Goal", style=WHITE)
-                color_map = {
-                    "running": "yellow", "pending": "yellow",
-                    "done": GREEN, "blocked": "#fbbf24",
-                    "exhausted": MAGENTA, "killed": "#fbbf24",
-                    "failed": RED,
-                }
-                for g in persisted[:30]:
-                    c = color_map.get(g.get("status", ""), "white")
-                    goal_short = g.get("goal", "")[:60]
-                    if len(g.get("goal", "")) > 60:
-                        goal_short += "…"
-                    table.add_row(
-                        g.get("id", "?"),
-                        f"[{c}]{g.get('status', '?')}[/]",
-                        g.get("target", "?"),
-                        f"{g.get('current_phase', 0)}/{g.get('max_phases', '?')}",
-                        g.get("started_at", "?")[:16],
-                        goal_short,
-                    )
-                console.print(table)
-                console.print(
-                    f"[dim]Resumir: [bold]goal resume <id>[/]  ·  "
-                    f"Borrar estado: [bold]goal discard <id>[/][/]"
-                )
-                continue
-
-            # `goal resume [id]` — reanuda un goal interrumpido
-            if rest.lower().startswith("resume") or rest.lower().startswith("reanudar") or rest.lower().startswith("retomar"):
-                parts_r = rest.split(maxsplit=1)
-                if len(parts_r) > 1:
-                    target_id = parts_r[1].strip()
-                else:
-                    orphans = list_orphan_goals()
-                    if not orphans:
-                        console.print(
-                            f"[dim]No hay goals huérfanos para reanudar. "
-                            f"Usa `goal list` para ver todos los persistidos.[/]"
-                        )
-                        continue
-                    target_id = orphans[0].get("id")
-                    console.print(
-                        f"[dim]› Reanudando el huérfano más reciente: "
-                        f"[bold]{target_id}[/][/]"
-                    )
-                gr, err = resume_goal(target_id)
-                if err:
-                    console.print(f"[{RED}]✗ {err}[/]")
-                else:
-                    n_done = len(gr.phases)
-                    n_left = gr.max_phases - gr.current_phase
-                    console.print()
-                    console.print(Panel(
-                        f"[bold {GREEN}]✓ Goal '{gr.id}' reanudado[/]\n\n"
-                        f"[bold {WHITE}]Goal:[/] {gr.goal[:200]}"
-                        f"{'…' if len(gr.goal) > 200 else ''}\n"
-                        f"[bold {WHITE}]Target:[/] {gr.target}\n"
-                        f"[bold {WHITE}]Fases completadas previamente:[/] "
-                        f"{n_done} ({', '.join('F'+str(p['n']) for p in gr.phases) or 'ninguna'})\n"
-                        f"[bold {WHITE}]Fases restantes:[/] {n_left}\n\n"
-                        f"[dim]El orquestador continúa desde fase "
-                        f"{gr.current_phase + 1}. Las fases ya ejecutadas NO "
-                        f"se repiten — su evidencia ya está en los archivos "
-                        f"del target.[/]",
-                        title=f"[bold {GREEN}]» Goal reanudado[/]",
-                        border_style=GREEN, box=ROUNDED, padding=(1, 2),
-                    ))
-                continue
-
-            # `goal discard <id>` — borra el estado persistido
-            if rest.lower().startswith("discard") or rest.lower().startswith("descartar"):
-                parts_d = rest.split(maxsplit=1)
-                if len(parts_d) < 2:
-                    console.print(
-                        f"[{RED}]Uso: goal discard <id>[/]"
-                    )
-                    continue
-                gid = parts_d[1].strip()
-                if discard_goal_state(gid):
-                    console.print(
-                        f"[bold {CYAN}]Estado del goal '{gid}' descartado. "
-                        f"El log de ejecución sigue en disco.[/]"
-                    )
-                else:
-                    console.print(
-                        f"[{RED}]No existe estado persistido para goal '{gid}'.[/]"
-                    )
-                continue
-
-            # `goal <texto>` → lanzar
-            goal_run, err = start_goal(rest)
-            if err:
-                console.print(f"[{RED}]✗ {err}[/]")
-            else:
-                console.print()
-                console.print(Panel(
-                    f"[bold {GREEN}]✓ Goal lanzado · id {goal_run.id}[/]\n\n"
-                    f"[bold {WHITE}]Goal:[/] {goal_run.goal[:300]}"
-                    f"{'…' if len(goal_run.goal) > 300 else ''}\n"
-                    f"[bold {WHITE}]Target:[/] {goal_run.target or '(ninguno — modo ad-hoc)'}\n"
-                    f"[bold {WHITE}]Max fases:[/] {goal_run.max_phases}  ·  "
-                    f"[bold {WHITE}]Max subagentes por fase:[/] "
-                    f"{MAX_CONCURRENT_SUBAGENTS}\n\n"
-                    f"[dim]El orquestador planifica fase a fase, "
-                    f"lanza subagentes en paralelo, espera y replanifica. "
-                    f"Te aviso cuando termine.\n"
-                    f"`goal status` para ver estado · "
-                    f"`goal kill` para detener.\n"
-                    f"Log: {os.path.relpath(goal_run.log_path, WORKSPACE)}[/]",
-                    title=f"[bold {GREEN}]» Goal-driven orchestration[/]",
-                    border_style=GREEN, box=ROUNDED, padding=(1, 2),
-                ))
-            continue
-
-        if first_word in ("subagent", "subagente", "sub"):
-            tokens = user_input.split(maxsplit=3)
-            action = tokens[1].strip().lower() if len(tokens) > 1 else "list"
-
-            if action in ("list", "ls", "status", "estado"):
-                subs = list_subagents()
-                if not subs:
-                    console.print(f"[dim]No hay subagentes.[/]")
-                else:
-                    table = Table(
-                        title="Subagentes",
-                        border_style=PURPLE, box=ROUNDED,
-                    )
-                    table.add_column("Nombre", style=WHITE, no_wrap=True)
-                    table.add_column("Status", no_wrap=True)
-                    table.add_column("Skill", style=PURPLE, no_wrap=True)
-                    table.add_column("Turnos", style=GRAY, no_wrap=True)
-                    table.add_column("Cmds", style=GRAY, no_wrap=True)
-                    table.add_column("Tarea", style=WHITE)
-                    color_map = {
-                        "running": "yellow", "done": GREEN,
-                        "failed": RED, "killed": "#fbbf24",
-                        "exhausted": MAGENTA, "pending": CYAN,
-                    }
-                    for s in subs:
-                        c = color_map.get(s.status, "white")
-                        table.add_row(
-                            s.name,
-                            f"[{c}]{s.status}[/]",
-                            s.skill,
-                            f"{s.turns_used}/{s.max_turns}",
-                            str(len(s.commands_run)),
-                            (s.task[:60] + "…") if len(s.task) > 60 else s.task,
-                        )
-                    console.print(table)
-                continue
-
-            if action in ("new", "spawn", "crear", "lanzar"):
-                # Uso: subagent new <name> <skill> "<tarea>"
-                if len(tokens) < 4:
-                    console.print(
-                        f"[{RED}]Uso: subagent new <nombre> <skill> "
-                        f"<descripción de la tarea>[/]"
-                    )
-                    continue
-                sname = tokens[2].strip()
-                rest = tokens[3].strip()
-                # Separar skill de la tarea (skill es la primera palabra)
-                rest_tokens = rest.split(maxsplit=1)
-                if len(rest_tokens) < 2:
-                    console.print(
-                        f"[{RED}]Falta la descripción de la tarea. "
-                        f"Uso: subagent new <nombre> <skill> "
-                        f"<descripción>[/]"
-                    )
-                    continue
-                sskill, stask = rest_tokens[0].strip(), rest_tokens[1].strip()
-                stask = stask.strip('"\'')
-                sub, err = spawn_subagent(sname, sskill, stask)
-                if err:
-                    console.print(f"[{RED}]✗ {err}[/]")
-                else:
-                    console.print()
-                    console.print(Panel(
-                        f"[bold {GREEN}]✓ Subagente '{sname}' lanzado[/]\n\n"
-                        f"[bold {WHITE}]Skill:[/] {sskill}\n"
-                        f"[bold {WHITE}]Target:[/] {ACTIVE_TARGET}\n"
-                        f"[bold {WHITE}]Max turnos:[/] {sub.max_turns}\n"
-                        f"[bold {WHITE}]Tarea:[/] {stask[:200]}"
-                        f"{'…' if len(stask) > 200 else ''}\n\n"
-                        f"[dim]Trabaja en background. Te aviso cuando "
-                        f"termine. `subagent list` para ver progreso, "
-                        f"`subagent kill {sname}` para pararlo.\n"
-                        f"Log: {os.path.relpath(sub.log_path, WORKSPACE)}[/]",
-                        border_style=GREEN, box=ROUNDED, padding=(1, 2),
-                    ))
-                continue
-
-            if action in ("kill", "stop", "parar", "abort"):
-                if len(tokens) < 3:
-                    console.print(f"[{RED}]Uso: subagent kill <nombre>[/]")
-                    continue
-                sname = tokens[2].strip()
-                if kill_subagent(sname):
-                    console.print(
-                        f"[bold {CYAN}]Kill solicitado a '{sname}'. "
-                        f"Terminará tras el turno actual.[/]"
-                    )
-                else:
-                    console.print(
-                        f"[{RED}]No hay subagente activo con nombre '{sname}'.[/]"
-                    )
-                continue
-
-            if action in ("show", "ver", "log"):
-                if len(tokens) < 3:
-                    console.print(f"[{RED}]Uso: subagent show <nombre>[/]")
-                    continue
-                sname = tokens[2].strip()
-                with _subagents_lock:
-                    sub = _subagents_registry.get(sname)
-                if not sub:
-                    console.print(f"[{RED}]No existe subagente '{sname}'.[/]")
-                    continue
-                _print_subagent_finished_panel(sub)
-                continue
-
-            console.print(
-                f"[{RED}]Acciones: new <nombre> <skill> <tarea> · "
-                f"list · show <nombre> · kill <nombre>[/]"
-            )
-            continue
-
-        if first_word in ("proxy",):
-            parts = user_input.split(maxsplit=1)
-            sub = parts[1].strip().lower() if len(parts) > 1 else "status"
-            global PROXY_MODE
-            if sub in ("status", "estado", ""):
-                _print_proxy_status()
-            elif sub in ("on", "proxychains"):
-                PROXY_MODE = "proxychains"
-                console.print(f"[bold {GREEN}]✓ Proxy ON (proxychains).[/]")
-                _print_proxy_status()
-            elif sub in ("torify", "torsocks"):
-                PROXY_MODE = "torify"
-                console.print(f"[bold {GREEN}]✓ Proxy ON (torify).[/]")
-                _print_proxy_status()
-            elif sub in ("off", "no"):
-                PROXY_MODE = "off"
-                console.print(f"[bold {CYAN}]Proxy OFF — los comandos van directos.[/]")
-            else:
-                console.print(
-                    f"[{RED}]Uso: proxy [on|off|status|proxychains|torify][/]"
-                )
-            continue
-
-        if cmd_lower in ("skills", "habilidades"):
-            print_skills_menu()
-            continue
-
-        if cmd_lower in ("compact", "compactar"):
-            est_before = estimate_tokens(history)
-            new_history = _compact_messages_for_call(list(history))
-            # _compact_messages_for_call respeta el threshold automático.
-            # Para el comando manual lo forzamos saltándonos el threshold:
-            if new_history is history or estimate_tokens(new_history) == est_before:
-                # Forzar truncado independientemente del % usado
-                user_indices = [
-                    i for i, m in enumerate(history) if m.get("role") == "user"
-                ]
-                if len(user_indices) <= COMPACT_KEEP_LAST_TURNS:
-                    console.print(
-                        f"[dim]Sin turnos suficientes para compactar "
-                        f"(necesitas > {COMPACT_KEEP_LAST_TURNS} pares user/assistant).[/]"
-                    )
-                    continue
-                cutoff = user_indices[-COMPACT_KEEP_LAST_TURNS]
-                new_history = []
-                touched = 0
-                for i, m in enumerate(history):
-                    if i == 0 or m.get("role") == "system" or i >= cutoff:
-                        new_history.append(m)
-                        continue
-                    original = m.get("content", "") or ""
-                    new_content = _compact_message_content(original)
-                    if len(new_content) < len(original):
-                        nm = dict(m)
-                        nm["content"] = new_content
-                        new_history.append(nm)
-                        touched += 1
-                    else:
-                        new_history.append(m)
-                if touched == 0:
-                    console.print(f"[dim]No había nada que compactar.[/]")
-                    continue
-            est_after = estimate_tokens(new_history)
-            saved = est_before - est_after
-            history.clear()
-            history.extend(new_history)
-            save_session()
-            console.print()
-            console.print(Panel(
-                f"[bold {GREEN}]✓ History compactado[/]\n"
-                f"[{WHITE}]{est_before:,} → {est_after:,} tokens "
-                f"(~{saved:,} ahorrados, {saved/max(est_before,1)*100:.1f}%)[/]\n\n"
-                f"[dim]Los últimos {COMPACT_KEEP_LAST_TURNS} turnos quedan intactos. "
-                f"Los resultados de comandos anteriores se mantienen sólo con "
-                f"head+tail (medio sustituido por marcador). El _timeline.md "
-                f"del target sigue guardando el original.[/]",
-                border_style=GREEN,
-                box=ROUNDED,
-                padding=(1, 2),
-            ))
-            continue
-
-        if first_word in ("aprende", "learn", "recuerda"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2 or not parts[1].strip():
-                console.print(
-                    f"[{RED}]Uso: aprende <regla a recordar>[/]\n"
-                    f"[dim]Ejemplo: aprende Cuando uses subfinder, "
-                    f"desactiva proxychains con `agent:proxy off` antes; "
-                    f"LD_PRELOAD lo ignora.[/]"
-                )
-                continue
-            path = save_lesson(parts[1].strip())
-            if not path:
-                console.print(f"[bold {RED}]No se pudo guardar la lección.[/]")
-                continue
-            rel = os.path.relpath(path, WORKSPACE)
-            console.print()
-            console.print(Panel(
-                f"[bold {GREEN}]✓ Lección guardada[/]\n\n"
-                f"[{WHITE}]{parts[1].strip()}[/]\n\n"
-                f"[dim]→ {rel}[/]\n"
-                f"[dim]Se inyecta en el system prompt; el agente la "
-                f"respetará en lo sucesivo.[/]",
-                border_style=GREEN,
-                box=ROUNDED,
-                padding=(1, 2),
-            ))
-            continue
-
-        if cmd_lower in ("lecciones", "lessons"):
-            content = list_lessons_raw()
-            has_entry = any(
-                line.strip().startswith("- ")
-                for line in content.splitlines()
-            )
-            if not has_entry:
-                console.print(
-                    f"[dim]Sin lecciones guardadas todavía. "
-                    f"Usa `aprende <regla>` o el modelo lo hará con "
-                    f"`agent:learn <regla>`.[/]"
-                )
-                continue
-            console.print()
-            console.print(Panel(
-                Markdown(content),
-                title=f"[bold {ORANGE}]Lecciones aprendidas[/]",
-                border_style=ORANGE,
-                box=ROUNDED,
-                padding=(1, 2),
-            ))
-            continue
-
-        if first_word in ("olvida", "forget"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2 or not parts[1].strip():
-                console.print(
-                    f"[{RED}]Uso: olvida <fragmento_del_nombre_de_archivo>[/]\n"
-                    f"[dim]Lista los nombres con `lecciones`.[/]"
-                )
-                continue
-            result = forget_lesson(parts[1].strip())
-            if result is None:
-                console.print(
-                    f"[bold {RED}]Sin coincidencias para "
-                    f"'{parts[1].strip()}'.[/]"
-                )
-            elif isinstance(result, list):
-                console.print(
-                    f"[bold {ORANGE}]Varias coincidencias — sé más específico:[/]"
-                )
-                for m in result:
-                    console.print(f"  · {m}")
-            else:
-                console.print(
-                    f"[bold {GREEN}]✓ Lección olvidada:[/] {result}"
-                )
-            continue
-
-        if first_word in ("tools_master", "master"):
-            _print_tools_master_menu()
-            continue
-
-        if first_word in ("target", "objetivo"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 1:
-                # `target` sin args → menú
-                print_targets_menu()
-                continue
-
-            sub = parts[1].strip()
-            sub_lower = sub.lower()
-
-            if sub_lower in ("reload", "recargar"):
-                if not ACTIVE_TARGET:
-                    console.print(f"[{RED}]No hay target activo para recargar.[/]")
-                    continue
-                ok, info = load_target(ACTIVE_TARGET)
-                if ok:
-                    console.print(
-                        f"[bold {GREEN}]✓ Target '{ACTIVE_TARGET}' recargado[/] "
-                        f"({info['n_files']} archivos, {_human_size(info['size'])})."
-                    )
-                    save_session()
-                else:
-                    console.print(f"[{RED}]Error al recargar: {info.get('error', '?')}[/]")
-                continue
-
-            if sub_lower in ("unload", "descargar"):
-                if not ACTIVE_TARGET:
-                    console.print(f"[{CYAN_DARK}]No hay target activo.[/]")
-                    continue
-                prev = ACTIVE_TARGET
-                unload_target()
-                console.print(f"[bold {CYAN}]Target '{prev}' descargado del contexto.[/]")
-                save_session()
-                continue
-
-            # `target <nombre>` → cargar
-            ok, info = load_target(sub)
-            if ok:
-                console.print(
-                    f"[bold {GREEN}]✓ Target '{sub}' cargado[/] "
-                    f"({info['n_files']} archivos, {_human_size(info['size'])})."
-                )
-                save_session()
-            else:
-                console.print(f"[{RED}]Error: {info.get('error', '?')}[/]")
-            continue
-
-        if first_word in ("use", "usar"):
-            # `use <skill>` activa la skill.
-            # `use <skill> <texto...>` activa la skill y envía <texto...> al modelo.
-            tokens = user_input.split(maxsplit=2)
-            skill_name = tokens[1].strip() if len(tokens) > 1 else ""
-            extra_instruction = tokens[2].strip() if len(tokens) > 2 else ""
-
-            if not skill_name:
-                console.print(f"[{RED}]Uso: use <nombre_skill> [instrucción]  (alias: usar)[/]")
-                continue
-            if activate_skill(skill_name):
-                master_loaded = os.path.isfile(
-                    os.path.join(TOOLS_MASTER_DIR, f"{skill_name}.md")
-                )
-                master_tag = (
-                    f" · [bold {PURPLE}]tools_master/{skill_name}.md cargada[/]"
-                    if master_loaded else ""
-                )
-                console.print(
-                    f"[bold {GREEN}]✓ Skill '{skill_name}' activada.[/] "
-                    f"Activas: {', '.join(ACTIVE_SKILLS)}{master_tag}"
-                )
-                save_session()
-                if extra_instruction:
-                    # Reemitimos la instrucción como entrada normal del usuario.
-                    # Reseteamos cmd_lower/first_word para que ningún handler
-                    # posterior la capture (p.ej. "use recon resume" no debe
-                    # activar la skill 'recon' Y luego ejecutar 'resume').
-                    user_input = extra_instruction
-                    cmd_lower = ""
-                    first_word = ""
-                    # Cae al bloque del modelo abajo.
-                else:
-                    continue
-            else:
-                console.print(
-                    f"[{RED}]No se encontró skills/{skill_name}/skill.md[/]"
-                )
-                continue
-
-        if first_word in ("unuse", "quitar"):
-            parts = user_input.split(maxsplit=1)
-            skill_name = parts[1].strip() if len(parts) > 1 else ""
-            if not skill_name:
-                console.print(f"[{RED}]Uso: unuse <nombre_skill> (alias: quitar)[/]")
-                continue
-            if deactivate_skill(skill_name):
-                remaining = ", ".join(ACTIVE_SKILLS) if ACTIVE_SKILLS else "(ninguna)"
-                console.print(
-                    f"[bold {CYAN}]Skill '{skill_name}' desactivada.[/] "
-                    f"Activas: {remaining}"
-                )
-                save_session()
-            else:
-                console.print(
-                    f"[{RED}]La skill '{skill_name}' no estaba activa.[/]"
-                )
-            continue
-
-        if cmd_lower in ("sessions", "sesiones"):
-            print_sessions_menu()
-            continue
-
-        if first_word in ("resume", "retomar"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) > 1:
-                target_id = parts[1].strip()
-            else:
-                saved = list_saved_sessions(limit=1)
-                if not saved:
-                    console.print(f"[{RED}]No hay sesiones guardadas para retomar.[/]")
-                    continue
-                target_id = saved[0]["id"]
-            if resume_session(target_id):
-                skills_str = ", ".join(ACTIVE_SKILLS) if ACTIVE_SKILLS else "(ninguna)"
-                target_str = (
-                    f" · target: [bold {PURPLE}]{ACTIVE_TARGET}[/]"
-                    if ACTIVE_TARGET else ""
-                )
-                console.print(
-                    f"[bold {GREEN}]✓ Sesión '{target_id}' retomada[/] "
-                    f"({len(history)} mensajes · skills: {skills_str}{target_str})."
-                )
-                # Mostrar el último intercambio prompt/respuesta para
-                # recordar al operador dónde se quedó la sesión.
-                last_user, last_assistant = get_last_exchange()
-                if last_user:
-                    # Recorto a un tamaño legible (cap por bloque)
-                    USER_CAP = 1500
-                    ASS_CAP = 3000
-                    user_disp = last_user.strip()
-                    if len(user_disp) > USER_CAP:
-                        user_disp = user_disp[:USER_CAP] + f"\n\n[…+{len(last_user) - USER_CAP} chars…]"
-                    body = [f"[bold {CYAN}]Tú dijiste:[/]\n{user_disp}"]
-                    if last_assistant:
-                        ass_disp = last_assistant.strip()
-                        if len(ass_disp) > ASS_CAP:
-                            ass_disp = ass_disp[:ASS_CAP] + f"\n\n[…+{len(last_assistant) - ASS_CAP} chars…]"
-                        body.append("")
-                        body.append(f"[bold {ORANGE}]Agente respondió:[/]")
-                        body.append(ass_disp)
-                    else:
-                        body.append("")
-                        body.append(
-                            f"[dim](el agente no llegó a responder a este "
-                            f"último prompt)[/]"
-                        )
-                    console.print()
-                    console.print(Panel(
-                        "\n".join(body),
-                        title=f"[bold {CYAN}]» Último intercambio de la sesión «[/]",
-                        border_style=CYAN, box=ROUNDED, padding=(1, 2),
-                    ))
-                else:
-                    console.print(
-                        f"[dim]› Sesión sin intercambios previos del "
-                        f"operador (history sólo system messages).[/]"
-                    )
-            else:
-                console.print(f"[{RED}]No se pudo cargar la sesión '{target_id}'.[/]")
-            continue
-
-        if cmd_lower in ("new", "nueva", "nuevo"):
-            start_new_session()
-            console.print(f"[bold {GREEN}]✓ Sesión nueva iniciada (id: {SESSION_ID}).[/]")
-            continue
-
-        if first_word in ("report", "informe"):
-            if not ACTIVE_TARGET:
-                console.print(
-                    f"[{RED}]No hay target activo.[/] Carga uno con [bold]target <nombre>[/] "
-                    f"antes de generar un informe."
-                )
-                continue
-
-            parts_r = user_input.split(maxsplit=1)
-            extra_instructions = parts_r[1].strip() if len(parts_r) > 1 else ""
-
-            # Asegurar que la skill 'reporting' está activa
-            if "reporting" not in ACTIVE_SKILLS:
-                if activate_skill("reporting"):
-                    console.print(f"[dim]→ Activando skill 'reporting'.[/]")
-                    save_session()
-
-            reporting_prompt = (
-                f"Genera AHORA el informe técnico completo del target activo "
-                f"'{ACTIVE_TARGET}'. Usa TODA la información que tienes en el "
-                f"contexto del target (scope.md, infrastructure.md, identities.md, "
-                f"attack-surface.md, wifi.md, notes.md, _timeline.md) más los "
-                f"comandos ejecutados durante la sesión.\n\n"
-                f"REGLAS DURAS PARA ESTE TURNO:\n"
-                f"- NO emitas ningún bloque [[TARGET_UPDATE]]. NO emitas COMANDO.\n"
-                f"- Devuelve SOLO el informe completo en Markdown, sin comentarios "
-                f"meta ni preámbulos. La primera línea debe ser el título principal "
-                f"con `# `.\n"
-                f"- Sigue la estructura de la skill 'reporting': Resumen ejecutivo, "
-                f"Alcance/Metodología, Resumen de hallazgos (tabla), Detalle de "
-                f"cada hallazgo (Título · ID · Severidad+CVSS · CWE/OWASP · "
-                f"Descripción · Activos · Reproducción · Evidencia · Impacto · "
-                f"Mitigación · Referencias), Anexos.\n"
-                f"- Para cada hallazgo, basa CVSS/severidad en lo que tienes "
-                f"evidenciado. Si algo no está confirmado, márcalo como "
-                f"\"Informativa\" o \"A confirmar\" en lugar de inventar severidad.\n"
-                f"- Si faltan datos críticos (no hay hallazgos confirmados, alcance "
-                f"vacío, etc.), genera igualmente el documento con secciones "
-                f"\"Pendiente de completar\" — el operador rellenará después.\n"
-            )
-            if extra_instructions:
-                reporting_prompt += (
-                    f"\nInstrucciones adicionales del operador: {extra_instructions}"
-                )
-
-            console.print(
-                f"[bold {CYAN}]→ Generando informe del target '{ACTIVE_TARGET}'…[/]"
-            )
-
-            answer = ask_model(reporting_prompt)
-
-            # Volcar a reports/
-            os.makedirs(os.path.join(WORKSPACE, "reports"), exist_ok=True)
-            fname = (
-                f"informe-{ACTIVE_TARGET}-"
-                f"{datetime.now().strftime('%Y%m%d-%H%M')}.md"
-            )
-            report_path = os.path.join(WORKSPACE, "reports", fname)
-            try:
-                with open(report_path, "w", encoding="utf-8") as f:
-                    f.write((answer or "").strip() + "\n")
-            except OSError as e:
-                console.print(f"[{RED}]Error al escribir el informe: {e}[/]")
-                continue
-
-            # HOOK on_report — indexado, hash, etc. No bloquea aunque falle.
-            run_hook("on_report", _build_hook_ctx(
-                report_path=report_path,
-                report_name=fname,
-            ))
-
-            size_kb = os.path.getsize(report_path) / 1024
-            n_lines = (answer or "").count("\n") + 1
-
-            console.print()
-            console.print(Panel(
-                f"[bold {GREEN}]✓ Informe generado[/]\n"
-                f"[{WHITE}]{report_path}[/]\n\n"
-                f"[dim]{size_kb:.1f} KB · {n_lines} líneas[/]\n\n"
-                f"[dim]Convertir a PDF:[/]\n"
-                f"  [bold]pandoc {os.path.relpath(report_path, WORKSPACE)} "
-                f"-o {os.path.relpath(report_path, WORKSPACE)[:-3]}.pdf "
-                f"--pdf-engine=xelatex[/]",
-                title=f"[bold {ORANGE}]Informe técnico[/]",
-                border_style=GREEN,
-                box=ROUNDED,
-                padding=(1, 2),
-            ))
+        if isinstance(action, tuple):
+            action, user_input = action
+        if action is _REPL_HANDLED:
             continue
 
         try:
@@ -11757,128 +12766,9 @@ def main():
 
             # ask_model imprime el answer en directo (streaming) o como Markdown
             # al final si STREAM_OUTPUT está desactivado. No volvemos a imprimirlo.
-            answer = ask_model(effective_input)
-
-            command = extract_command(answer)
-            remember_command_rationale(answer)
-
-            if command:
-                # run_command muestra el panel con el comando propuesto, luego
-                # ejecuta. En modo stream, salida en directo. En modo batch
-                # (STREAM_OUTPUT=False), spinner durante la ejecución y al
-                # terminar mostramos un panel con la salida completa.
-                result = run_command(command)
-                first_rc = LAST_COMMAND_RC
-
-                # AUTOMÁTICO: append a _timeline.md (bitácora narrativa) y a
-                # _runs.md (checklist estructurada para anti-duplicación).
-                # No depende del modelo. Garantiza que nada se pierde.
-                if ACTIVE_TARGET:
-                    timeline_path = append_timeline_entry(command, result)
-                    runs_path = append_runs_entry(command, first_rc)
-                    notes = []
-                    if timeline_path:
-                        notes.append(
-                            os.path.relpath(timeline_path, WORKSPACE)
-                        )
-                    if runs_path:
-                        notes.append(
-                            os.path.relpath(runs_path, WORKSPACE)
-                        )
-                    if notes:
-                        console.print(
-                            f"[dim]› anotado en {' · '.join(notes)}[/]"
-                        )
-
-                # AUTOPILOT de troubleshooting: si el comando falló y el modo
-                # está activo, entrar al bucle de auto-fix antes de pasar al
-                # análisis del modelo. Excepción: rc=1 de grep / test / diff
-                # NO es error — es información válida ("sin coincidencias",
-                # "condición falsa", "hay diferencias"). Disparar autopilot
-                # ahí mete al modelo en un bucle de reintento sin sentido.
-                if (TROUBLESHOOT_AUTOPILOT
-                        and first_rc != 0 and first_rc != -1
-                        and not _is_benign_nonzero_rc(command, first_rc)):
-                    ts_outcome = troubleshoot_loop(command, result)
-                    _print_troubleshoot_summary(ts_outcome)
-                    # Reemplazamos el `result` que va al análisis con el
-                    # output final tras el bucle (el modelo verá el estado
-                    # post-fix, no el original).
-                    if ts_outcome["resolved"]:
-                        result = ts_outcome["final_output"]
-                    else:
-                        # En caso de no resuelto, encadenamos para que el
-                        # modelo lo explique al usuario en el análisis.
-                        result = (
-                            f"[Comando original `{command}` falló y el autopilot "
-                            f"no pudo resolverlo tras {len(ts_outcome['attempts'])} "
-                            f"intentos.]\n\n{ts_outcome['final_output']}"
-                        )
-
-                if not STREAM_COMMAND_OUTPUT:
-                    # Si no hubo streaming, el usuario no vio nada — mostramos
-                    # el panel con la salida completa. Si hubo streaming,
-                    # ya lo vio en directo y el panel sería redundante.
-                    console.print()
-                    console.print(Panel(
-                        Text.from_ansi(result),
-                        title=f"[bold {ORANGE}]Resultado[/bold {ORANGE}]",
-                        border_style=ORANGE,
-                        box=ROUNDED,
-                    ))
-
-                # COMANDO CANCELADO por el operador (rc=-1): no pedimos análisis
-                # al modelo. Una cancelación es una decisión consciente del
-                # operador — analizar "Comando cancelado por el usuario." sólo
-                # produce bucles donde el modelo asume que el comando sigue
-                # ejecutándose y propone variantes que el operador no quiere.
-                if first_rc == -1:
-                    cancel_note = (
-                        f"[Comando cancelado por el operador — sin análisis "
-                        f"automático. Cuando quieras retomar, escribe la "
-                        f"siguiente acción o pide 'siguientes pasos'.]"
-                    )
-                    console.print(f"[dim]› {cancel_note}[/]")
-                    # Persistimos en history el resultado para trazabilidad,
-                    # pero NO disparamos analysis_prompt.
-                    history.append({
-                        "role": "user",
-                        "content": f"Resultado del comando:\n{result}\n\n{cancel_note}"
-                    })
-                    save_session()
-                    continue
-
-                history.append({
-                    "role": "user",
-                    "content": f"Resultado del comando:\n{result}"
-                })
-
-                analysis_prompt = (
-                    "Analiza la salida anterior en detalle: extrae y explica los datos "
-                    "relevantes (IPs, puertos, servicios, versiones, usuarios, hashes, "
-                    "archivos, errores, hallazgos). Termina con un bloque "
-                    "**Siguientes pasos:** que liste 2-4 acciones concretas y "
-                    "priorizadas (1 línea cada una). Si hay un siguiente paso obvio "
-                    "y barato, propónlo además como bloque `COMANDO:` al final."
-                )
-                if ACTIVE_TARGET:
-                    analysis_prompt += (
-                        f"\n\nOBLIGATORIO — Persistencia del trabajo en target '{ACTIVE_TARGET}':\n"
-                        f"Emite AL MENOS UN bloque [[TARGET_UPDATE: archivo.md]] al final de "
-                        f"tu respuesta con los hallazgos de esta iteración. Mapeo recordatorio:\n"
-                        f"  - hosts/puertos/servicios/endpoints/subdominios  → attack-surface.md\n"
-                        f"  - DNS/ASN/hosting/tecnologías/certs              → infrastructure.md\n"
-                        f"  - correos/usuarios/repos/leaks                   → identities.md\n"
-                        f"  - SSIDs/BSSIDs/wifi                              → wifi.md\n"
-                        f"  - decisiones, TODOs, hilos sueltos, atajos       → notes.md\n"
-                        f"Si la salida fue vacía o no aportó nada accionable, emite al menos "
-                        f"un bloque hacia notes.md con una entrada del tipo:\n"
-                        f"  ## [YYYY-MM-DD HH:MM] <herramienta> · sin hallazgos\n"
-                        f"  Detalle breve de por qué (timeout, host no responde, etc.).\n"
-                        f"De este modo el informe final tendrá trazabilidad completa de la fase."
-                    )
-
-                ask_model(analysis_prompt)
+            # Ciclo completo: prompt → COMANDO → resultado → análisis →
+            # siguiente COMANDO (con AUTO_CONTINUE activo, hasta el límite).
+            run_autonomous_turn(effective_input)
 
         except KeyboardInterrupt:
             print()
@@ -11906,4 +12796,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
