@@ -47,3 +47,12 @@ theharvester_*
 # OS
 .DS_Store
 Thumbs.db
+
+# Artefactos locales de pentesting — no versionar
+# (listas de credenciales, hashes, páginas de captura y herramientas de ataque)
+/.maxiwatt/
+/passwords.txt
+/users.txt
+/hashes-sha1.txt
+/landing-page-example.html
+/setup_anon_chain.sh
