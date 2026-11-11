@@ -136,6 +136,20 @@ Un goal solo termina por:
 4. fases agotadas (`exhausted`),
 5. kill del operador (`killed`).
 
+## Ventana de contexto dinámica
+
+La ventana efectiva ya no es un número fijo. `get_max_context_tokens()` la
+resuelve por modelo y la cachea por `(backend, modelo)`:
+
+- **LM Studio** → `/api/v0/models` (`loaded_context_length` o
+  `max_context_length`).
+- **Ollama Cloud** → `POST /api/show` → `model_info.<arquitectura>.context_length`.
+- **Fallback** → `MAX_CONTEXT_TOKENS` si el backend no expone el dato.
+
+Se usa en la barra de contexto y en el umbral de compactación
+(`COMPACT_TRIGGER_PCT`). Al cambiar de modelo (`models N`) o de backend
+(`backend ollama`) se invalida la caché y se vuelve a resolver.
+
 ## Modo headless
 
 ```bash

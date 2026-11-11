@@ -23,6 +23,7 @@ __pycache__/
 memory/sessions/
 memory/subagents/
 memory/lessons/
+memory/swarm/
 scans/
 evidence/
 reports/

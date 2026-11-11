@@ -187,7 +187,11 @@ def _llm_kwargs(profile, overrides=None):
     return base
 
 
-# Tamaño de la ventana de contexto del modelo. Ajusta según tu modelo.
+# Fallback de ventana de contexto. El valor EFECTIVO se detecta por modelo
+# en `get_max_context_tokens()`:
+#   · LM Studio → /api/v0/models (loaded_context_length / max_context_length)
+#   · Ollama Cloud → /api/show → model_info.<arch>.context_length
+# Este número solo se usa si el backend no expone metadatos o la consulta falla.
 # qwen3.6-27b típicamente: 32768. Modelos largos: 65536, 131072, 200000.
 MAX_CONTEXT_TOKENS = 34196
 
@@ -246,6 +250,15 @@ LAST_USAGE = {
 # vuelve al primero disponible (con aviso silencioso vía fallback).
 _SELECTED_MODEL = None
 
+# Caché de la ventana de contexto por (backend, modelo). Evita repetir la
+# consulta a /api/show o /api/v0/models en cada turno.
+_MODEL_CONTEXT_CACHE = {}
+# Último modelo resuelto por get_active_model(). Permite a get_max_context_tokens()
+# no volver a pedir la lista de modelos en cada render de la barra.
+_LAST_ACTIVE_MODEL = None
+# Estado de la ventana efectiva: {backend, model, value}.
+_CTX_STATE = {"backend": None, "model": None, "value": None}
+
 CYAN = "#22d3ee"
 CYAN_BRIGHT = "#67e8f9"
 CYAN_DARK = "#155e75"
@@ -279,6 +292,7 @@ BACKENDS = {
         "base_url": LMSTUDIO_BASE_URL,
         "api_key": "lm-studio",
         "fallback": MODEL_NAME_FALLBACK,
+        "context_fallback": MAX_CONTEXT_TOKENS,
         "needs_key": False,
     },
     "ollama": {
@@ -287,6 +301,8 @@ BACKENDS = {
         # Resuelta en caliente desde el entorno (se carga del .env al inicio).
         "api_key": lambda: os.environ.get("OLLAMA_API_KEY", "") or "ollama",
         "fallback": OLLAMA_MODEL_FALLBACK,
+        # Si /api/show no responde, usamos el fallback conservador local.
+        "context_fallback": MAX_CONTEXT_TOKENS,
         "needs_key": True,
         # La API de Ollama devuelve los modelos en orden no determinista: cada
         # llamada varía. Ordenamos alfabéticamente para que la numeración de
@@ -847,27 +863,34 @@ _subagents_registry = {}   # name → Subagent
 _subagent_io_lock = threading.Lock()  # serializa escrituras a archivos target
 _subagent_thread_marker = threading.local()
 
+# Enjambre persistente (agent_swarm). None = desactivado.
+_SWARM = None
+_swarm_thread_marker = threading.local()
+
 
 def _is_subagent_thread():
     """True si el código se ejecuta dentro de un thread de subagente."""
     return getattr(_subagent_thread_marker, "active", False)
 
 
+def _is_swarm_worker():
+    """True si el código se ejecuta dentro de un worker del enjambre."""
+    return getattr(_swarm_thread_marker, "active", False)
+
+
 def _q_print(*args, **kwargs):
-    """`console.print` con silenciado automático en threads de subagente.
-    El operador ve solo su flujo principal; los subagentes acumulan en su
-    log file y se reportan en el panel-resumen final.
+    """`console.print` con silenciado automático en threads de subagente
+    o de workers del enjambre. El operador ve solo su flujo principal.
     """
-    if _is_subagent_thread():
+    if _is_subagent_thread() or _is_swarm_worker():
         return
     console.print(*args, **kwargs)
 
 
 def _q_spinner(label):
-    """Devuelve un contexto: spinner real si NO estamos en subagente,
-    null-context si sí. Para que `with _q_spinner(...)` funcione tanto en
-    main como en subagente sin imprimir el spinner."""
-    if _is_subagent_thread():
+    """Devuelve un contexto: spinner real si NO estamos en un thread de
+    fondo (subagente o worker del enjambre), null-context si sí."""
+    if _is_subagent_thread() or _is_swarm_worker():
         return contextlib.nullcontext()
     return _AnimatedSpinner(label)
 
@@ -2406,8 +2429,8 @@ def _goal_request_plan(goal_run, available_skills, max_attempts=3):
                 "(incluido el prompt minimal). Probables causas: prompt "
                 "demasiado grande para el context window del modelo, "
                 "modelo sobrecargado o timeout interno de LM Studio. "
-                "Revisa: tamaño del target, MAX_CONTEXT_TOKENS, modelo "
-                "cargado en LM Studio."
+                "Revisa: tamaño del target, ventana de contexto efectiva del "
+                "modelo activo (get_max_context_tokens) y modelo cargado."
             ),
         }
     return {"action": "parse_error", "raw": last_raw[:600]}
@@ -3905,6 +3928,35 @@ def _validate_workspace_path(path):
     return (True, full, display)
 
 
+# Hallazgos propuestos por el agente principal. Formato:
+#   FINDING: high | Título corto | afirmación + evidencia
+# El Guardian los valida después; el modelo NO debe presentarlos como
+# confirmados en el mismo turno.
+_FINDING_RE = re.compile(
+    r"^[ \t]*FINDING:\s*(?P<sev>info|low|medium|high|critical)\s*\|\s*"
+    r"(?P<title>[^|\n]+?)\s*\|\s*(?P<claim>.+?)\s*$",
+    re.I | re.M,
+)
+
+
+def extract_findings(text):
+    """Devuelve [(severidad, título, claim)] de los bloques FINDING:."""
+    if not text:
+        return []
+    return [
+        (m.group("sev").lower(), m.group("title").strip(),
+         m.group("claim").strip())
+        for m in _FINDING_RE.finditer(text)
+    ]
+
+
+def strip_findings(text):
+    """Elimina las líneas FINDING: del texto guardado en history."""
+    if not text:
+        return text
+    return _FINDING_RE.sub("", text).strip()
+
+
 def extract_file_reads(text):
     """Devuelve lista de strings con las rutas a leer."""
     if not text:
@@ -4989,6 +5041,130 @@ def get_lmstudio_models_detailed():
     ]
 
 
+def _extract_context_length(model_info):
+    """Extrae la ventana de contexto de un bloque `model_info` de Ollama.
+
+    Ollama devuelve claves tipo `<arquitectura>.context_length`
+    (p. ej. `kimi-k2.context_length`, `gptoss.context_length`).
+    """
+    if not isinstance(model_info, dict):
+        return None
+    candidates = []
+    for key, val in model_info.items():
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            continue
+        k = str(key).lower()
+        if (k.endswith(".context_length")
+                or k in ("context_length", "max_context_length",
+                         "context_window", "max_position_embeddings")):
+            candidates.append(val)
+    return max(candidates) if candidates else None
+
+
+def fetch_ollama_model_context(model_id):
+    """Consulta `/api/show` al backend Ollama y devuelve su context length.
+
+    Funciona con Ollama Cloud (`https://ollama.com/api/show`) y con un
+    Ollama local. Devuelve None si el endpoint no responde o no expone el
+    dato.
+    """
+    cfg = BACKENDS.get("ollama", {})
+    base = (cfg.get("base_url") or OLLAMA_BASE_URL).rstrip("/")
+    root = base[:-3] if base.endswith("/v1") else base
+    key_fn = cfg.get("api_key")
+    key = key_fn() if callable(key_fn) else (key_fn or "")
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        r = requests.post(
+            f"{root}/api/show",
+            json={"model": model_id},
+            headers=headers,
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        ctx = _extract_context_length(data.get("model_info", {}))
+        if ctx:
+            return int(ctx)
+        # Fallback por si el backend cambia el esquema.
+        return _extract_context_length(data)
+    except Exception:
+        return None
+
+
+def fetch_lmstudio_model_context(model_id):
+    """Consulta SOLO el API nativo de LM Studio para el contexto del modelo.
+
+    No cae a `/v1/models` (solo devuelve IDs): si el API nativo no está
+    disponible, `resolve_model_context_limit` usará `context_fallback`.
+    Esto evita una segunda llamada a `/models` por turno.
+    """
+    base = LMSTUDIO_BASE_URL.rstrip("/")
+    native_base = base[:-3] if base.endswith("/v1") else base
+    try:
+        r = requests.get(f"{native_base}/api/v0/models", timeout=3)
+        r.raise_for_status()
+        for item in r.json().get("data", []):
+            if item.get("id") == model_id:
+                return (item.get("loaded_context_length")
+                        or item.get("max_context_length"))
+    except Exception:
+        pass
+    return None
+
+
+def resolve_model_context_limit(model_id=None, backend=None):
+    """Resuelve y cachea la ventana de contexto del modelo indicado.
+
+    Orden: metadatos del backend → `context_fallback` del backend →
+    `MAX_CONTEXT_TOKENS`.
+    """
+    backend = backend or _ACTIVE_BACKEND
+    model_id = model_id or get_active_model()
+    if not model_id:
+        return None
+    key = (backend, model_id)
+    if key in _MODEL_CONTEXT_CACHE:
+        return _MODEL_CONTEXT_CACHE[key]
+
+    ctx = None
+    if backend == "ollama":
+        ctx = fetch_ollama_model_context(model_id)
+    elif backend == "lmstudio":
+        ctx = fetch_lmstudio_model_context(model_id)
+    if not ctx:
+        ctx = BACKENDS.get(backend, {}).get("context_fallback")
+    if not ctx:
+        ctx = MAX_CONTEXT_TOKENS
+    ctx = int(ctx)
+    _MODEL_CONTEXT_CACHE[key] = ctx
+    return ctx
+
+
+def get_max_context_tokens():
+    """Ventana de contexto efectiva del modelo activo.
+
+    Se recalcula cuando cambia el backend o el modelo. Para cloud (Ollama)
+    consulta `/api/show`; para LM Studio usa los metadatos nativos. Si no
+    hay metadatos, cae a `MAX_CONTEXT_TOKENS`.
+    """
+    global _LAST_ACTIVE_MODEL
+    backend = _ACTIVE_BACKEND
+    model = _LAST_ACTIVE_MODEL
+    if not model:
+        # Arranque (o cambio de modelo aún no resuelto): no bloqueamos el
+        # REPL consultando /v1/models + /api/show. get_active_model() se
+        # encarga en la primera llamada al LLM; a partir de ahí la barra y
+        # la compactación usan la ventana real.
+        return MAX_CONTEXT_TOKENS
+    if (_CTX_STATE["backend"] != backend
+            or _CTX_STATE["model"] != model
+            or _CTX_STATE["value"] is None):
+        ctx = resolve_model_context_limit(model, backend)
+        _CTX_STATE.update(backend=backend, model=model, value=ctx)
+    return int(_CTX_STATE["value"] or MAX_CONTEXT_TOKENS)
+
+
 def get_active_model():
     """Modelo que el agente usará en sus llamadas.
 
@@ -4996,12 +5172,18 @@ def get_active_model():
       1. Selección manual del operador (_SELECTED_MODEL), si sigue expuesta.
       2. Primer modelo que expone LM Studio.
       3. MODEL_NAME_FALLBACK.
+
+    Actualiza `_LAST_ACTIVE_MODEL` para que `get_max_context_tokens()` pueda
+    resolver la ventana de contexto sin volver a pedir la lista de modelos.
     """
+    global _LAST_ACTIVE_MODEL
     models = get_lmstudio_models()
     if _SELECTED_MODEL and _SELECTED_MODEL in models:
-        return _SELECTED_MODEL
-    return models[0] if models else active_backend_cfg().get(
-        "fallback", MODEL_NAME_FALLBACK)
+        _LAST_ACTIVE_MODEL = _SELECTED_MODEL
+    else:
+        _LAST_ACTIVE_MODEL = models[0] if models else active_backend_cfg().get(
+            "fallback", MODEL_NAME_FALLBACK)
+    return _LAST_ACTIVE_MODEL
 
 
 def set_active_model(selector):
@@ -5011,12 +5193,16 @@ def set_active_model(selector):
     selector="auto" / "reset" / "" → vuelve al modo automático (primero
     expuesto por LM Studio).
     """
-    global _SELECTED_MODEL
+    global _SELECTED_MODEL, _LAST_ACTIVE_MODEL
+    # El modelo cambia (o puede cambiar): invalidar la ventana cacheada.
+    _LAST_ACTIVE_MODEL = None
+    _CTX_STATE.update(backend=None, model=None, value=None)
     models = get_lmstudio_models()
 
     sel = (selector or "").strip()
     if sel.lower() in ("", "auto", "reset", "default"):
         _SELECTED_MODEL = None
+        _LAST_ACTIVE_MODEL = models[0] if models else None
         return True, "Modo automático: se usará el primer modelo cargado en LM Studio."
 
     # ¿Índice 1-based?
@@ -5024,18 +5210,21 @@ def set_active_model(selector):
         idx = int(sel)
         if 1 <= idx <= len(models):
             _SELECTED_MODEL = models[idx - 1]
+            _LAST_ACTIVE_MODEL = _SELECTED_MODEL
             return True, f"Modelo activo → {_SELECTED_MODEL}"
         return False, f"Índice fuera de rango (hay {len(models)} modelo(s); usa 1..{len(models)})."
 
     # Nombre exacto.
     if sel in models:
         _SELECTED_MODEL = sel
+        _LAST_ACTIVE_MODEL = sel
         return True, f"Modelo activo → {sel}"
 
     # Coincidencia parcial (case-insensitive) — útil para nombres largos.
     matches = [m for m in models if sel.lower() in m.lower()]
     if len(matches) == 1:
         _SELECTED_MODEL = matches[0]
+        _LAST_ACTIVE_MODEL = matches[0]
         return True, f"Modelo activo → {matches[0]}"
     if len(matches) > 1:
         return False, ("Coincidencia ambigua: " + ", ".join(matches) +
@@ -5052,7 +5241,7 @@ def switch_backend(selector):
 
     selector="" / "status" → informa del backend actual sin cambiarlo.
     """
-    global _ACTIVE_BACKEND, _SELECTED_MODEL, client
+    global _ACTIVE_BACKEND, _SELECTED_MODEL, client, _LAST_ACTIVE_MODEL
 
     sel = (selector or "").strip().lower()
     cur = active_backend_cfg()
@@ -5085,6 +5274,8 @@ def switch_backend(selector):
 
     _ACTIVE_BACKEND = target
     _SELECTED_MODEL = None          # cada backend tiene su propio catálogo
+    _LAST_ACTIVE_MODEL = None       # fuerza re-resolución del contexto
+    _CTX_STATE.update(backend=None, model=None, value=None)
     client = build_client()         # reapunta todas las llamadas al nuevo host
 
     # Sondeo rápido de modelos para dar feedback útil.
@@ -6093,8 +6284,9 @@ def _compact_messages_for_call(messages):
        lecciones) NUNCA se toca.
 
     2) Mensajes USER/ASSISTANT antiguos — sólo se truncan si la estimación
-       global del prompt supera COMPACT_TRIGGER_PCT * MAX_CONTEXT_TOKENS y
-       caen fuera de la ventana de recencia (COMPACT_KEEP_LAST_TURNS pares).
+       global del prompt supera COMPACT_TRIGGER_PCT de la ventana EFECTIVA
+       del modelo activo (get_max_context_tokens) y caen fuera de la ventana
+       de recencia (COMPACT_KEEP_LAST_TURNS pares).
 
     No modifica `messages` ni `history` in-place.
     """
@@ -6113,7 +6305,7 @@ def _compact_messages_for_call(messages):
         cutoff = len(messages)  # nada cae fuera de recencia todavía
 
     do_user_compact = (
-        est_before >= MAX_CONTEXT_TOKENS * COMPACT_TRIGGER_PCT
+        est_before >= get_max_context_tokens() * COMPACT_TRIGGER_PCT
         and cutoff < len(messages)
     )
 
@@ -6461,6 +6653,53 @@ def _strip_context_regurgitation(answer):
 _TOOL_SATURATION_THRESHOLD = 3
 
 
+def _build_swarm_context(max_findings=8):
+    """Resumen compacto del enjambre para inyectar en el prompt del modelo.
+
+    Distingue explícitamente hallazgos confirmados por el Guardian de los
+    pendientes/rechazados: el modelo no debe tratar una hipótesis como
+    vulnerabilidad confirmada.
+    """
+    if _SWARM is None:
+        return ""
+    try:
+        store = _SWARM.store
+        groups = {
+            "CONFIRMADOS (puedes usarlos como base)": store.list_findings(
+                status="confirmed", limit=max_findings),
+            "PENDIENTES DE VALIDACIÓN (no confirmados)": store.list_findings(
+                status="pending_validation", limit=max_findings),
+            "REQUIEREN MÁS EVIDENCIA": store.list_findings(
+                status="needs_more_evidence", limit=max_findings),
+            "RECHAZADOS (no usar como base)": store.list_findings(
+                status="rejected", limit=max_findings),
+        }
+        lines = [
+            "[ENJAMBRE · contexto validado]",
+            f"Target: {_SWARM.target or '(ninguno)'} · "
+            f"scope: {_SWARM.scope.describe()}",
+            "REGLA: solo los hallazgos de CONFIRMADOS están validados por "
+            "el Guardian. No presentes como confirmada una vulnerabilidad "
+            "basada solo en versión/banner o en una hipótesis pendiente.",
+        ]
+        any_finding = False
+        for title, items in groups.items():
+            if not items:
+                continue
+            any_finding = True
+            lines.append(title + ":")
+            for f in items:
+                lines.append(
+                    f"  · #{f.id} [{f.severity}] {f.title[:160]} "
+                    f"(target={f.target or '?'})"
+                )
+        if not any_finding:
+            lines.append("(sin hallazgos registrados todavía)")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def _build_tool_runs_summary(target_name):
     """Resumen de uso de herramientas en `_runs.md` del target. Indica cuáles
     están SATURADAS (≥_TOOL_SATURATION_THRESHOLD runs) para que el modelo
@@ -6696,6 +6935,14 @@ def ask_model(user_input):
         runs_summary = _build_tool_runs_summary(ACTIVE_TARGET)
         if runs_summary:
             ephemeral.append({"role": "system", "content": runs_summary})
+
+    # Contexto del enjambre: hallazgos validados, pendientes y decisiones
+    # recientes. El modelo NO debe presentar como confirmado nada que el
+    # Guardian no haya validado.
+    if _SWARM is not None:
+        swarm_ctx = _build_swarm_context()
+        if swarm_ctx:
+            ephemeral.append({"role": "system", "content": swarm_ctx})
 
     # Nudge si el modelo tiene comandos "quemados" — el autopilot ya los
     # intentó y no los pudo resolver. Sirve para que no vuelva a proponer
@@ -7011,6 +7258,27 @@ def ask_model(user_input):
         # Limpiar bloques del answer guardado (igual que TARGET_UPDATE).
         answer = strip_file_blocks(answer)
 
+    # Procesar FINDING: (solo si el enjambre está activo). El hallazgo se
+    # registra como pendiente; el Guardian lo validará en background.
+    finding_msgs = []
+    finding_items = extract_findings(answer)
+    if finding_items:
+        if _SWARM is not None:
+            for sev, title, claim in finding_items:
+                try:
+                    fid = _SWARM.submit_finding(
+                        title, severity=sev, claim=claim, created_by="main",
+                    )
+                    finding_msgs.append(
+                        f"FINDING #{fid} registrado [{sev}] {title[:120]} "
+                        f"— pendiente de validación del Guardian"
+                    )
+                except Exception as e:
+                    finding_msgs.append(f"FINDING no registrado: {e}")
+        # Si el enjambre está apagado, el bloque se elimina igualmente para
+        # no dejar ruido en el history.
+        answer = strip_findings(answer)
+
     history.append({"role": "assistant", "content": answer})
 
     if applied:
@@ -7025,6 +7293,14 @@ def ask_model(user_input):
     # Inyectar feedback de FILE_EDIT/WRITE al history (errores + confirmaciones)
     if file_results["op_summary"]:
         history.append({"role": "system", "content": file_results["op_summary"]})
+
+    # Confirmación de que el Guardian ha recibido los hallazgos del turno.
+    if finding_msgs:
+        history.append({
+            "role": "system",
+            "content": "[ENJAMBRE · hallazgos registrados]\n"
+                       + "\n".join(finding_msgs),
+        })
 
     # Un solo save_session() al final cubre los 3 appends previos. Antes
     # se llamaba tres veces consecutivas — innecesario.
@@ -7234,7 +7510,8 @@ def render_context_bar():
     porcentaje sí refleja la realidad cuando se excede el budget configurado.
     """
     used = get_context_used()
-    pct = (used / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS > 0 else 0
+    max_ctx = get_max_context_tokens()
+    pct = (used / max_ctx * 100) if max_ctx > 0 else 0
 
     if pct < 50:
         color = GREEN
@@ -7268,7 +7545,7 @@ def render_context_bar():
     text.append("│ ", style=f"{color}")
     text.append(bar, style=f"{color}")
     text.append(f" {pct:>5.1f}%", style=f"bold {color}")
-    text.append(f"  {used:,} / {MAX_CONTEXT_TOKENS:,} tokens{suffix}", style=GRAY)
+    text.append(f"  {used:,} / {max_ctx:,} tokens{suffix}", style=GRAY)
     text.append(f"  ·  {turns} turnos  ·  {skills_str}", style=GRAY)
     if ACTIVE_TARGET:
         text.append(f"  ·  target: ", style=GRAY)
@@ -7297,8 +7574,9 @@ def render_context_bar():
             f"cargado: el modelo arranca con history limpio pero toda la "
             f"evidencia recuperable desde los archivos del target. Es lo "
             f"más recomendable para engagements largos.\n"
-            f"  3. Subir `MAX_CONTEXT_TOKENS` en agent.py si tu modelo "
-            f"local soporta más contexto del configurado.",
+            f"  3. El límite se detecta automáticamente del modelo activo "
+            f"(LM Studio u Ollama Cloud). Si el backend no expone metadatos, "
+            f"ajusta `MAX_CONTEXT_TOKENS` en agent.py como fallback.",
             title=f"[bold {MAGENTA}]Context window agotado[/]",
             border_style=MAGENTA,
             box=ROUNDED,
@@ -9474,6 +9752,49 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
             f"(2>/dev/null / &>/dev/null / etc.)[/]"
         )
 
+    # 3.5) POLÍTICA DEL ENJAMBRE (si está activo)
+    # El motor es determinista y externo a los modelos. En workers del
+    # enjambre no se re-aplica: la tarea ya fue autorizada al encolarse.
+    policy_requires_approval = False
+    _swarm_role = "subagent" if _is_subagent_thread() else "main"
+    if _SWARM is not None and not _is_swarm_worker():
+        try:
+            decision = _SWARM.authorize_command(
+                command, agent_role=_swarm_role, target=eff_target,
+            )
+        except Exception as e:
+            _q_print(f"[dim]› swarm policy: no se pudo evaluar ({e})[/]")
+            decision = None
+        if decision is not None:
+            if decision.blocked or (not decision.allowed
+                                    and not decision.requires_approval):
+                return CommandResult(
+                    command=command, rc=-1, output=(
+                        f"[POLÍTICA DEL ENJAMBRE · BLOQUEADO]\n"
+                        f"{decision.reason}\n"
+                        f"Nivel {int(decision.level)} · target="
+                        f"{decision.target or eff_target or '(ninguno)'}"
+                    ),
+                    error_class="policy", proxy_mode=eff_proxy,
+                )
+            if decision.requires_approval:
+                if auto:
+                    return CommandResult(
+                        command=command, rc=-1, output=(
+                            f"[POLÍTICA DEL ENJAMBRE · APROBACIÓN REQUERIDA]\n"
+                            f"{decision.reason}\n"
+                            f"Este contexto (autopilot/subagente) no puede "
+                            f"pedir aprobación humana. Ejecútalo desde el "
+                            f"REPL interactivo o sube el nivel de autonomía."
+                        ),
+                        error_class="policy", proxy_mode=eff_proxy,
+                    )
+                policy_requires_approval = True
+                _q_print(
+                    f"[dim]› política: {decision.reason} "
+                    f"· requiere confirmación[/]"
+                )
+
     category = classify_command(command)
 
     category_meta = {
@@ -9632,7 +9953,9 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
     auto_interactive = _command_needs_interactive_tty(command)
     use_interactive = auto_interactive  # puede sobreescribirse desde el prompt
 
-    if (auto or (AUTO_EXECUTE and category == "safe")) and not duplicate_block_auto:
+    if ((auto or (AUTO_EXECUTE and category == "safe"))
+            and not policy_requires_approval
+            and not duplicate_block_auto):
         msg = "auto-ejecutando (autopilot)" if auto else f"Auto-ejecutando (categoría: seguro)"
         if auto_interactive:
             msg += " · TTY cedido (comando interactivo detectado)"
@@ -9642,7 +9965,12 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
         # disponible para que el operador pueda forzarlo aunque la
         # heurística no lo haya detectado.
         opts_label = "[s/i/N]"
-        if duplicate_runs:
+        if policy_requires_approval:
+            prompt_msg = (
+                "⚠ La política del enjambre requiere aprobación humana. "
+                f"¿Ejecutar de todos modos? {opts_label}: "
+            )
+        elif duplicate_runs:
             prompt_msg = (
                 "⚠ El escaneo ya está hecho según _runs.md. "
                 f"¿Re-ejecutar de todos modos? {opts_label}: "
@@ -9855,6 +10183,17 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
             auto=bool(auto),
         ))
 
+    # Trazabilidad del enjambre: registra el comando y su resultado. Los
+    # workers ya lo registran en su propia tarea, así que se omiten aquí.
+    if _SWARM is not None and not _is_swarm_worker():
+        try:
+            _SWARM.record_command(
+                command, final_rc, final_output,
+                agent_role=_swarm_role, target=eff_target,
+            )
+        except Exception as e:
+            _q_print(f"[dim]› swarm: no se pudo registrar el comando ({e})[/]")
+
     # Alias legacy para hooks/plugins que aún lean el global. El flujo interno
     # usa SIEMPRE el CommandResult devuelto.
     LAST_COMMAND_RC = final_rc
@@ -9993,6 +10332,15 @@ def print_commands():
         ("Orquestación", "goal discard <id>",                   "Borra el estado persistido de un goal (el log queda)"),
         ("Orquestación", "goal kill",                           "Detiene el goal y los subagentes de su fase actual"),
 
+        ("Enjambre", "swarm start [--target X] [--scope ruta] [--level N] [--llm]", "Inicia los 2 workers permanentes (Recon + Guardian) y el orquestador determinista."),
+        ("Enjambre", "swarm status · swarm stop",                 "Estado de workers/colas/hallazgos · detiene el enjambre."),
+        ("Enjambre", "swarm plan [--enqueue] · swarm task <cmd>", "Genera un plan de recon desde el scope · encola un comando de recon."),
+        ("Enjambre", "swarm finding add <título> · swarm evidence <id> <ruta>", "Registra un hallazgo · adjunta evidencia para validación."),
+        ("Enjambre", "swarm findings [estado] · swarm validate <id>", "Lista hallazgos · solicita validación del Guardian."),
+        ("Enjambre", "swarm queue [rol] · swarm cancel <id>",     "Cola de tareas · cancela una tarea pendiente o en ejecución."),
+        ("Enjambre", "swarm events [N]",                          "Últimos eventos del enjambre (trazabilidad)."),
+        ("Enjambre", "swarm block <target> <motivo> · swarm unblock <target>", "Bloquea/desbloquea un target en el motor de políticas."),
+
         ("Targets",  "target / objetivo",            "Lista los targets disponibles · ●=activo"),
         ("Targets",  "target <nombre>",              "Carga targets/<nombre>/ en el contexto"),
         ("Targets",  "target reload / recargar",     "Recarga el target activo (tras tocar archivos)"),
@@ -10023,7 +10371,9 @@ def print_commands():
     last_cat = None
     for cat, cmd, desc in rows:
         cat_cell = cat if cat != last_cat else ""
-        table.add_row(cat_cell, cmd, desc)
+        # Escapamos los corchetes de los placeholders (\[--target X], etc.)
+        # para que Rich no los interprete como etiquetas de estilo.
+        table.add_row(cat_cell, rich_escape(cmd), desc)
         last_cat = cat
 
     console.print(table)
@@ -10036,6 +10386,18 @@ def print_commands():
 def print_models():
     detailed = get_lmstudio_models_detailed()
     active = get_active_model()
+    # Reutiliza los metadatos ya obtenidos; solo consulta /api/show si el
+    # backend no los expone (caso Ollama Cloud).
+    active_ctx = None
+    for m in detailed:
+        if m.get("id") == active:
+            active_ctx = m.get("loaded_ctx") or m.get("max_ctx")
+            break
+    if not active_ctx and active:
+        try:
+            active_ctx = resolve_model_context_limit(active)
+        except Exception:
+            active_ctx = None
 
     table = Table(title=f"Modelos · {active_backend_cfg()['label']}",
                   border_style=ORANGE)
@@ -10065,6 +10427,9 @@ def print_models():
             ctx_cell = f"{loaded_ctx:,}/{max_ctx:,}"
         elif max_ctx:
             ctx_cell = f"máx {max_ctx:,}"
+        elif is_active and active_ctx:
+            # Cloud: el contexto se consulta al modelo activo vía /api/show.
+            ctx_cell = f"máx {active_ctx:,}"
         else:
             ctx_cell = "—"
 
@@ -10079,6 +10444,11 @@ def print_models():
     console.print(
         f"[dim]Activo (●): [bold {GREEN}]{active}[/]  ·  selección: {mode}[/]"
     )
+    if active_ctx:
+        console.print(
+            f"[dim]Ventana de contexto efectiva: "
+            f"[bold]{active_ctx:,}[/] tokens[/]"
+        )
     console.print(
         f"[dim]Cambiar: [bold {CYAN}]models <nombre|índice>[/]   ·   "
         f"volver a automático: [bold {CYAN}]models auto[/][/]"
@@ -11189,6 +11559,16 @@ def run_autonomous_turn(user_input, max_steps=None):
         result, rc = _execute_main_command(command)
 
         if rc == -1:
+            # Bloqueo/aprobación del motor de políticas: no es una
+            # cancelación del operador; lo informamos y paramos.
+            if (result or "").startswith("[POLÍTICA DEL ENJAMBRE"):
+                console.print(f"[dim]› {result.splitlines()[0]}[/]")
+                history.append({
+                    "role": "user",
+                    "content": f"Resultado del comando:\n{result}",
+                })
+                save_session()
+                return
             # Cancelación consciente del operador: no analizamos ni seguimos.
             cancel_note = (
                 f"[Comando cancelado por el operador — sin análisis "
@@ -12528,6 +12908,426 @@ def _repl_report(user_input, cmd_lower, first_word):
     return _REPL_HANDLED
 
 
+# ============================================================
+# ENJAMBRE — callbacks y comando REPL
+# ============================================================
+
+def _swarm_runner(command, task):
+    """Runner de los workers del enjambre.
+
+    Ejecuta sin UI y con auto=True. La política NO se re-aplica: la tarea
+    ya fue autorizada al encolarse (y el worker volvió a comprobarla).
+    """
+    _swarm_thread_marker.active = True
+    try:
+        return run_command(
+            command, auto=True,
+            target=task.target if task else None,
+        )
+    finally:
+        _swarm_thread_marker.active = False
+
+
+def _swarm_llm_validator(finding, evidence_texts, scope_text):
+    """Segunda opinión del Guardian (opcional). Devuelve dict o None."""
+    try:
+        skill = load_skill_content("validation") or (
+            "Eres un validador de seguridad independiente."
+        )
+        prompt = (
+            "Valida este hallazgo de Red Team de forma independiente.\n"
+            "Responde SOLO JSON con esta forma:\n"
+            '{"decision":"confirmed|rejected|needs_more_evidence",'
+            '"confidence":0.0,"reason":"...","required_evidence":["..."]}\n\n'
+            f"Target: {finding.target}\nSeveridad: {finding.severity}\n"
+            f"Título: {finding.title}\nAfirmación: {finding.claim}\n"
+            f"Alcance autorizado: {scope_text}\n\n"
+            "Evidencia:\n" + "\n---\n".join(evidence_texts)[:12000] +
+            "\n\nReglas: una coincidencia de versión/banner NO confirma "
+            "una vulnerabilidad; exige prueba de explotación o "
+            "comportamiento vulnerable. Si el target está fuera de alcance, "
+            "responde rejected."
+        )
+        kwargs = _llm_kwargs("subagent")
+        kwargs["messages"] = [
+            {"role": "system", "content": skill},
+            {"role": "user", "content": prompt},
+        ]
+        resp = client.chat.completions.create(**kwargs)
+        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group(0))
+        if data.get("decision") not in ("confirmed", "rejected",
+                                         "needs_more_evidence"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _swarm_llm_planner(task, output, assets):
+    """Planner opcional de recon. Devuelve hasta 3 comandos."""
+    try:
+        skill = load_skill_content("recon") or (
+            "Eres un planificador de reconocimiento."
+        )
+        prompt = (
+            "Propón hasta 3 comandos de reconocimiento de bajo impacto para "
+            "continuar desde estos activos. Responde SOLO JSON: "
+            '{"commands":["..."]}. No propongas explotación ni fuerza bruta.'
+            f"\n\nComando ejecutado: {task.command}\n"
+            f"Target: {task.target}\n"
+            f"Activos: {json.dumps(assets[:20], ensure_ascii=False)}\n"
+            f"Salida (recortada):\n{output[:6000]}"
+        )
+        kwargs = _llm_kwargs("subagent")
+        kwargs["messages"] = [
+            {"role": "system", "content": skill},
+            {"role": "user", "content": prompt},
+        ]
+        resp = client.chat.completions.create(**kwargs)
+        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return []
+        data = json.loads(m.group(0))
+        cmds = data.get("commands") or []
+        return [c.strip() for c in cmds
+                if isinstance(c, str) and c.strip()][:3]
+    except Exception:
+        return []
+
+
+def _swarm_require():
+    if _SWARM is None:
+        console.print(
+            f"[{RED}]El enjambre no está iniciado. Usa "
+            f"`swarm start [--target X] [--scope archivo]`.[/]"
+        )
+        return False
+    return True
+
+
+def _repl_swarm(user_input, cmd_lower, first_word):
+    """Handler REPL: enjambre de subagentes permanentes."""
+    global _SWARM
+    tokens = user_input.split(maxsplit=2)
+    action = tokens[1].strip().lower() if len(tokens) > 1 else "status"
+    rest = tokens[2].strip() if len(tokens) > 2 else ""
+
+    if action in ("help", "ayuda"):
+        console.print(Panel(
+            "[bold]swarm start[/] \\[--target X] \\[--scope ruta] "
+            "\\[--level 1-2] \\[--llm] \\[--poll seg]\n"
+            "[bold]swarm stop[/] · [bold]swarm status[/]\n"
+            "[bold]swarm plan[/] \\[--enqueue] — plan de recon desde el scope\n"
+            "[bold]swarm task[/] <comando> — encola una tarea de recon\n"
+            "[bold]swarm finding add[/] <título> — registra un hallazgo\n"
+            "[bold]swarm evidence[/] <id> <ruta> — adjunta evidencia\n"
+            "[bold]swarm validate[/] <id> — pide validación al Guardian\n"
+            "[bold]swarm cancel[/] <id> — cancela una tarea de la cola\n"
+            "[bold]swarm findings[/] \\[estado] · [bold]swarm queue[/] \\[rol]\n"
+            "[bold]swarm events[/] \\[N] · [bold]swarm block[/] <target> <motivo>\n"
+            "[bold]swarm unblock[/] <target>",
+            title=f"[bold {PURPLE}]Enjambre[/]",
+            border_style=PURPLE, box=ROUNDED, padding=(1, 2),
+        ))
+        return _REPL_HANDLED
+
+    if action == "start":
+        if _SWARM is not None and _SWARM.is_running():
+            console.print(f"[{ORANGE}]El enjambre ya está activo.[/]")
+            return _REPL_HANDLED
+        target = None
+        scope_path = ""
+        level = 2
+        use_llm = False
+        poll = 1.0
+        try:
+            args = shlex.split(rest)
+        except ValueError:
+            args = rest.split()
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a in ("--target", "-t") and i + 1 < len(args):
+                target = args[i + 1]; i += 2
+            elif a in ("--scope", "-s") and i + 1 < len(args):
+                scope_path = args[i + 1]; i += 2
+            elif a in ("--level", "-l") and i + 1 < len(args):
+                try:
+                    level = int(args[i + 1])
+                except ValueError:
+                    level = 2
+                i += 2
+            elif a in ("--poll", "-p") and i + 1 < len(args):
+                try:
+                    poll = max(0.2, float(args[i + 1]))
+                except ValueError:
+                    poll = 1.0
+                i += 2
+            elif a in ("--llm", "--ia"):
+                use_llm = True; i += 1
+            else:
+                i += 1
+        # El nivel 3 (explotación) siempre exige aprobación humana; el CLI
+        # solo controla el máximo autoaprobado (1-2).
+        level = max(1, min(2, int(level)))
+        target = target or ACTIVE_TARGET
+        if not scope_path and target:
+            candidate = os.path.join(WORKSPACE, "targets", target, "scope.md")
+            if os.path.isfile(candidate):
+                scope_path = candidate
+        scope_text = ""
+        if scope_path:
+            try:
+                with open(scope_path, encoding="utf-8") as f:
+                    scope_text = f.read()
+            except OSError as e:
+                console.print(f"[{RED}]✗ no se pudo leer scope: {e}[/]")
+                return _REPL_HANDLED
+        try:
+            from agent_swarm import SwarmOrchestrator
+        except Exception as e:
+            console.print(f"[{RED}]✗ no se pudo importar agent_swarm: {e}[/]")
+            return _REPL_HANDLED
+        safe_target = re.sub(r"[^A-Za-z0-9_.-]", "_", target or "default")
+        store_path = os.path.join(
+            WORKSPACE, "memory", "swarm", f"{safe_target}.db"
+        )
+        _SWARM = SwarmOrchestrator(
+            store_path=store_path, target=target, scope_text=scope_text,
+            autonomy_level=level, runner=_swarm_runner,
+            llm_validator=_swarm_llm_validator if use_llm else None,
+            llm_planner=_swarm_llm_planner if use_llm else None,
+            poll_interval=poll,
+        )
+        _SWARM.start()
+        console.print()
+        console.print(Panel(
+            _SWARM.format_status(),
+            title=f"[bold {GREEN}]» Enjambre iniciado[/]",
+            border_style=GREEN, box=ROUNDED, padding=(1, 2),
+        ))
+        if _SWARM.scope.is_empty():
+            console.print(
+                f"[bold {ORANGE}]⚠ Scope vacío:[/] los comandos con host "
+                f"serán bloqueados por el motor de políticas. Inicia con "
+                f"`--scope <archivo>` o carga un target con `scope.md`."
+            )
+        return _REPL_HANDLED
+
+    if action == "stop":
+        if _SWARM is None:
+            console.print(f"[dim]El enjambre no está activo.[/]")
+            return _REPL_HANDLED
+        _SWARM.stop()
+        _SWARM = None
+        console.print(f"[bold {CYAN}]Enjambre detenido.[/]")
+        return _REPL_HANDLED
+
+    if action == "status":
+        if not _swarm_require():
+            return _REPL_HANDLED
+        console.print(Panel(
+            _SWARM.format_status(),
+            title=f"[bold {PURPLE}]Enjambre[/]",
+            border_style=PURPLE, box=ROUNDED, padding=(1, 2),
+        ))
+        return _REPL_HANDLED
+
+    if action == "plan":
+        if not _swarm_require():
+            return _REPL_HANDLED
+        enqueue = "--enqueue" in rest.split()
+        cmds = _SWARM.plan_from_scope(enqueue=enqueue)
+        if not cmds:
+            console.print(f"[dim]Scope vacío: no hay plan que generar.[/]")
+        else:
+            console.print(Panel(
+                "\n".join(f"  · {c}" for c in cmds),
+                title=f"[bold {CYAN}]Plan de recon "
+                      f"({'encolado' if enqueue else 'dry-run'})[/]",
+                border_style=CYAN, box=ROUNDED, padding=(1, 2),
+            ))
+        return _REPL_HANDLED
+
+    if action == "task":
+        if not _swarm_require():
+            return _REPL_HANDLED
+        if not rest:
+            console.print(f"[{RED}]Uso: swarm task <comando>[/]")
+            return _REPL_HANDLED
+        tid, decision = _SWARM.submit_recon_task(rest)
+        if tid:
+            console.print(f"[bold {GREEN}]✓ tarea #{tid} encolada[/] · "
+                          f"nivel {int(decision.level)} · {decision.reason}")
+        else:
+            console.print(f"[bold {RED}]✗ rechazada:[/] {decision.reason}")
+        return _REPL_HANDLED
+
+    if action in ("finding", "hallazgo"):
+        if not _swarm_require():
+            return _REPL_HANDLED
+        parts = user_input.split(maxsplit=4)
+        sub = parts[2].lower() if len(parts) > 2 else ""
+        if sub in ("add", "añadir", "nuevo"):
+            title = (" ".join(parts[3:]).strip().strip('"').strip("'")
+                     if len(parts) > 3 else "")
+            if not title:
+                console.print(f"[{RED}]Uso: swarm finding add <título>[/]")
+                return _REPL_HANDLED
+            fid = _SWARM.submit_finding(title)
+            console.print(
+                f"[bold {GREEN}]✓ hallazgo #{fid} registrado[/] · "
+                f"pendiente de validación."
+            )
+        elif sub in ("list", "ls", "listar"):
+            self_findings = _SWARM.store.list_findings(limit=30)
+            for f in self_findings:
+                console.print(
+                    f"#{f.id} [{f.severity}] {f.status} · {f.title[:100]}"
+                )
+        else:
+            console.print(f"[{RED}]Uso: swarm finding add <título>[/]")
+        return _REPL_HANDLED
+
+    if action == "evidence":
+        if not _swarm_require():
+            return _REPL_HANDLED
+        parts = user_input.split(maxsplit=3)
+        if len(parts) < 4:
+            console.print(f"[{RED}]Uso: swarm evidence <id> <ruta>[/]")
+            return _REPL_HANDLED
+        try:
+            fid = int(parts[2])
+        except ValueError:
+            console.print(f"[{RED}]id inválido[/]")
+            return _REPL_HANDLED
+        path = parts[3].strip()
+        eid = _SWARM.add_evidence(fid, path=path)
+        console.print(f"[bold {GREEN}]✓ evidencia #{eid} adjunta a #{fid}[/]")
+        return _REPL_HANDLED
+
+    if action in ("validate", "validar"):
+        if not _swarm_require():
+            return _REPL_HANDLED
+        try:
+            fid = int(rest)
+        except ValueError:
+            console.print(f"[{RED}]Uso: swarm validate <id>[/]")
+            return _REPL_HANDLED
+        tid = _SWARM.request_validation(fid)
+        if tid:
+            console.print(f"[bold {GREEN}]✓ validación #{tid} encolada "
+                          f"para hallazgo #{fid}[/]")
+        else:
+            console.print(f"[{RED}]Hallazgo #{fid} no existe.[/]")
+        return _REPL_HANDLED
+
+    if action in ("cancel", "cancelar"):
+        if not _swarm_require():
+            return _REPL_HANDLED
+        try:
+            tid = int(rest)
+        except ValueError:
+            console.print(f"[{RED}]Uso: swarm cancel <task_id>[/]")
+            return _REPL_HANDLED
+        if _SWARM.cancel_task(tid, "cancelada por el operador"):
+            console.print(f"[bold {CYAN}]✓ tarea #{tid} cancelada.[/]")
+        else:
+            console.print(
+                f"[{RED}]No se pudo cancelar #{tid} (no existe o ya "
+                f"terminó).[/]"
+            )
+        return _REPL_HANDLED
+
+    if action in ("findings", "hallazgos"):
+        if not _swarm_require():
+            return _REPL_HANDLED
+        status = rest or None
+        findings = _SWARM.store.list_findings(status=status, limit=50)
+        if not findings:
+            console.print(f"[dim]Sin hallazgos.[/]")
+        else:
+            table = Table(title="Hallazgos del enjambre", border_style=PURPLE)
+            table.add_column("ID", style=CYAN, no_wrap=True)
+            table.add_column("Sev", no_wrap=True)
+            table.add_column("Estado", no_wrap=True)
+            table.add_column("Target", no_wrap=True)
+            table.add_column("Título", style=WHITE)
+            for f in findings:
+                table.add_row(str(f.id), f.severity, f.status,
+                              f.target or "—", f.title[:100])
+            console.print(table)
+        return _REPL_HANDLED
+
+    if action in ("queue", "cola", "tasks"):
+        if not _swarm_require():
+            return _REPL_HANDLED
+        role = rest or None
+        tasks = _SWARM.store.list_tasks(role=role, limit=30)
+        if not tasks:
+            console.print(f"[dim]Cola vacía.[/]")
+        else:
+            table = Table(title="Cola del enjambre", border_style=CYAN)
+            table.add_column("ID", style=CYAN, no_wrap=True)
+            table.add_column("Rol", no_wrap=True)
+            table.add_column("Estado", no_wrap=True)
+            table.add_column("Prio", no_wrap=True)
+            table.add_column("Comando", style=WHITE)
+            for t in tasks:
+                table.add_row(str(t.id), t.role, t.status, str(t.priority),
+                              (t.command or f"validate #{t.finding_id}")[:100])
+            console.print(table)
+        return _REPL_HANDLED
+
+    if action in ("events", "eventos"):
+        if not _swarm_require():
+            return _REPL_HANDLED
+        try:
+            n = int(rest) if rest else 20
+        except ValueError:
+            n = 20
+        for e in _SWARM.store.list_events(n):
+            console.print(
+                f"[dim]{e['ts']}[/] [{CYAN}]{e['type']}[/] "
+                f"{e.get('agent') or ''} #{e.get('task_id') or ''} "
+                f"{json.dumps(e.get('payload', {}), ensure_ascii=False)[:160]}"
+            )
+        return _REPL_HANDLED
+
+    if action == "block":
+        if not _swarm_require():
+            return _REPL_HANDLED
+        parts = user_input.split(maxsplit=3)
+        if len(parts) < 3:
+            console.print(f"[{RED}]Uso: swarm block <target> <motivo>[/]")
+            return _REPL_HANDLED
+        target_b = parts[2].strip()
+        reason = parts[3].strip() if len(parts) > 3 else ""
+        _SWARM.block_target(target_b, reason)
+        console.print(f"[bold {RED}]⛔ target bloqueado:[/] {target_b}")
+        return _REPL_HANDLED
+
+    if action in ("unblock", "desbloquear"):
+        if not _swarm_require():
+            return _REPL_HANDLED
+        target_b = rest.strip() or None
+        _SWARM.clear_blocks(target_b)
+        console.print(f"[bold {CYAN}]Bloqueos desactivados"
+                      f"{' para ' + target_b if target_b else ''}.[/]")
+        return _REPL_HANDLED
+
+    console.print(
+        f"[{RED}]Uso: swarm [start|stop|status|plan|task|finding|"
+        f"evidence|validate|findings|queue|events|block|unblock|help][/]"
+    )
+    return _REPL_HANDLED
+
+
 _REPL_TABLE = []  # [(kind, frozenset(names), handler)]
 
 
@@ -12566,6 +13366,7 @@ _register_repl('exact', ('sessions', 'sesiones'), _repl_sessions)
 _register_repl('first', ('resume', 'retomar'), _repl_resume)
 _register_repl('exact', ('new', 'nueva', 'nuevo'), _repl_new)
 _register_repl('first', ('report', 'informe'), _repl_report)
+_register_repl('first', ('swarm', 'enjambre'), _repl_swarm)
 
 
 def _dispatch_repl(user_input):
