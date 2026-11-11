@@ -324,6 +324,22 @@ class Store:
             row = self._conn.execute(q, args).fetchone()
         return int(row["n"]) if row else 0
 
+    def count_tasks_since(self, since_iso: str,
+                          role: str | None = None) -> int:
+        """Cuenta tareas creadas desde `since_iso` (para presupuestos)."""
+        q = "SELECT COUNT(*) AS n FROM tasks WHERE created_at>=?"
+        args = [since_iso]
+        if role:
+            q += " AND role=?"
+            args.append(role)
+        with self._lock:
+            row = self._conn.execute(q, args).fetchone()
+        if row is None:
+            return 0
+        if isinstance(row, dict):
+            return int(next(iter(row.values())))
+        return int(row[0])
+
     def task_stats(self) -> dict:
         with self._lock:
             rows = self._conn.execute(

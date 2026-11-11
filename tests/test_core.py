@@ -109,6 +109,17 @@ class TestVerifier(unittest.TestCase):
         self.assertIsNone(v["ok"])
         self.assertTrue(v["unknown"])
 
+    def test_cmd_output_with_url(self):
+        # El separador @@@ evita que `http://...` rompa el comando.
+        v = verify_goal_criteria([
+            "cmd_output:printf 'http://example.com 200'@@@200"
+        ])
+        self.assertTrue(v["ok"], v)
+        v2 = verify_goal_criteria([
+            "cmd_output:printf 'http://example.com 200'::200"
+        ])
+        self.assertTrue(v2["ok"], v2)
+
 
 if __name__ == "__main__":
     unittest.main()

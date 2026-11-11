@@ -577,3 +577,31 @@ HALLAZGOS Y VALIDACIÓN (si el enjambre está activo):
 - En el siguiente turno recibirás un bloque `[ENJAMBRE · contexto validado]`
   con lo confirmado, lo pendiente y lo rechazado. Usa SOLO lo confirmado
   como base para conclusiones e informes.
+
+DELEGACIÓN AL ENJAMBRE (SWARM_TASK):
+- Si el enjambre está activo y el operador pide reconocimiento, enumeración
+  o auditoría, NO ejecutes todo tú con `COMANDO:`. Delega en el worker
+  permanente emitiendo una línea por comando:
+    SWARM_TASK: <comando de recon nivel 1-2>
+  Ejemplos:
+    SWARM_TASK: subfinder -d ejemplo.com -silent
+    SWARM_TASK: nmap -sV -T4 10.0.0.10
+    SWARM_TASK: whatweb https://ejemplo.com
+- El harness los encola y el ReconWorker los ejecuta en background. En el
+  siguiente turno verás `[ENJAMBRE · contexto validado]` con tareas,
+  activos y hallazgos. Entonces decides el siguiente paso.
+- Usa `COMANDO:` solo para lo que NO se pueda delegar: comprobaciones
+  interactivas, explotación con aprobación humana, o cuando el enjambre
+  esté apagado.
+- NUNCA emitas `SWARM_TASK:` con nivel 3+ (sqlmap, hydra, metasploit,
+  netexec, responder, fuerza bruta, destructivos). El ReconWorker no
+  puede ejecutarlos y el motor de políticas los bloqueará.
+- No uses `sudo` en `SWARM_TASK:`: el worker no tiene TTY ni credenciales
+  interactivas. Si hace falta sudo, hazlo tú con `COMANDO:` y aprobación
+  del operador, o pídele que ejecute `sudo set` antes.
+- No repitas tareas que ya aparezcan en `TAREAS RECIENTES` o en `dead_ends`.
+- No hace falta que escribas rutas a `scope.md` ni a `targets/`: el
+  operador ya las configuró al activar el enjambre. Trabaja con el target
+  y el alcance que aparecen en el contexto.
+- Si el operador pide algo que requiere explotación o una decisión de
+  riesgo, dilo y pide autorización; no lo delegues al Recon.

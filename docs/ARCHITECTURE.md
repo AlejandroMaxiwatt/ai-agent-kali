@@ -18,6 +18,8 @@ python agent.py --goal "Comprometer TYPO3 || criteria: file_exists:evidence/x.tx
 
 # Enjambre permanente (Recon + Guardian)
 swarm start --target acme --scope targets/acme/scope.md
+# objetivo completo: auto-planifica y encola en Recon
+swarm goal "Auditar acme y encontrar el vector de entrada" || criteria: file_exists:notes.md
 # versión distribuida opcional
 swarm start --target acme --store postgres --dsn postgresql://user:pass@host/agent --redis redis://127.0.0.1:6379/0
 

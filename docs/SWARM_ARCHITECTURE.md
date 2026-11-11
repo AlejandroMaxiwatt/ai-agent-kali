@@ -109,6 +109,8 @@ autoaprobar por diseño.
 ## Comandos REPL
 
 ```text
+swarm goal <objetivo> [|| criteria: … || budget: …]
+swarm goal status / list / kill / resume <id>
 swarm start [--target X] [--scope ruta] [--level 1-2] [--llm] [--poll seg]
 swarm stop
 swarm status
@@ -117,6 +119,7 @@ swarm task <comando>
 swarm finding add <título>
 swarm evidence <id> <ruta>
 swarm validate <id>
+swarm cancel <id>
 swarm findings [estado]
 swarm queue [rol]
 swarm events [N]
@@ -124,6 +127,43 @@ swarm block <target> <motivo>
 swarm unblock <target>
 swarm help
 ```
+
+### `swarm goal` — objetivo sobre el enjambre
+
+`swarm goal` une el orquestador de objetivos con los workers
+permanentes:
+
+1. Auto-inicia el enjambre si no está activo.
+2. Infiere target/scope:
+   - `target:` del spec, o el target activo, o el único target de `targets/`.
+   - `targets/<target>/scope.md`; si no existe, extrae hosts del propio
+     texto del objetivo.
+3. Pide al LLM un plan JSON con tareas de recon nivel 1-2.
+4. Encola las tareas en el ReconWorker, espera a que la cola y las
+   validaciones queden idle.
+5. Verifica los criterios con `verify_goal_criteria`.
+6. Si no se cumplen, replanifica con el contexto actualizado (activos,
+   hallazgos, intentos, dead-ends).
+7. Termina en `done`, `blocked`, `budget_exhausted`, `exhausted` o
+   `killed`; genera un informe en `reports/swarm-goal-<id>-<target>.md`.
+
+El runner persiste su estado en `memory/swarm/goals/<id>.state.json`;
+`swarm goal resume <id>` continúa desde la última ronda.
+
+### Delegación desde el agente principal
+
+Con el enjambre activo, el agente principal puede delegar recon sin
+ejecutarlo síncronamente:
+
+```text
+SWARM_TASK: nmap -sV 10.0.0.1
+SWARM_TASK: whatweb https://ejemplo.com
+```
+
+El harness las encola en el ReconWorker y elimina las líneas del history.
+En el siguiente turno el modelo recibe tareas, activos y hallazgos en
+`[ENJAMBRE · contexto validado]`. `swarm goal` hace esto automáticamente
+con su planner LLM.
 
 ## Propiedades de seguridad
 

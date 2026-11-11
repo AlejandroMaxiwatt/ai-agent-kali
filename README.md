@@ -404,6 +404,9 @@ Arquitectura de **1 agente principal + 2 workers permanentes**:
 
 | Comando | Acción |
 |---|---|
+| `swarm goal <objetivo> [\|\| criteria: … \|\| budget: …]` | **Auto-inicia** el enjambre, planifica con el LLM, encola recon y verifica criterios hasta cumplir |
+| `swarm goal status / list / kill / resume <id>` | Estado, histórico, parada y reanudación de los objetivos |
+| `swarm goal spec <ruta>` | Carga objetivo + criterios + presupuesto desde un archivo |
 | `swarm start [--target X] [--scope ruta] [--level 1-2] [--llm]` | Inicia Recon + Guardian y el orquestador |
 | `swarm start … --store postgres --dsn <DSN> --redis <URL>` | Versión distribuida (PostgreSQL + Redis Streams) |
 | `swarm status` / `swarm stop` | Estado de workers/colas/hallazgos · detener |
@@ -416,7 +419,9 @@ Arquitectura de **1 agente principal + 2 workers permanentes**:
 | `swarm findings [estado]` · `swarm queue [rol]` · `swarm events [N]` | Consultar hallazgos, cola y eventos |
 | `swarm block <target> <motivo>` / `swarm unblock <target>` | Bloquear/desbloquear un target en el motor de políticas |
 
-El agente principal puede emitir una línea `FINDING: <sev> | <título> | <claim>`; el orquestador la registra y el Guardian la valida. En el prompt recibe un bloque `[ENJAMBRE · contexto validado]` con confirmados, pendientes y rechazados.
+El agente principal puede emitir una línea `FINDING: <sev> | <título> | <claim>`; el orquestador la registra y el Guardian la valida. También puede delegar reconocimiento con `SWARM_TASK: <comando nivel 1-2>` y el ReconWorker lo ejecuta en background. En el prompt recibe un bloque `[ENJAMBRE · contexto validado]` con tareas, activos, confirmados, pendientes y rechazados.
+
+`swarm goal` automatiza todo: auto-inicia el enjambre, infiere target/scope desde el objetivo o el target activo, pide al LLM un plan de tareas, las encola en Recon, espera la validación del Guardian y comprueba los criterios de éxito.
 
 Visor de solo lectura:
 

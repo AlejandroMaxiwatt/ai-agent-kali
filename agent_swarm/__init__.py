@@ -27,6 +27,7 @@ from .event_bus import (
     RedisStreamsEventBus,
     make_event_bus,
 )
+from .goal_runner import SwarmGoalRunner, SwarmGoalSpec
 from .orchestrator import SwarmOrchestrator
 from .policy import PolicyEngine, Scope
 from .store import Store
@@ -40,6 +41,8 @@ __all__ = [
     "PolicyDecision",
     "Task",
     "SwarmOrchestrator",
+    "SwarmGoalRunner",
+    "SwarmGoalSpec",
     "PolicyEngine",
     "Scope",
     "Store",

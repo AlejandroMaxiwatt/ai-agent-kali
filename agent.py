@@ -865,6 +865,8 @@ _subagent_thread_marker = threading.local()
 
 # Enjambre persistente (agent_swarm). None = desactivado.
 _SWARM = None
+# Goal activo sobre el enjambre (SwarmGoalRunner) o None.
+_SWARM_GOAL = None
 _swarm_thread_marker = threading.local()
 
 
@@ -3953,6 +3955,27 @@ def strip_findings(text):
     return _FINDING_RE.sub("", text).strip()
 
 
+# Delegación de trabajo al ReconWorker permanente. Formato:
+#   SWARM_TASK: nmap -sV 10.0.0.1
+_SWARM_TASK_RE = re.compile(
+    r"^[ \t]*SWARM_TASK:\s*(?P<cmd>.+?)\s*$", re.I | re.M,
+)
+
+
+def extract_swarm_tasks(text):
+    """Devuelve los comandos de las líneas `SWARM_TASK:`."""
+    if not text:
+        return []
+    return [m.group("cmd").strip() for m in _SWARM_TASK_RE.finditer(text)
+            if m.group("cmd").strip()]
+
+
+def strip_swarm_tasks(text):
+    if not text:
+        return text
+    return _SWARM_TASK_RE.sub("", text).strip()
+
+
 def extract_file_reads(text):
     """Devuelve lista de strings con las rutas a leer."""
     if not text:
@@ -4096,7 +4119,7 @@ def _write_file_with_sudo_fallback(full_path, body):
             # thread (no en un subagente), pedimos la password ahora con
             # un panel claro y reintentamos. Si está en subagente o el
             # operador la cancela, devolvemos el error con el tip.
-            if not _is_subagent_thread():
+            if not (_is_subagent_thread() or _is_swarm_worker()):
                 console.print()
                 console.print(Panel(
                     f"[bold {WHITE}]{full_path}[/] requiere [bold]root[/] "
@@ -5825,6 +5848,8 @@ def build_commands_panel():
         ]),
         ("Enjambre", [
             ("swarm start [--target] [--scope]", "Recon + Guardian permanentes"),
+            ("swarm goal <objetivo>",   "Auto-planifica y encola en Recon"),
+            ("swarm goal status / kill", "Estado / parar el objetivo"),
             ("swarm status / stop",     "Estado / detener el enjambre"),
             ("swarm plan / task <cmd>", "Plan de recon / encolar tarea"),
             ("swarm finding add <título>", "Hallazgo pendiente de validación"),
@@ -6636,6 +6661,33 @@ def _strip_context_regurgitation(answer):
 _TOOL_SATURATION_THRESHOLD = 3
 
 
+def _process_swarm_tasks(answer):
+    """Encola las líneas `SWARM_TASK:` en el ReconWorker permanente."""
+    items = extract_swarm_tasks(answer)
+    if not items:
+        return answer, []
+    messages = []
+    if _SWARM is not None:
+        for cmd in items:
+            try:
+                tid, decision = _SWARM.submit_recon_task(
+                    cmd, target=_SWARM.target,
+                )
+            except Exception as e:
+                messages.append(f"SWARM_TASK no encolada: {e}")
+                continue
+            if tid:
+                messages.append(
+                    f"SWARM_TASK #{tid} encolada: {cmd[:120]}"
+                )
+            else:
+                messages.append(
+                    f"SWARM_TASK rechazada: {cmd[:120]} · "
+                    f"{decision.reason}"
+                )
+    return strip_swarm_tasks(answer), messages
+
+
 def _process_swarm_findings(answer):
     """Registra los bloques `FINDING:` en el enjambre.
 
@@ -6682,14 +6734,47 @@ def _build_swarm_context(max_findings=8):
             "RECHAZADOS (no usar como base)": store.list_findings(
                 status="rejected", limit=max_findings),
         }
+        stats = store.task_stats()
+        pending = sum(v.get("pending", 0) for v in stats.values())
+        running = sum(v.get("running", 0) for v in stats.values())
         lines = [
             "[ENJAMBRE · contexto validado]",
             f"Target: {_SWARM.target or '(ninguno)'} · "
-            f"scope: {_SWARM.scope.describe()}",
+            f"scope: {_SWARM.scope.describe()} · "
+            f"cola {pending}p/{running}r",
             "REGLA: solo los hallazgos de CONFIRMADOS están validados por "
             "el Guardian. No presentes como confirmada una vulnerabilidad "
             "basada solo en versión/banner o en una hipótesis pendiente.",
+            "DELEGACIÓN: puedes encolar recon en el worker permanente con "
+            "líneas `SWARM_TASK: <comando nivel 1-2>`.",
         ]
+        if _SWARM_GOAL is not None:
+            try:
+                gs = _SWARM_GOAL.status_dict()
+                lines.append(
+                    f"GOAL DEL ENJAMBRE: {gs['status']} · ronda "
+                    f"{gs['rounds']}/{gs['max_rounds']} · {gs['goal'][:160]}"
+                )
+            except Exception:
+                pass
+        tasks = store.list_tasks(limit=8)
+        if tasks:
+            lines.append("TAREAS RECIENTES:")
+            for t in tasks:
+                result = (t.result or "").replace("\n", " ")[:220]
+                cmd = t.command or f"validate #{t.finding_id}"
+                lines.append(
+                    f"  · #{t.id} [{t.status}] {cmd[:140]} "
+                    f"rc={t.rc} → {result}"
+                )
+        assets = store.list_assets(_SWARM.target, limit=10)
+        if assets:
+            lines.append("ACTIVOS:")
+            for a in assets:
+                lines.append(
+                    f"  · {a.get('host')}:{a.get('port') or ''} "
+                    f"{a.get('service') or ''} {a.get('version') or ''}"
+                )
         any_finding = False
         for title, items in groups.items():
             if not items:
@@ -7269,6 +7354,8 @@ def ask_model(user_input):
     # Procesar FINDING: (si el enjambre está activo). El hallazgo se
     # registra como pendiente; el Guardian lo validará en background.
     answer, finding_msgs = _process_swarm_findings(answer)
+    # Delegación de trabajo al ReconWorker permanente.
+    answer, swarm_task_msgs = _process_swarm_tasks(answer)
 
     history.append({"role": "assistant", "content": answer})
 
@@ -7291,6 +7378,12 @@ def ask_model(user_input):
             "role": "system",
             "content": "[ENJAMBRE · hallazgos registrados]\n"
                        + "\n".join(finding_msgs),
+        })
+    if swarm_task_msgs:
+        history.append({
+            "role": "system",
+            "content": "[ENJAMBRE · tareas delegadas]\n"
+                       + "\n".join(swarm_task_msgs),
         })
 
     # Un solo save_session() al final cubre los 3 appends previos. Antes
@@ -7526,6 +7619,16 @@ def render_swarm_bar():
         if st.get("active_blocks"):
             text.append(f"  · bloqueos {st['active_blocks']}",
                         style=f"bold {RED}")
+        if _SWARM_GOAL is not None:
+            try:
+                gs = _SWARM_GOAL.status_dict()
+                text.append(
+                    f"  · goal {gs['status']} "
+                    f"r{gs['rounds']}/{gs['max_rounds']}",
+                    style=f"bold {MAGENTA}",
+                )
+            except Exception:
+                pass
         text.append(f"  · target {_SWARM.target or '—'}", style=GRAY)
         return text
     except Exception:
@@ -8905,7 +9008,7 @@ def _sudo_run(sudo_args, timeout=60, allow_tty_fallback=True):
         except Exception as e:
             return (1, "", str(e))
 
-    if _is_subagent_thread():
+    if _is_subagent_thread() or _is_swarm_worker():
         return (1, "",
                 "sudo requiere password pero el caché no es vigente y no "
                 "hay password almacenada. Ejecuta `sudo set` antes de "
@@ -8955,8 +9058,8 @@ def _ensure_sudo_credentials():
     if _sudo_refresh_with_stored_password():
         return True
 
-    # 3) main thread → prompt interactivo. Subagente → fail.
-    if _is_subagent_thread():
+    # 3) main thread → prompt interactivo. Subagente/worker → fail.
+    if _is_subagent_thread() or _is_swarm_worker():
         return False
 
     console.print()
@@ -10114,7 +10217,7 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
         camino normal — el operador interactúa con el comando como si fuera
         una terminal normal (puede responder passwords, host keys, etc.).
         Devuelve (stdout, stderr, rc)."""
-        in_sub = _is_subagent_thread()
+        in_sub = _is_subagent_thread() or _is_swarm_worker()
         # Modo interactivo: el comando recibe el TTY del agente. No tiene
         # sentido en threads de subagente (no hay operador para responder),
         # así que en ese caso caemos al camino normal con stdin=DEVNULL.
@@ -10356,6 +10459,11 @@ def print_help():
                         Inicia los dos workers permanentes y el orquestador determinista.
 [bold {WHITE}]swarm start … --store postgres --dsn <DSN> --redis <URL>[/bold {WHITE}]
                         Memoria compartida PostgreSQL y eventos Redis Streams (opcionales).
+[bold {WHITE}]swarm goal <objetivo> \\[|| criteria: … || budget: …][/bold {WHITE}]
+                        Auto-inicia el enjambre, infiere target/scope, planifica con el LLM,
+                        encola recon en el worker y verifica criterios hasta cumplir.
+[bold {WHITE}]swarm goal status / list / kill / resume <id>[/bold {WHITE}]  Seguimiento y reanudación.
+[bold {WHITE}]swarm goal spec <ruta>[/bold {WHITE}]                Carga objetivo + criterios + presupuesto desde archivo.
 [bold {WHITE}]swarm status / stop[/bold {WHITE}]                   Estado de workers/colas/hallazgos · detener.
 [bold {WHITE}]swarm plan \\[--enqueue] / task <comando>[/bold {WHITE}]  Plan de recon desde el scope · encolar tarea.
 [bold {WHITE}]swarm finding add <título> / evidence <id> <ruta>[/bold {WHITE}]  Registrar hallazgo y evidencia.
@@ -10452,6 +10560,8 @@ def print_commands():
         ("Orquestación", "goal kill",                           "Detiene el goal y los subagentes de su fase actual"),
 
         ("Enjambre", "swarm start [--target X] [--scope ruta] [--level N] [--llm] [--store sqlite|postgres] [--dsn DSN] [--redis URL]", "Inicia los 2 workers permanentes (Recon + Guardian) y el orquestador determinista. Store SQLite local o PostgreSQL; eventos opcionales en Redis Streams."),
+        ("Enjambre", "swarm goal <objetivo> [|| criteria: … || budget: …]", "Auto-inicia el enjambre, planifica con el LLM, encola recon en el ReconWorker y verifica criterios hasta cumplir."),
+        ("Enjambre", "swarm goal status / list / kill / resume <id>", "Estado, histórico, parada y reanudación de los objetivos del enjambre."),
         ("Enjambre", "swarm status · swarm stop",                 "Estado de workers/colas/hallazgos · detiene el enjambre."),
         ("Enjambre", "swarm plan [--enqueue] · swarm task <cmd>", "Genera un plan de recon desde el scope · encola un comando de recon."),
         ("Enjambre", "swarm finding add <título> · swarm evidence <id> <ruta>", "Registra un hallazgo · adjunta evidencia para validación."),
@@ -13121,6 +13231,73 @@ def _swarm_llm_planner(task, output, assets):
         return []
 
 
+def _swarm_goal_planner(context):
+    """Planner LLM de `swarm goal`.
+
+    Recibe el contexto (objetivo, activos, hallazgos, cola, intentos) y
+    devuelve un plan JSON con tareas de recon nivel 1-2, o una decisión
+    done/blocked. El ReconWorker ejecuta; el motor de políticas valida.
+    """
+    try:
+        skill = load_skill_content("recon") or (
+            "Eres un planificador de reconocimiento de Red Team."
+        )
+        prompt = (
+            "Eres el planificador de un enjambre de Red Team con dos workers "
+            "permanentes (Recon y Guardian).\n"
+            "Tu única salida debe ser JSON válido, sin markdown ni prosa.\n\n"
+            "REGLAS:\n"
+            "- Solo puedes proponer reconocimiento de nivel 1-2: nmap, "
+            "masscan, rustscan, subfinder, assetfinder, amass, httpx, "
+            "whatweb, wafw00f, nuclei, nikto, gobuster, ffuf, feroxbuster, "
+            "enum4linux, smbmap, ldapsearch, etc.\n"
+            "- PROHIBIDO proponer explotación, fuerza bruta o acciones "
+            "destructivas (sqlmap, hydra, metasploit, netexec, responder, "
+            "rm, dd, systemctl…). El ReconWorker no puede ejecutar nivel 3+.\n"
+            "- No uses `sudo`: el worker no tiene credenciales interactivas. "
+            "Si una herramienta lo requiere, usa una alternativa sin sudo o "
+            "pide al operador que la ejecute.\n"
+            "- No repitas comandos que ya aparezcan en `tasks`, `attempts` "
+            "o `dead_ends`. Si un escaneo ya se hizo, usa sus resultados.\n"
+            "- Usa los activos descubiertos para pivotar (web, SMB, DNS…).\n"
+            "- Máximo 5 tareas por ronda.\n"
+            "- Si los criterios ya se cumplen, responde done.\n"
+            "- Si no hay más recon útil, responde blocked con el motivo.\n\n"
+            "FORMATOS:\n"
+            '{"action":"plan","tasks":[{"command":"nmap -sV 10.0.0.1",'
+            '"target":"10.0.0.1","priority":3,"reason":"..."}]}\n'
+            '{"action":"done","reason":"...","summary":"..."}\n'
+            '{"action":"blocked","reason":"...","required":"..."}\n\n'
+            "CONTEXTO:\n"
+            + json.dumps(context, ensure_ascii=False)[:16000]
+        )
+        kwargs = _llm_kwargs("orchestrator")
+        kwargs["messages"] = [
+            {"role": "system", "content": skill},
+            {"role": "user", "content": prompt},
+        ]
+        resp = client.chat.completions.create(**kwargs)
+        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return {"action": "blocked",
+                    "reason": "el planner no devolvió JSON"}
+        data = json.loads(m.group(0))
+        action = (data.get("action") or "").lower()
+        if action not in ("plan", "done", "blocked"):
+            return {"action": "blocked",
+                    "reason": f"acción inválida: {action!r}"}
+        if action == "plan":
+            tasks = data.get("tasks") or []
+            data["tasks"] = [
+                t for t in tasks
+                if isinstance(t, dict) and (t.get("command") or "").strip()
+            ]
+        return data
+    except Exception as e:
+        return {"action": "blocked", "reason": f"planner error: {e}"}
+
+
 def _swarm_require():
     if _SWARM is None:
         console.print(
@@ -13129,6 +13306,297 @@ def _swarm_require():
         )
         return False
     return True
+
+
+def _print_swarm_goal_status(state: dict):
+    color = {
+        "running": "yellow", "done": GREEN, "killed": "#fbbf24",
+        "blocked": "#fbbf24", "exhausted": MAGENTA,
+        "budget_exhausted": "#f97316", "failed": RED,
+        "pending": CYAN,
+    }.get(state.get("status", ""), WHITE)
+    criteria = state.get("criteria") or []
+    crit_str = "\n".join(f"  · {c}" for c in criteria) or "  (sin criterios)"
+    budget = state.get("budget") or {}
+    lines = [
+        f"[bold]Goal:[/] {state.get('goal', '')[:300]}",
+        f"[bold]Estado:[/] [{color}]{state.get('status', '?')}[/]  ·  "
+        f"Ronda {state.get('rounds', 0)}/{state.get('max_rounds', '?')}",
+        f"[bold]Target:[/] [bold {PURPLE}]{state.get('target') or '(ad-hoc)'}[/]",
+        f"[bold]Criterios:[/]\n{crit_str}",
+        f"[bold]Presupuesto:[/] {budget.get('elapsed_s', 0)/60:.0f} min · "
+        f"{budget.get('commands_used', 0)}/{budget.get('budget_commands', '?')} comandos",
+        f"[bold]Motivo:[/] {state.get('outcome_reason') or '—'}",
+    ]
+    if state.get("summary"):
+        lines.append(f"[bold]Resumen:[/] {state['summary'][:500]}")
+    if state.get("report_path"):
+        lines.append(f"[bold]Informe:[/] {state['report_path']}")
+    console.print(Panel(
+        "\n".join(lines),
+        title=f"[bold {PURPLE}]Swarm goal[/]",
+        border_style=PURPLE, box=ROUNDED, padding=(1, 2),
+    ))
+
+
+def _repl_swarm_goal(rest):
+    """Subcomandos de `swarm goal`: iniciar/status/list/kill/show/resume."""
+    global _SWARM, _SWARM_GOAL
+    try:
+        from agent_swarm.goal_runner import (
+            SwarmGoalRunner, SwarmGoalSpec,
+            list_swarm_goals, load_swarm_goal,
+        )
+    except Exception as e:
+        console.print(f"[{RED}]✗ no se pudo importar goal_runner: {e}[/]")
+        return _REPL_HANDLED
+
+    first = rest.split(maxsplit=1)[0].lower() if rest else ""
+    subrest = rest.split(maxsplit=1)[1].strip() if len(rest.split(maxsplit=1)) > 1 else ""
+
+    if first in ("status", "estado"):
+        state = None
+        if _SWARM_GOAL is not None:
+            try:
+                state = _SWARM_GOAL.status_dict()
+            except Exception:
+                state = None
+        if state is None:
+            goals = list_swarm_goals(WORKSPACE)
+            state = goals[0] if goals else None
+        if state is None:
+            console.print(f"[dim]No hay ningún swarm goal todavía.[/]")
+        else:
+            _print_swarm_goal_status(state)
+        return _REPL_HANDLED
+
+    if first in ("list", "listar", "ls"):
+        goals = list_swarm_goals(WORKSPACE)
+        if not goals:
+            console.print(f"[dim]No hay swarm goals persistidos.[/]")
+            return _REPL_HANDLED
+        table = Table(title="Swarm goals", border_style=PURPLE)
+        table.add_column("ID", style=CYAN, no_wrap=True)
+        table.add_column("Estado", no_wrap=True)
+        table.add_column("Target", no_wrap=True)
+        table.add_column("Ronda", no_wrap=True)
+        table.add_column("Goal", style=WHITE)
+        for g in goals[:30]:
+            spec = g.get("spec") or {}
+            table.add_row(
+                g.get("id", "?"), g.get("status", "?"),
+                spec.get("target") or "—",
+                f"{g.get('rounds', 0)}/{spec.get('max_rounds', '?')}",
+                (spec.get("goal") or "")[:100],
+            )
+        console.print(table)
+        return _REPL_HANDLED
+
+    if first in ("kill", "stop", "parar"):
+        if _SWARM_GOAL is None or not _SWARM_GOAL.is_alive():
+            console.print(f"[dim]No hay swarm goal activo.[/]")
+        else:
+            _SWARM_GOAL.kill_event.set()
+            console.print(f"[bold {CYAN}]Kill solicitado al swarm goal.[/]")
+        return _REPL_HANDLED
+
+    if first in ("show", "ver"):
+        if _SWARM_GOAL is not None:
+            _print_swarm_goal_status(_SWARM_GOAL.status_dict())
+        else:
+            goals = list_swarm_goals(WORKSPACE)
+            if goals:
+                _print_swarm_goal_status(goals[0])
+            else:
+                console.print(f"[dim]No hay ningún swarm goal.[/]")
+        return _REPL_HANDLED
+
+    if first in ("resume", "reanudar", "retomar"):
+        if not subrest:
+            console.print(f"[{RED}]Uso: swarm goal resume <id>[/]")
+            return _REPL_HANDLED
+        state = load_swarm_goal(WORKSPACE, subrest)
+        if not state:
+            console.print(f"[{RED}]No existe el goal '{subrest}'.[/]")
+            return _REPL_HANDLED
+        if state.get("status") in ("done", "killed"):
+            console.print(
+                f"[{RED}]El goal '{subrest}' ya terminó "
+                f"({state.get('status')}).[/]"
+            )
+            return _REPL_HANDLED
+        # Asegurar enjambre activo.
+        if _SWARM is None or not _SWARM.is_running():
+            spec_state = state.get("spec") or {}
+            target = spec_state.get("target") or ACTIVE_TARGET
+            scope_text = ""
+            if target:
+                candidate = os.path.join(
+                    WORKSPACE, "targets", target, "scope.md"
+                )
+                if os.path.isfile(candidate):
+                    try:
+                        with open(candidate, encoding="utf-8") as f:
+                            scope_text = f.read()
+                    except OSError:
+                        pass
+            from agent_swarm import SwarmOrchestrator
+            safe_target = re.sub(
+                r"[^A-Za-z0-9_.-]", "_", target or "default"
+            )
+            store_path = os.path.join(
+                WORKSPACE, "memory", "swarm", f"{safe_target}.db"
+            )
+            _SWARM = SwarmOrchestrator(
+                store_path=store_path, target=target,
+                scope_text=scope_text, autonomy_level=2,
+                runner=_swarm_runner,
+                llm_validator=_swarm_llm_validator,
+                llm_planner=None, poll_interval=1.0,
+            )
+            _SWARM.start()
+        if _SWARM_GOAL is not None and _SWARM_GOAL.is_alive():
+            console.print(f"[{ORANGE}]Ya hay un swarm goal activo.[/]")
+            return _REPL_HANDLED
+        spec = SwarmGoalSpec.from_dict(state.get("spec") or {})
+        _SWARM_GOAL = SwarmGoalRunner(
+            _SWARM, spec, _swarm_goal_planner, WORKSPACE,
+            poll_interval=2.0, goal_id=subrest, initial_state=state,
+        )
+        _SWARM_GOAL.start()
+        console.print(
+            f"[bold {GREEN}]✓ swarm goal '{subrest}' reanudado[/] "
+            f"(ronda {state.get('rounds', 0)})."
+        )
+        return _REPL_HANDLED
+
+    # --- cargar la especificación desde archivo --------------------
+    if first in ("spec", "file", "archivo"):
+        if not subrest:
+            console.print(f"[{RED}]Uso: swarm goal spec <ruta>[/]")
+            return _REPL_HANDLED
+        path = _goal_resolve_path(subrest)
+        try:
+            with open(path, encoding="utf-8") as f:
+                rest = f.read()
+            console.print(
+                f"[dim]› spec cargada de "
+                f"{os.path.relpath(path, WORKSPACE)}[/]"
+            )
+        except OSError as e:
+            console.print(f"[{RED}]✗ no se pudo leer {subrest}: {e}[/]")
+            return _REPL_HANDLED
+
+    # --- iniciar un goal nuevo -------------------------------------
+    spec = GoalSpec.parse(rest)
+    if not spec.goal or len(spec.goal.strip()) < 8:
+        console.print(f"[{RED}]Uso: swarm goal <objetivo> "
+                      f"|| criteria: … || budget: …[/]")
+        return _REPL_HANDLED
+
+    if _SWARM_GOAL is not None and _SWARM_GOAL.is_alive():
+        console.print(
+            f"[{ORANGE}]Ya hay un swarm goal activo "
+            f"({_SWARM_GOAL.id}). `swarm goal kill` para detenerlo.[/]"
+        )
+        return _REPL_HANDLED
+
+    # Auto-arranque del enjambre si no está activo.
+    if _SWARM is None or not _SWARM.is_running():
+        target = spec.target or ACTIVE_TARGET
+        if not target:
+            targets = list_available_targets()
+            goal_low = spec.goal.lower()
+            # Preferir un target cuyo nombre aparezca en el objetivo.
+            matches = [name for name, *_ in targets
+                       if name.lower() in goal_low]
+            candidates = matches if len(matches) == 1 else targets
+            if len(candidates) == 1:
+                name = candidates[0]
+                ok, _ = load_target(name)
+                if ok:
+                    target = name
+                    console.print(
+                        f"[dim]› target auto-cargado: {name}[/]"
+                    )
+        scope_text = ""
+        if target:
+            candidate = os.path.join(
+                WORKSPACE, "targets", target, "scope.md"
+            )
+            if os.path.isfile(candidate):
+                try:
+                    with open(candidate, encoding="utf-8") as f:
+                        scope_text = f.read()
+                except OSError:
+                    pass
+        if not scope_text:
+            # Inferir alcance de los hosts mencionados en el objetivo.
+            try:
+                from agent_swarm.policy import extract_hosts
+                hosts = sorted(extract_hosts(spec.goal))
+                scope_text = " ".join(hosts)
+                if hosts:
+                    console.print(
+                        f"[dim]› scope inferido del objetivo: "
+                        f"{', '.join(hosts)}[/]"
+                    )
+            except Exception:
+                pass
+        try:
+            from agent_swarm import SwarmOrchestrator
+        except Exception as e:
+            console.print(f"[{RED}]✗ no se pudo importar agent_swarm: {e}[/]")
+            return _REPL_HANDLED
+        safe_target = re.sub(
+            r"[^A-Za-z0-9_.-]", "_", target or "default"
+        )
+        store_path = os.path.join(
+            WORKSPACE, "memory", "swarm", f"{safe_target}.db"
+        )
+        _SWARM = SwarmOrchestrator(
+            store_path=store_path, target=target, scope_text=scope_text,
+            autonomy_level=2, runner=_swarm_runner,
+            llm_validator=_swarm_llm_validator,
+            llm_planner=None, poll_interval=1.0,
+        )
+        _SWARM.start()
+        console.print(
+            f"[dim]› enjambre auto-iniciado · target="
+            f"{target or '(ad-hoc)'} · scope={_SWARM.scope.describe()}[/]"
+        )
+        if _SWARM.scope.is_empty():
+            console.print(
+                f"[bold {ORANGE}]⚠ Scope vacío:[/] no pude inferir hosts "
+                f"del objetivo. Los comandos con host serán bloqueados. "
+                f"Carga un target con `scope.md` o usa `swarm start --scope`."
+            )
+
+    sg_spec = SwarmGoalSpec.from_goal_spec(
+        spec, target=_SWARM.target, max_rounds=10,
+    )
+    _SWARM_GOAL = SwarmGoalRunner(
+        _SWARM, sg_spec, _swarm_goal_planner, WORKSPACE,
+        poll_interval=2.0,
+    )
+    _SWARM_GOAL.start()
+    console.print()
+    console.print(Panel(
+        f"[bold {GREEN}]✓ swarm goal lanzado · id {_SWARM_GOAL.id}[/]\n\n"
+        f"[bold]Objetivo:[/] {sg_spec.goal[:300]}\n"
+        f"[bold]Target:[/] {sg_spec.target or '(ad-hoc)'}\n"
+        f"[bold]Scope:[/] {_SWARM.scope.describe()}\n"
+        f"[bold]Criterios:[/] "
+        f"{'; '.join(sg_spec.criteria) if sg_spec.criteria else '(el planner decide)'}\n"
+        f"[bold]Presupuesto:[/] {sg_spec.budget_seconds/3600:.1f}h · "
+        f"{sg_spec.budget_commands} comandos · {sg_spec.max_rounds} rondas\n\n"
+        f"[dim]El planner LLM encola tareas de recon en el worker permanente, "
+        f"espera al Guardian y verifica criterios. `swarm goal status` para "
+        f"seguir el progreso.[/]",
+        title=f"[bold {GREEN}]» Swarm goal[/]",
+        border_style=GREEN, box=ROUNDED, padding=(1, 2),
+    ))
+    return _REPL_HANDLED
 
 
 def _repl_swarm(user_input, cmd_lower, first_word):
@@ -13143,6 +13611,9 @@ def _repl_swarm(user_input, cmd_lower, first_word):
             "[bold]swarm start[/] \\[--target X] \\[--scope ruta] "
             "\\[--level 1-2] \\[--llm] \\[--poll seg]\n"
             "  \\[--store sqlite|postgres] \\[--dsn DSN] \\[--redis URL]\n"
+            "[bold]swarm goal[/] <objetivo> \\[|| criteria: … || budget: …]\n"
+            "  — planifica, encola en Recon y verifica hasta cumplir.\n"
+            "[bold]swarm goal[/] status / list / kill / resume <id>\n"
             "[bold]swarm stop[/] · [bold]swarm status[/]\n"
             "[bold]swarm plan[/] \\[--enqueue] — plan de recon desde el scope\n"
             "[bold]swarm task[/] <comando> — encola una tarea de recon\n"
@@ -13158,7 +13629,10 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         ))
         return _REPL_HANDLED
 
-    if action == "start":
+    if action in ("goal", "objetivo"):
+        return _repl_swarm_goal(rest)
+
+    if action in ("start", "on", "activar"):
         if _SWARM is not None and _SWARM.is_running():
             console.print(f"[{ORANGE}]El enjambre ya está activo.[/]")
             return _REPL_HANDLED
@@ -13206,6 +13680,16 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         # El nivel 3 (explotación) siempre exige aprobación humana; el CLI
         # solo controla el máximo autoaprobado (1-2).
         level = max(1, min(2, int(level)))
+        # Si no se indicó target y no hay uno activo, cargar el único
+        # target disponible (menos comandos/rutas para el operador).
+        if not target and not ACTIVE_TARGET:
+            available = list_available_targets()
+            if len(available) == 1:
+                name = available[0][0]
+                ok, _ = load_target(name)
+                if ok:
+                    target = name
+                    console.print(f"[dim]› target auto-cargado: {name}[/]")
         target = target or ACTIVE_TARGET
         if not scope_path and target:
             candidate = os.path.join(WORKSPACE, "targets", target, "scope.md")
@@ -13279,6 +13763,10 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         if _SWARM is None:
             console.print(f"[dim]El enjambre no está activo.[/]")
             return _REPL_HANDLED
+        # Detener primero el goal para que no use un store cerrado.
+        if _SWARM_GOAL is not None and _SWARM_GOAL.is_alive():
+            _SWARM_GOAL.kill_event.set()
+            _SWARM_GOAL.join(timeout=5)
         _SWARM.stop()
         _SWARM = None
         console.print(f"[bold {CYAN}]Enjambre detenido.[/]")

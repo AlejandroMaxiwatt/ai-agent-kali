@@ -69,6 +69,45 @@ class TestFindingProtocol(unittest.TestCase):
         finally:
             agent._SWARM = old
 
+    def test_swarm_task_parser(self):
+        text = (
+            "Delego el recon:\n"
+            "SWARM_TASK: nmap -sV 10.0.0.1\n"
+            "  SWARM_TASK: whatweb https://example.com\n"
+            "fin"
+        )
+        tasks = agent.extract_swarm_tasks(text)
+        self.assertEqual(tasks, [
+            "nmap -sV 10.0.0.1", "whatweb https://example.com",
+        ])
+        cleaned = agent.strip_swarm_tasks(text)
+        self.assertNotIn("SWARM_TASK:", cleaned)
+        self.assertIn("Delego el recon", cleaned)
+
+    def test_swarm_task_integration_with_fake_swarm(self):
+        class FakeSwarm:
+            target = "t"
+
+            def __init__(self):
+                self.calls = []
+
+            def submit_recon_task(self, command, target=None):
+                self.calls.append((command, target))
+                return 42, type("D", (), {"reason": "ok"})()
+
+        fake = FakeSwarm()
+        old = agent._SWARM
+        agent._SWARM = fake
+        try:
+            cleaned, msgs = agent._process_swarm_tasks(
+                "texto\nSWARM_TASK: nmap -sV 10.0.0.1\nfin"
+            )
+            self.assertEqual(fake.calls, [("nmap -sV 10.0.0.1", "t")])
+            self.assertTrue(any("#42" in m for m in msgs))
+            self.assertNotIn("SWARM_TASK:", cleaned)
+        finally:
+            agent._SWARM = old
+
     def test_no_swarm_still_strips(self):
         old = agent._SWARM
         agent._SWARM = None

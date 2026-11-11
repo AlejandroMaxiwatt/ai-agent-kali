@@ -14,7 +14,7 @@ Criterios soportados:
     file_contains:<ruta>:<regex>
     file_not_contains:<ruta>:<regex>
     cmd_rc:<comando>
-    cmd_output:<comando>:<regex>
+    cmd_output:<comando>@@@<regex>   (@@@ evita romper URLs con ':')
     port_open:<host>:<puerto>
 
 Este módulo no importa Rich ni el cliente LLM: es testeable de forma aislada.
@@ -226,11 +226,22 @@ def verify_goal_criteria(criteria, workspace: str | None = None) -> dict:
                 if kind_l == "cmd_rc":
                     ok, detail = _criterion_cmd(rest, workspace)
                 else:
-                    command, sep2, pattern = rest.partition(":")
-                    if not sep2:
-                        ok, detail = False, "sintaxis: cmd_output:<comando>:<regex>"
+                    # `@@@` es el separador recomendado porque las URLs y
+                    # muchos comandos contienen `:` y `::`.
+                    if "@@@" in rest:
+                        command, pattern = rest.split("@@@", 1)
+                    elif "::" in rest:
+                        command, pattern = rest.split("::", 1)
                     else:
-                        ok, detail = _criterion_cmd(command, workspace, pattern)
+                        command, sep2, pattern = rest.partition(":")
+                    if not command.strip() or not pattern.strip():
+                        ok, detail = False, (
+                            "sintaxis: cmd_output:<comando>@@@<regex>"
+                        )
+                    else:
+                        ok, detail = _criterion_cmd(
+                            command.strip(), workspace, pattern.strip(),
+                        )
             elif kind_l == "port_open":
                 host, sep2, port = rest.rpartition(":")
                 if not sep2 or not port.isdigit():
