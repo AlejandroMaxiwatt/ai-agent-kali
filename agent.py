@@ -42,7 +42,7 @@ from agent_core.goalspec import (
 # CONFIGURACIÓN GENERAL
 # ============================================================
 
-LMSTUDIO_BASE_URL = "http://lmstudio-oficina:1234/v1"
+LMSTUDIO_BASE_URL = "http://100.68.49.90:1234/v1"
 
 #MODEL_NAME_FALLBACK = "qwen/qwen3.6-27b"
 MODEL_NAME_FALLBACK = "qwen3.8-27b-turbo-fable-cold-fusion-735-882-heretic-uncensored-neo-coder-max-mtp"
@@ -66,6 +66,23 @@ try:
     load_dotenv(os.path.join(WORKSPACE, ".env"), override=False)
 except ImportError:
     pass
+
+# Overrides por entorno/.env (sin editar agent.py):
+#   LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
+#   LMSTUDIO_BASE_URL=http://it1-pc:1234/v1
+#   OLLAMA_BASE_URL / MODEL_NAME_FALLBACK / OLLAMA_MODEL_FALLBACK
+LMSTUDIO_BASE_URL = os.environ.get(
+    "LMSTUDIO_BASE_URL", LMSTUDIO_BASE_URL
+).rstrip("/")
+OLLAMA_BASE_URL = os.environ.get(
+    "OLLAMA_BASE_URL", OLLAMA_BASE_URL
+).rstrip("/")
+MODEL_NAME_FALLBACK = os.environ.get(
+    "MODEL_NAME_FALLBACK", MODEL_NAME_FALLBACK
+)
+OLLAMA_MODEL_FALLBACK = os.environ.get(
+    "OLLAMA_MODEL_FALLBACK", OLLAMA_MODEL_FALLBACK
+)
 
 # Si True, los comandos propuestos por el agente se ejecutan sin pedir confirmación.
 AUTO_EXECUTE = True
@@ -1747,11 +1764,11 @@ def _print_subagent_finished_panel(sub):
     lines = []
     lines.append(f"[bold]Estado:[/] [{color}]{sub.status.upper()}[/]")
     task_disp = sub.task[:120] + ("…" if len(sub.task) > 120 else "")
-    lines.append(f"[bold]Tarea:[/] {task_disp}")
+    lines.append(f"[bold]Tarea:[/] {rich_escape(task_disp)}")
     lines.append(
-        f"[bold]Skill:[/] {sub.skill}  ·  "
+        f"[bold]Skill:[/] {rich_escape(str(sub.skill))}  ·  "
         f"Turnos: {sub.turns_used}/{sub.max_turns}  ·  "
-        f"Target: [bold {PURPLE}]{sub.target}[/]"
+        f"Target: [bold {PURPLE}]{rich_escape(str(sub.target))}[/]"
     )
     # Cobertura de herramientas
     if sub.tools_available:
@@ -1764,13 +1781,15 @@ def _print_subagent_finished_panel(sub):
             failed_short = list(sub.tools_failed_perm.keys())[:5]
             extra = f" (+{len(sub.tools_failed_perm)-5})" if len(sub.tools_failed_perm) > 5 else ""
             lines.append(
-                f"  [dim]Falladas perm: {', '.join(failed_short)}{extra}[/]"
+                f"  [dim]Falladas perm: "
+                f"{rich_escape(', '.join(failed_short))}{extra}[/]"
             )
         if sub.tools_skipped:
             skipped_short = list(sub.tools_skipped.keys())[:5]
             extra = f" (+{len(sub.tools_skipped)-5})" if len(sub.tools_skipped) > 5 else ""
             lines.append(
-                f"  [dim]Skipped: {', '.join(skipped_short)}{extra}[/]"
+                f"  [dim]Skipped: "
+                f"{rich_escape(', '.join(skipped_short))}{extra}[/]"
             )
         if sub.proxy_was_disabled:
             lines.append(
@@ -1782,30 +1801,33 @@ def _print_subagent_finished_panel(sub):
             rc_color = "green" if c["rc"] == 0 else "red"
             cmd_short = c["cmd"][:90] + ("…" if len(c["cmd"]) > 90 else "")
             lines.append(
-                f"  · [{rc_color}]rc={c['rc']}[/] [{CYAN}]{cmd_short}[/]"
+                f"  · [{rc_color}]rc={c['rc']}[/] "
+                f"[{CYAN}]{rich_escape(cmd_short)}[/]"
             )
         if len(sub.commands_run) > 5:
             lines.append(f"  · … (+{len(sub.commands_run) - 5} más)")
     if sub.target_updates_applied:
         files = list(dict.fromkeys(sub.target_updates_applied))
         lines.append(
-            f"[bold]TARGET_UPDATE aplicados:[/] {', '.join(files)}"
+            f"[bold]TARGET_UPDATE aplicados:[/] "
+            f"{rich_escape(', '.join(files))}"
         )
     if sub.summary:
         lines.append("")
         lines.append(f"[bold]Resumen:[/]")
-        lines.append(sub.summary)
+        lines.append(rich_escape(str(sub.summary)))
     if sub.error:
-        lines.append(f"[bold {RED}]Error:[/] {sub.error}")
+        lines.append(f"[bold {RED}]Error:[/] {rich_escape(str(sub.error))}")
     lines.append("")
     lines.append(
         f"[dim]Log completo: "
-        f"{os.path.relpath(sub.log_path, WORKSPACE)}[/]"
+        f"{rich_escape(os.path.relpath(sub.log_path, WORKSPACE))}[/]"
     )
     console.print()
     console.print(Panel(
         "\n".join(lines),
-        title=f"[bold {color}]» Subagente '{sub.name}' terminado[/]",
+        title=f"[bold {color}]» Subagente "
+              f"'{rich_escape(str(sub.name))}' terminado[/]",
         border_style=color, box=ROUNDED, padding=(1, 2),
     ))
 
@@ -3456,13 +3478,14 @@ def _print_goal_finished_panel(gr, ring_bell=False):
 
     lines = [
         f"[bold]Estado:[/] {emoji} [{color}]{gr.status.upper()}[/]",
-        f"[bold]Goal:[/] {gr.goal[:200]}{'…' if len(gr.goal) > 200 else ''}",
-        f"[bold]Target:[/] [bold {PURPLE}]{gr.target}[/]  ·  "
+        f"[bold]Goal:[/] {rich_escape(gr.goal[:200])}"
+        f"{'…' if len(gr.goal) > 200 else ''}",
+        f"[bold]Target:[/] [bold {PURPLE}]{rich_escape(str(gr.target))}[/]  ·  "
         f"Fases: {gr.current_phase}/{gr.max_phases}  ·  "
         f"Inicio: {gr.started_at}  ·  Fin: {gr.finished_at}",
     ]
     if gr.outcome_reason:
-        lines.append(f"[bold]Motivo:[/] {gr.outcome_reason}")
+        lines.append(f"[bold]Motivo:[/] {rich_escape(str(gr.outcome_reason))}")
     # Verificación objetiva de criterios (P1).
     if getattr(gr, "criteria", None):
         lines.append("")
@@ -3472,15 +3495,18 @@ def _print_goal_finished_panel(gr, ring_bell=False):
         if last_v:
             for r in last_v.get("results", []):
                 mark = f"[{GREEN}]✓[/]" if r["ok"] else f"[{RED}]✗[/]"
-                lines.append(f"  {mark} {r['criterion']} — {r['detail']}")
+                lines.append(
+                    f"  {mark} {rich_escape(str(r['criterion']))} — "
+                    f"{rich_escape(str(r['detail']))}"
+                )
         else:
             for c in gr.criteria:
-                lines.append(f"  · {c}")
+                lines.append(f"  · {rich_escape(str(c))}")
     if getattr(gr, "dead_ends", None):
         lines.append("")
         lines.append("[bold]Dead-ends registrados:[/]")
         for d in gr.dead_ends[-5:]:
-            lines.append(f"  · {d[:180]}")
+            lines.append(f"  · {rich_escape(str(d[:180]))}")
     if getattr(gr, "budget_commands", None):
         b = _goal_budget_status(gr)
         lines.append("")
@@ -3491,19 +3517,23 @@ def _print_goal_finished_panel(gr, ring_bell=False):
     if gr.summary:
         lines.append("")
         lines.append(f"[bold]Resumen del orquestador:[/]")
-        lines.append(gr.summary)
+        lines.append(rich_escape(str(gr.summary)))
     if gr.phases:
         lines.append("")
         lines.append(f"[bold]Subagentes lanzados por fase:[/]")
         for ph in gr.phases:
             names = ph.get("subagent_names", [])
-            lines.append(f"  · Fase {ph['n']}: {', '.join(names)}")
+            lines.append(
+                f"  · Fase {ph['n']}: "
+                f"{rich_escape(', '.join(str(n) for n in names))}"
+            )
             for s in ph.get("subagent_summaries", []):
                 if s.get("summary"):
                     sm = s["summary"][:150]
                     lines.append(
-                        f"    └ [{CYAN}]{s['name']}[/] "
-                        f"({s['status']}): {sm}"
+                        f"    └ [{CYAN}]{rich_escape(str(s['name']))}[/] "
+                        f"({rich_escape(str(s['status']))}): "
+                        f"{rich_escape(str(sm))}"
                         + ("…" if len(s.get("summary", "")) > 150 else "")
                     )
     if gr.report_path:
@@ -3513,7 +3543,9 @@ def _print_goal_finished_panel(gr, ring_bell=False):
         lines.append(
             f"[bold {GREEN}]📄 INFORME AUTOMÁTICO GENERADO:[/]"
         )
-        lines.append(f"   [{WHITE}]{rel}[/] ({size_kb:.1f} KB)")
+        lines.append(
+            f"   [{WHITE}]{rich_escape(str(rel))}[/] ({size_kb:.1f} KB)"
+        )
         lines.append(
             f"   [dim]Abrir: `cat {rel}` · "
             f"PDF: `pandoc {rel} -o {rel[:-3]}.pdf --pdf-engine=xelatex`[/]"
@@ -5813,7 +5845,7 @@ def build_commands_panel():
             ("help / ayuda",            "Ayuda extendida"),
             ("comandos / commands",     "Esta tabla de comandos"),
             ("models [nombre|índice]",  "Lista modelos / cambia el activo (auto = automático)"),
-            ("backend [nombre]",        "Cambia backend: ollama (nube) / lmstudio (local)"),
+            ("backend [nombre|test]",   "Cambia backend: ollama (nube) / lmstudio (local); test = diagnóstico"),
             ("tools / herramientas",    "Herramientas instaladas"),
             ("proxy [on/off/status]",   "Control de Tor/proxychains"),
             ("sudo [set/refresh/clear]", "Cachea contraseña sudo (subagentes)"),
@@ -7542,18 +7574,23 @@ def _print_target_updates_panel(applied):
             detail = (
                 f"+{r.get('added_lines', 0)} líneas · "
                 f"{_human_size(r.get('added_bytes', 0))} · "
-                f"[dim]{full}[/]"
+                f"[dim]{rich_escape(str(full))}[/]"
             )
             preview = (r.get("preview") or "").strip()
             if preview:
                 preview = preview.replace("\n", " ⏎ ")
                 if len(preview) > 110:
                     preview = preview[:107] + "…"
-                detail += f"\n   [dim]preview:[/] [italic]{preview}[/]"
+                detail += (
+                    f"\n   [dim]preview:[/] "
+                    f"[italic]{rich_escape(preview)}[/]"
+                )
         else:
             mark = f"[bold {RED}]✗[/]"
-            detail = f"[{RED}]{r.get('error', '?')}[/]"
-        table.add_row(mark, r.get("filename", "?"), detail)
+            detail = f"[{RED}]{rich_escape(str(r.get('error', '?')))}[/]"
+        table.add_row(
+            mark, rich_escape(str(r.get("filename", "?"))), detail,
+        )
 
     console.print()
     console.print(
@@ -9831,19 +9868,24 @@ def _print_troubleshoot_summary(result):
             rows.append(f"  [{n}] [bold {RED}]interrumpido por el usuario[/]")
             continue
         if not a.get("fix"):
-            rows.append(f"  [{n}] [dim]{a.get('note', 'sin fix')}[/]")
+            rows.append(
+                f"  [{n}] [dim]"
+                f"{rich_escape(str(a.get('note', 'sin fix')))}[/]"
+            )
             continue
         rc_retry = a.get("retry_rc", "?")
         if a.get("meta"):
             meta = a["meta"]
             rows.append(
-                f"  [{n}] [bold {PURPLE}]meta[/]: {meta.get('log', '?')}\n"
+                f"  [{n}] [bold {PURPLE}]meta[/]: "
+                f"{rich_escape(str(meta.get('log', '?')))}\n"
                 f"      └─ reintento rc={rc_retry}"
             )
         else:
             rc_fix = a.get("fix_rc", "?")
             rows.append(
-                f"  [{n}] fix: [cyan]{a['fix'][:80]}[/]\n"
+                f"  [{n}] fix: "
+                f"[cyan]{rich_escape(str(a['fix'][:80]))}[/]\n"
                 f"      └─ fix rc={rc_fix} · reintento rc={rc_retry}"
             )
 
@@ -10011,7 +10053,8 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
             f"`targets/{eff_target}/_runs.md`.[/]\n\n"
             f"[bold {WHITE}]Run anterior:[/] [{prev['ts']}] · "
             f"rc={prev['rc']}\n"
-            f"[bold {WHITE}]Comando:[/] [{CYAN}]{prev['command']}[/]\n"
+            f"[bold {WHITE}]Comando:[/] "
+            f"[{CYAN}]{rich_escape(str(prev['command']))}[/]\n"
             f"[bold {WHITE}]Archivos:[/] {files_str}\n\n"
             f"[dim]Si los resultados ya están en disco, lee el archivo en "
             f"vez de re-escanear. Si quieres forzar el rescan (cambió la "
@@ -10117,7 +10160,8 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
     _q_print()
     _q_print(Panel(
         f"[bold {ORANGE}]📋 Comando propuesto[/bold {ORANGE}] "
-        f"[bold {color}]· {label}[/]\n\n[{WHITE}]{command}[/]"
+        f"[bold {color}]· {label}[/]\n\n"
+        f"[{WHITE}]{rich_escape(str(command))}[/]"
         f"{proxy_note}{burned_note}{auto_tag}{copy_hint}",
         border_style=color,
         box=ROUNDED
@@ -10422,7 +10466,8 @@ def print_help():
 [bold {WHITE}]models \\[nombre|índice][/bold {WHITE}]  Lista modelos de LM Studio (con estado/contexto) y marca el activo.
                         Con argumento cambia el modelo activo: `models 2` o `models qwen`.
                         `models auto` vuelve al modo automático (primer modelo cargado).
-[bold {WHITE}]backend \\[nombre][/bold {WHITE}]        Cambia el backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local).
+[bold {WHITE}]backend \\[nombre|test][/bold {WHITE}]  Cambia el backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local).
+                        `backend test` prueba la conexión y muestra el error exacto.
                         Sin argumento muestra el backend activo y las opciones. Ollama Cloud usa OLLAMA_API_KEY.
 [bold {WHITE}]tools / herramientas[/bold {WHITE}]    Herramientas instaladas y faltantes.
 [bold {WHITE}]proxy \\[on/off/status][/bold {WHITE}]   Estado y control del enrutado por Tor/proxychains.
@@ -10530,7 +10575,7 @@ def print_commands():
         ("General",  "refresh / refrescar",     "Limpia pantalla y redibuja el splash"),
         ("General",  "clear / limpiar",         "Igual que refresh"),
         ("General",  "models [nombre|índice]",  "Lista modelos (estado/contexto) y cambia el activo; `models auto` = automático"),
-        ("General",  "backend [nombre]",        "Cambia backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local)"),
+        ("General",  "backend [nombre|test]",   "Cambia backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local). `backend test` diagnostica la conexión y muestra el error exacto"),
         ("General",  "tools / herramientas",    "Tabla de herramientas instaladas vs faltantes"),
         ("General",  "proxy [on/off/status]",   "Estado y control del enrutado por Tor/proxychains"),
         ("General",  "sudo [status|refresh|set|clear]", "Gestiona la password sudo. `sudo refresh` refresca el caché (15 min). `sudo set` almacena la password en memoria (no a disco) para que subagentes/autopilot la usen sin pedirla. `sudo clear` la borra."),
@@ -10664,8 +10709,14 @@ def print_models():
 
         caps = ", ".join(m.get("caps") or []) or "—"
 
-        name_cell = f"[bold {GREEN}]{m['id']}[/]" if is_active else m["id"]
-        table.add_row(str(i), marker, name_cell, state_cell, ctx_cell, caps)
+        model_id = rich_escape(str(m["id"]))
+        name_cell = (
+            f"[bold {GREEN}]{model_id}[/]" if is_active else model_id
+        )
+        table.add_row(
+            str(i), marker, name_cell, state_cell, ctx_cell,
+            rich_escape(str(caps)),
+        )
 
     console.print(table)
 
@@ -10817,7 +10868,10 @@ def _print_tools_master_menu():
     for name, size, n_tools, has_skill in entries:
         active = f"[bold {GREEN}]● activa[/]" if name in ACTIVE_SKILLS else "○ disponible"
         skill_cell = "[bold green]✓[/]" if has_skill else f"[{RED}]falta skill.md[/]"
-        table.add_row(name, str(n_tools), _human_size(size), skill_cell, active)
+        table.add_row(
+            rich_escape(str(name)), str(n_tools), _human_size(size),
+            skill_cell, active,
+        )
 
     console.print(table)
     console.print(
@@ -10853,7 +10907,10 @@ def print_skills_menu():
         else:
             master_cell = "[dim]—[/]"
 
-        table.add_row(marker, name, master_cell, desc)
+        table.add_row(
+            marker, rich_escape(str(name)), master_cell,
+            rich_escape(str(desc)),
+        )
 
     console.print(table)
     console.print(
@@ -11887,9 +11944,9 @@ def _repl_models(user_input, cmd_lower, first_word):
         return _REPL_HANDLED
     ok, msg = set_active_model(parts[1].strip())
     if ok:
-        console.print(f"[bold {GREEN}]✓[/] {msg}")
+        console.print(f"[bold {GREEN}]✓[/] {rich_escape(str(msg))}")
     else:
-        console.print(f"[bold {RED}]✗[/] {msg}")
+        console.print(f"[bold {RED}]✗[/] {rich_escape(str(msg))}")
     return _REPL_HANDLED
 
 
@@ -11910,16 +11967,84 @@ def _repl_backend(user_input, cmd_lower, first_word):
             note = ""
             if cfg.get("needs_key") and not os.environ.get("OLLAMA_API_KEY"):
                 note = "  [dim](falta OLLAMA_API_KEY)[/]"
-            console.print(f"  [bold {CYAN}]{mark}[/] {name:10} "
-                          f"{cfg['label']} · {cfg['base_url']}{note}")
+            console.print(
+                f"  [bold {CYAN}]{mark}[/] {name:10} "
+                f"{rich_escape(str(cfg['label']))} · "
+                f"{rich_escape(str(cfg['base_url']))}{note}"
+            )
         console.print(f"[dim]Cambiar: [bold {CYAN}]backend ollama[/] / "
                       f"[bold {CYAN}]backend lmstudio[/][/]")
+        console.print(f"[dim]Diagnóstico de conexión: "
+                      f"[bold {CYAN}]backend test[/][/]")
         return _REPL_HANDLED
+
+    if arg.lower() in ("test", "probar", "ping", "diag"):
+        cur = active_backend_cfg()
+        base = backend_base_url().rstrip("/")
+        console.print(
+            f"[bold {CYAN}]Backend:[/] {_ACTIVE_BACKEND} "
+            f"({rich_escape(str(cur['label']))}) → "
+            f"{rich_escape(base)}"
+        )
+        key = backend_api_key() if cur.get("needs_key") else ""
+        if cur.get("needs_key"):
+            console.print(
+                f"[dim]API key: "
+                f"{'presente' if key and key != 'ollama' else 'FALTA'}[/]"
+            )
+        headers = {}
+        if cur.get("needs_key") and key and key != "ollama":
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            r = requests.get(f"{base}/models", headers=headers, timeout=6)
+            r.raise_for_status()
+            ids = [
+                m.get("id") for m in r.json().get("data", [])
+                if m.get("id")
+            ]
+            console.print(
+                f"[bold {GREEN}]✓ conexión OK[/] · HTTP {r.status_code} · "
+                f"{len(ids)} modelo(s)"
+            )
+            for mid in ids[:8]:
+                console.print(f"  · {rich_escape(str(mid))}")
+            if len(ids) > 8:
+                console.print(f"  · … (+{len(ids) - 8})")
+        except Exception as e:
+            console.print(
+                f"[bold {RED}]✗ no conecta:[/] {rich_escape(str(e))}"
+            )
+            console.print(
+                f"[dim]Comprueba que el servidor esté sirviendo en "
+                f"{rich_escape(base)}, que el host/puerto sean alcanzables "
+                f"y el firewall. "
+                f"Para LM Studio: activa 'Serve on Local Network' y el "
+                f"puerto 1234. Para cambiar la URL sin editar código: "
+                f"LMSTUDIO_BASE_URL=http://host:1234/v1 en .env.[/]"
+            )
+        if _ACTIVE_BACKEND == "ollama":
+            root = base[:-3] if base.endswith("/v1") else base
+            try:
+                r = requests.get(
+                    f"{root}/api/tags", headers=headers, timeout=6,
+                )
+                console.print(
+                    f"[dim]GET {root}/api/tags → HTTP {r.status_code}[/]"
+                )
+                if r.status_code == 200:
+                    names = [
+                        m.get("name") for m in r.json().get("models", [])
+                    ]
+                    console.print(f"[dim]modelos nativos: {len(names)}[/]")
+            except Exception as e:
+                console.print(f"[dim]GET {root}/api/tags → error: {e}[/]")
+        return _REPL_HANDLED
+
     ok, msg = switch_backend(arg)
     if ok:
-        console.print(f"[bold {GREEN}]✓[/] {msg}")
+        console.print(f"[bold {GREEN}]✓[/] {rich_escape(str(msg))}")
     else:
-        console.print(f"[bold {RED}]✗[/] {msg}")
+        console.print(f"[bold {RED}]✗[/] {rich_escape(str(msg))}")
     return _REPL_HANDLED
 
 
@@ -12358,12 +12483,15 @@ def _repl_goal(user_input, cmd_lower, first_word):
                           if getattr(gr, "verifications", None) else None)
                 if last_v and last_v.get("results"):
                     crit_status = "\n[bold]Criterios:[/] " + " · ".join(
-                        ("✓ " if r["ok"] else "✗ ") + r["criterion"]
+                        ("✓ " if r["ok"] else "✗ ")
+                        + rich_escape(str(r["criterion"]))
                         for r in last_v["results"]
                     )
                 else:
-                    crit_status = ("\n[bold]Criterios:[/] "
-                                   + " · ".join(gr.criteria))
+                    crit_status = (
+                        "\n[bold]Criterios:[/] "
+                        + rich_escape(" · ".join(gr.criteria))
+                    )
             budget_status = ""
             if getattr(gr, "budget_commands", None):
                 b = _goal_budget_status(gr)
@@ -12373,21 +12501,24 @@ def _repl_goal(user_input, cmd_lower, first_word):
                     f"{b['commands_used']}/{b['budget_commands']} cmds"
                 )
             console.print(Panel(
-                f"[bold]Goal:[/] {gr.goal}\n"
+                f"[bold]Goal:[/] {rich_escape(str(gr.goal))}\n"
                 f"[bold]Estado:[/] [{status_color}]{gr.status}[/]  ·  "
                 f"Fase: {gr.current_phase}/{gr.max_phases}\n"
-                f"[bold]Target:[/] [bold {PURPLE}]{gr.target or '(ninguno — modo ad-hoc)'}[/]  ·  "
-                f"Started: {gr.started_at}\n"
+                f"[bold]Target:[/] [bold {PURPLE}]"
+                f"{rich_escape(str(gr.target or '(ninguno — modo ad-hoc)'))}"
+                f"[/]  ·  Started: {gr.started_at}\n"
                 f"[bold]Subagentes por fase:[/] "
                 + " · ".join(
                     f"F{ph['n']}={len(ph.get('subagent_names', []))}"
                     for ph in gr.phases
                 ) + crit_status + budget_status + (
-                    f"\n[bold]Motivo:[/] {gr.outcome_reason}"
+                    f"\n[bold]Motivo:[/] "
+                    f"{rich_escape(str(gr.outcome_reason))}"
                     if gr.outcome_reason else ""
                 ) + (
                     f"\n[dim]Log: "
-                    f"{os.path.relpath(gr.log_path, WORKSPACE)}[/]"
+                    f"{rich_escape(os.path.relpath(gr.log_path, WORKSPACE))}"
+                    f"[/]"
                 ),
                 title=f"[bold {PURPLE}]Goal orchestrator[/]",
                 border_style=PURPLE, box=ROUNDED, padding=(1, 2),
@@ -12442,15 +12573,15 @@ def _repl_goal(user_input, cmd_lower, first_word):
         }
         for g in persisted[:30]:
             c = color_map.get(g.get("status", ""), "white")
-            goal_short = g.get("goal", "")[:60]
+            goal_short = rich_escape(str(g.get("goal", "")[:60]))
             if len(g.get("goal", "")) > 60:
                 goal_short += "…"
             table.add_row(
-                g.get("id", "?"),
-                f"[{c}]{g.get('status', '?')}[/]",
-                g.get("target", "?"),
+                rich_escape(str(g.get("id", "?"))),
+                f"[{c}]{rich_escape(str(g.get('status', '?')))}[/]",
+                rich_escape(str(g.get("target", "?"))),
                 f"{g.get('current_phase', 0)}/{g.get('max_phases', '?')}",
-                g.get("started_at", "?")[:16],
+                rich_escape(str(g.get("started_at", "?"))[:16]),
                 goal_short,
             )
         console.print(table)
@@ -12476,20 +12607,23 @@ def _repl_goal(user_input, cmd_lower, first_word):
             target_id = orphans[0].get("id")
             console.print(
                 f"[dim]› Reanudando el huérfano más reciente: "
-                f"[bold]{target_id}[/][/]"
+                f"[bold]{rich_escape(str(target_id))}[/][/]"
             )
         gr, err = resume_goal(target_id)
         if err:
-            console.print(f"[{RED}]✗ {err}[/]")
+            console.print(f"[{RED}]✗ {rich_escape(str(err))}[/]")
         else:
             n_done = len(gr.phases)
             n_left = gr.max_phases - gr.current_phase
             console.print()
             console.print(Panel(
-                f"[bold {GREEN}]✓ Goal '{gr.id}' reanudado[/]\n\n"
-                f"[bold {WHITE}]Goal:[/] {gr.goal[:200]}"
+                f"[bold {GREEN}]✓ Goal "
+                f"'{rich_escape(str(gr.id))}' reanudado[/]\n\n"
+                f"[bold {WHITE}]Goal:[/] "
+                f"{rich_escape(str(gr.goal[:200]))}"
                 f"{'…' if len(gr.goal) > 200 else ''}\n"
-                f"[bold {WHITE}]Target:[/] {gr.target}\n"
+                f"[bold {WHITE}]Target:[/] "
+                f"{rich_escape(str(gr.target))}\n"
                 f"[bold {WHITE}]Fases completadas previamente:[/] "
                 f"{n_done} ({', '.join('F'+str(p['n']) for p in gr.phases) or 'ninguna'})\n"
                 f"[bold {WHITE}]Fases restantes:[/] {n_left}\n\n"
@@ -13008,23 +13142,28 @@ def _repl_resume(user_input, cmd_lower, first_word):
             user_disp = last_user.strip()
             if len(user_disp) > USER_CAP:
                 user_disp = user_disp[:USER_CAP] + f"\n\n[…+{len(last_user) - USER_CAP} chars…]"
-            body = [f"[bold {CYAN}]Tú dijiste:[/]\n{user_disp}"]
+            # Construimos un Text plano: el contenido del modelo puede
+            # contener `[[TARGET_UPDATE]]`, `[/TARGET_UPDATE]`, `[FILE_*]`,
+            # etc. y Rich los interpretaría como etiquetas de estilo.
+            body = Text()
+            body.append("Tú dijiste:\n", style=f"bold {CYAN}")
+            body.append(user_disp)
             if last_assistant:
                 ass_disp = last_assistant.strip()
                 if len(ass_disp) > ASS_CAP:
                     ass_disp = ass_disp[:ASS_CAP] + f"\n\n[…+{len(last_assistant) - ASS_CAP} chars…]"
-                body.append("")
-                body.append(f"[bold {ORANGE}]Agente respondió:[/]")
+                body.append("\n\n")
+                body.append("Agente respondió:\n", style=f"bold {ORANGE}")
                 body.append(ass_disp)
             else:
-                body.append("")
+                body.append("\n\n")
                 body.append(
-                    f"[dim](el agente no llegó a responder a este "
-                    f"último prompt)[/]"
+                    "(el agente no llegó a responder a este último prompt)",
+                    style="dim",
                 )
             console.print()
             console.print(Panel(
-                "\n".join(body),
+                body,
                 title=f"[bold {CYAN}]» Último intercambio de la sesión «[/]",
                 border_style=CYAN, box=ROUNDED, padding=(1, 2),
             ))
@@ -13316,22 +13455,35 @@ def _print_swarm_goal_status(state: dict):
         "pending": CYAN,
     }.get(state.get("status", ""), WHITE)
     criteria = state.get("criteria") or []
-    crit_str = "\n".join(f"  · {c}" for c in criteria) or "  (sin criterios)"
+    crit_str = (
+        "\n".join(f"  · {rich_escape(str(c))}" for c in criteria)
+        or "  (sin criterios)"
+    )
     budget = state.get("budget") or {}
     lines = [
-        f"[bold]Goal:[/] {state.get('goal', '')[:300]}",
+        f"[bold]Goal:[/] "
+        f"{rich_escape(str(state.get('goal', '')[:300]))}",
         f"[bold]Estado:[/] [{color}]{state.get('status', '?')}[/]  ·  "
         f"Ronda {state.get('rounds', 0)}/{state.get('max_rounds', '?')}",
-        f"[bold]Target:[/] [bold {PURPLE}]{state.get('target') or '(ad-hoc)'}[/]",
+        f"[bold]Target:[/] [bold {PURPLE}]"
+        f"{rich_escape(str(state.get('target') or '(ad-hoc)'))}[/]",
         f"[bold]Criterios:[/]\n{crit_str}",
         f"[bold]Presupuesto:[/] {budget.get('elapsed_s', 0)/60:.0f} min · "
-        f"{budget.get('commands_used', 0)}/{budget.get('budget_commands', '?')} comandos",
-        f"[bold]Motivo:[/] {state.get('outcome_reason') or '—'}",
+        f"{budget.get('commands_used', 0)}/"
+        f"{budget.get('budget_commands', '?')} comandos",
+        f"[bold]Motivo:[/] "
+        f"{rich_escape(str(state.get('outcome_reason') or '—'))}",
     ]
     if state.get("summary"):
-        lines.append(f"[bold]Resumen:[/] {state['summary'][:500]}")
+        lines.append(
+            f"[bold]Resumen:[/] "
+            f"{rich_escape(str(state['summary'][:500]))}"
+        )
     if state.get("report_path"):
-        lines.append(f"[bold]Informe:[/] {state['report_path']}")
+        lines.append(
+            f"[bold]Informe:[/] "
+            f"{rich_escape(str(state['report_path']))}"
+        )
     console.print(Panel(
         "\n".join(lines),
         title=f"[bold {PURPLE}]Swarm goal[/]",
@@ -13384,10 +13536,11 @@ def _repl_swarm_goal(rest):
         for g in goals[:30]:
             spec = g.get("spec") or {}
             table.add_row(
-                g.get("id", "?"), g.get("status", "?"),
-                spec.get("target") or "—",
+                rich_escape(str(g.get("id", "?"))),
+                rich_escape(str(g.get("status", "?"))),
+                rich_escape(str(spec.get("target") or "—")),
                 f"{g.get('rounds', 0)}/{spec.get('max_rounds', '?')}",
-                (spec.get("goal") or "")[:100],
+                rich_escape(str((spec.get("goal") or "")[:100])),
             )
         console.print(table)
         return _REPL_HANDLED
@@ -13582,12 +13735,15 @@ def _repl_swarm_goal(rest):
     _SWARM_GOAL.start()
     console.print()
     console.print(Panel(
-        f"[bold {GREEN}]✓ swarm goal lanzado · id {_SWARM_GOAL.id}[/]\n\n"
-        f"[bold]Objetivo:[/] {sg_spec.goal[:300]}\n"
-        f"[bold]Target:[/] {sg_spec.target or '(ad-hoc)'}\n"
-        f"[bold]Scope:[/] {_SWARM.scope.describe()}\n"
+        f"[bold {GREEN}]✓ swarm goal lanzado · id "
+        f"{rich_escape(str(_SWARM_GOAL.id))}[/]\n\n"
+        f"[bold]Objetivo:[/] {rich_escape(str(sg_spec.goal[:300]))}\n"
+        f"[bold]Target:[/] "
+        f"{rich_escape(str(sg_spec.target or '(ad-hoc)'))}\n"
+        f"[bold]Scope:[/] "
+        f"{rich_escape(_SWARM.scope.describe())}\n"
         f"[bold]Criterios:[/] "
-        f"{'; '.join(sg_spec.criteria) if sg_spec.criteria else '(el planner decide)'}\n"
+        f"{rich_escape('; '.join(sg_spec.criteria)) if sg_spec.criteria else '(el planner decide)'}\n"
         f"[bold]Presupuesto:[/] {sg_spec.budget_seconds/3600:.1f}h · "
         f"{sg_spec.budget_commands} comandos · {sg_spec.max_rounds} rondas\n\n"
         f"[dim]El planner LLM encola tareas de recon en el worker permanente, "
@@ -13747,7 +13903,7 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         _SWARM.start()
         console.print()
         console.print(Panel(
-            _SWARM.format_status(),
+            rich_escape(_SWARM.format_status()),
             title=f"[bold {GREEN}]» Enjambre iniciado[/]",
             border_style=GREEN, box=ROUNDED, padding=(1, 2),
         ))
@@ -13776,7 +13932,7 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         if not _swarm_require():
             return _REPL_HANDLED
         console.print(Panel(
-            _SWARM.format_status(),
+            rich_escape(_SWARM.format_status()),
             title=f"[bold {PURPLE}]Enjambre[/]",
             border_style=PURPLE, box=ROUNDED, padding=(1, 2),
         ))
@@ -13791,7 +13947,9 @@ def _repl_swarm(user_input, cmd_lower, first_word):
             console.print(f"[dim]Scope vacío: no hay plan que generar.[/]")
         else:
             console.print(Panel(
-                "\n".join(f"  · {c}" for c in cmds),
+                "\n".join(
+                    f"  · {rich_escape(str(c))}" for c in cmds
+                ),
                 title=f"[bold {CYAN}]Plan de recon "
                       f"({'encolado' if enqueue else 'dry-run'})[/]",
                 border_style=CYAN, box=ROUNDED, padding=(1, 2),
@@ -13806,10 +13964,16 @@ def _repl_swarm(user_input, cmd_lower, first_word):
             return _REPL_HANDLED
         tid, decision = _SWARM.submit_recon_task(rest)
         if tid:
-            console.print(f"[bold {GREEN}]✓ tarea #{tid} encolada[/] · "
-                          f"nivel {int(decision.level)} · {decision.reason}")
+            console.print(
+                f"[bold {GREEN}]✓ tarea #{tid} encolada[/] · "
+                f"nivel {int(decision.level)} · "
+                f"{rich_escape(str(decision.reason))}"
+            )
         else:
-            console.print(f"[bold {RED}]✗ rechazada:[/] {decision.reason}")
+            console.print(
+                f"[bold {RED}]✗ rechazada:[/] "
+                f"{rich_escape(str(decision.reason))}"
+            )
         return _REPL_HANDLED
 
     if action in ("finding", "hallazgo"):
@@ -13903,8 +14067,12 @@ def _repl_swarm(user_input, cmd_lower, first_word):
             table.add_column("Target", no_wrap=True)
             table.add_column("Título", style=WHITE)
             for f in findings:
-                table.add_row(str(f.id), f.severity, f.status,
-                              f.target or "—", f.title[:100])
+                table.add_row(
+                    str(f.id), rich_escape(str(f.severity)),
+                    rich_escape(str(f.status)),
+                    rich_escape(str(f.target or "—")),
+                    rich_escape(str(f.title[:100])),
+                )
             console.print(table)
         return _REPL_HANDLED
 
@@ -13923,8 +14091,12 @@ def _repl_swarm(user_input, cmd_lower, first_word):
             table.add_column("Prio", no_wrap=True)
             table.add_column("Comando", style=WHITE)
             for t in tasks:
-                table.add_row(str(t.id), t.role, t.status, str(t.priority),
-                              (t.command or f"validate #{t.finding_id}")[:100])
+                cmd = (t.command or f"validate #{t.finding_id}")[:100]
+                table.add_row(
+                    str(t.id), rich_escape(str(t.role)),
+                    rich_escape(str(t.status)), str(t.priority),
+                    rich_escape(str(cmd)),
+                )
             console.print(table)
         return _REPL_HANDLED
 
@@ -13936,10 +14108,15 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         except ValueError:
             n = 20
         for e in _SWARM.store.list_events(n):
+            payload = json.dumps(
+                e.get("payload", {}), ensure_ascii=False,
+            )[:160]
             console.print(
-                f"[dim]{e['ts']}[/] [{CYAN}]{e['type']}[/] "
-                f"{e.get('agent') or ''} #{e.get('task_id') or ''} "
-                f"{json.dumps(e.get('payload', {}), ensure_ascii=False)[:160]}"
+                f"[dim]{rich_escape(str(e['ts']))}[/] "
+                f"[{CYAN}]{rich_escape(str(e['type']))}[/] "
+                f"{rich_escape(str(e.get('agent') or ''))} "
+                f"#{rich_escape(str(e.get('task_id') or ''))} "
+                f"{rich_escape(payload)}"
             )
         return _REPL_HANDLED
 
@@ -13953,7 +14130,10 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         target_b = parts[2].strip()
         reason = parts[3].strip() if len(parts) > 3 else ""
         _SWARM.block_target(target_b, reason)
-        console.print(f"[bold {RED}]⛔ target bloqueado:[/] {target_b}")
+        console.print(
+            f"[bold {RED}]⛔ target bloqueado:[/] "
+            f"{rich_escape(str(target_b))}"
+        )
         return _REPL_HANDLED
 
     if action in ("unblock", "desbloquear"):
@@ -13961,8 +14141,12 @@ def _repl_swarm(user_input, cmd_lower, first_word):
             return _REPL_HANDLED
         target_b = rest.strip() or None
         _SWARM.clear_blocks(target_b)
-        console.print(f"[bold {CYAN}]Bloqueos desactivados"
-                      f"{' para ' + target_b if target_b else ''}.[/]")
+        target_txt = (
+            " para " + rich_escape(str(target_b)) if target_b else ""
+        )
+        console.print(
+            f"[bold {CYAN}]Bloqueos desactivados{target_txt}.[/]"
+        )
         return _REPL_HANDLED
 
     console.print(

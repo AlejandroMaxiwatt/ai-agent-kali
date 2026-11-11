@@ -67,18 +67,19 @@ Edita las constantes al principio de `agent.py`:
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `LMSTUDIO_BASE_URL` | `http://127.0.0.1:1234/v1` | Endpoint de LM Studio |
-| `MODEL_NAME_FALLBACK` | `qwen/qwen3.6-27b` | Modelo a usar si LM Studio no expone ninguno |
+| `LMSTUDIO_BASE_URL` | `http://lmstudio-oficina:1234/v1` | Endpoint de LM Studio. **Configurable en `.env`** (`LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1`) |
+| `MODEL_NAME_FALLBACK` | modelo local por defecto | Modelo a usar si el backend no expone ninguno. Override en `.env` |
+| `OLLAMA_BASE_URL` / `OLLAMA_API_KEY` | `https://ollama.com/v1` | Backend cloud OpenAI-compatible |
 | `WORKSPACE` | `~/ai-agent-kali` | Ruta del proyecto |
 | `AUTO_EXECUTE` | `True` | Auto-ejecuta comandos `safe` sin confirmación |
-| `MAX_CONTEXT_TOKENS` | `65536` | Context window del modelo |
+| `MAX_CONTEXT_TOKENS` | `34196` | Fallback de context window si el backend no expone metadatos |
 | `COMMAND_TIMEOUT_S` | `300` | Timeout base por comando shell (s) |
 | `COMMAND_TIMEOUT_S_LARGE` | `1800` | Timeout extendido para wordlists ≥ 5000 líneas |
 | `WORDLIST_MEDIUM_THRESHOLD_LINES` | `5000` | Líneas a partir de las que un wordlist se considera medio/grande |
 | `MAX_CONCURRENT_SUBAGENTS` | `3` | Subagentes simultáneos máximo |
 | `SUBAGENT_DEFAULT_MAX_TURNS` | `12` | Turnos LLM por subagente antes de "exhausted" |
-| `GOAL_MAX_PHASES` | `5` | Fases máximas del orquestador |
-| `GOAL_PHASE_TIMEOUT_S` | `1800` | Timeout por fase del orquestador (s) |
+| `GOAL_MAX_PHASES` | `12` | Fases máximas del orquestador |
+| `GOAL_PHASE_TIMEOUT_S` | `7200` | Timeout por fase del orquestador (s) |
 | `PROXY_MODE` | `"proxychains"` | Routing: `"proxychains"`, `"torify"`, `"off"` |
 | `STREAM_COMMAND_OUTPUT` | `False` | Stream línea a línea de stdout/stderr (vs panel al final) |
 | `TROUBLESHOOT_AUTOPILOT` | `True` | Auto-fix de comandos fallidos vía LLM (ver [auto-troubleshooting](#auto-troubleshooting-autopilot)) |
@@ -743,10 +744,21 @@ Las faltantes se pueden auto-instalar cuando el modelo intente usarlas (auto-ins
 > La fuente del terminal no soporta los símbolos Unicode que chafa usa. Solución: instala una Nerd Font (FiraCode, JetBrains Mono Nerd Font) o usa kitty.
 
 **El agente no se conecta al modelo**
+> 1. En el REPL: `backend test` — muestra la URL efectiva y el error exacto.
+> 2. Comprueba resolución y puerto:
 > ```bash
-> curl http://127.0.0.1:1234/v1/models
+> getent hosts lmstudio-oficina
+> curl -m 5 http://lmstudio-oficina:1234/v1/models
+> ss -ltn | grep 1234
 > ```
-> Si LM Studio está en otra máquina, edita `LMSTUDIO_BASE_URL` en `agent.py`.
+> 3. Si LM Studio está en otra máquina, configura la URL en `.env` (sin editar código):
+> ```bash
+> LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1     # LM Studio en esta máquina
+> LMSTUDIO_BASE_URL=http://it1-pc:1234/v1        # tailnet/LAN
+> LMSTUDIO_BASE_URL=http://192.168.1.20:1234/v1  # LAN
+> ```
+> 4. En LM Studio activa **Serve on Local Network**, puerto 1234, y permite el puerto en el firewall.
+> 5. Fallback cloud: `backend ollama` (requiere `OLLAMA_API_KEY` en `.env`).
 
 **El goal falla con "Modelo devolvió respuesta VACÍA"**
 > El prompt del orquestador supera el context window real del modelo. El agente reintenta automáticamente con prompt MINIMAL (sólo attack-surface + notes + identities, head corto). Si aun así falla, revisa el log en `memory/subagents/_goal-<id>.log`, baja `MAX_CONTEXT_TOKENS` para coincidir con el modelo real, o usa un modelo con context window más grande.
