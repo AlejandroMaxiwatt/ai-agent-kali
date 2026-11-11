@@ -2886,10 +2886,6 @@ def _goal_run_loop(goal_run):
         # SNAPSHOT FINAL con status terminal + report_path.
         goal_run.save_state()
         _subagent_thread_marker.active = False
-        with _goal_lock:
-            global _active_goal_orch
-            if _active_goal_orch is goal_run:
-                pass  # se queda referenciado hasta el próximo `goal new`
 
 
 def start_goal(goal_text, max_phases=GOAL_MAX_PHASES):
@@ -5148,7 +5144,6 @@ def get_max_context_tokens():
     consulta `/api/show`; para LM Studio usa los metadatos nativos. Si no
     hay metadatos, cae a `MAX_CONTEXT_TOKENS`.
     """
-    global _LAST_ACTIVE_MODEL
     backend = _ACTIVE_BACKEND
     model = _LAST_ACTIVE_MODEL
     if not model:
@@ -5536,30 +5531,6 @@ def is_kitty_terminal():
     )
 
 
-def render_kitty_emblem_raw(width=60, height=32):
-    """Devuelve los bytes raw del protocolo kitty graphics, o None si falla."""
-    if shutil.which("chafa") is None or not os.path.isfile(EMBLEM_PATH):
-        return None, 0, 0
-    try:
-        result = subprocess.run(
-            [
-                "chafa",
-                f"--size={width}x{height}",
-                "--format=kitty",
-                "--polite=on",
-                EMBLEM_PATH,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0 or not result.stdout:
-            return None, 0, 0
-        return result.stdout, width, height
-    except Exception:
-        return None, 0, 0
-
-
 def display_kitty_emblem_inline():
     """
     Renderiza el emblema usando 'kitten icat' nativo de kitty.
@@ -5843,12 +5814,22 @@ def build_commands_panel():
         ]),
         ("Orquestación", [
             ("goal <descripción>",      "Orquesta fases hasta cumplir el objetivo"),
+            ("goal … || criteria: …",   "Criterios verificables + presupuesto"),
             ("goal status",             "Estado del goal en curso"),
             ("goal show",               "Panel resumen del goal"),
             ("goal list",               "Lista goals persistidos en disco"),
             ("goal resume [<id>]",      "Reanuda goal interrumpido"),
             ("goal discard <id>",       "Borra estado persistido"),
             ("goal kill",               "Detiene la orquestación"),
+            ("auto [on|off|steps N]",   "Auto-continuación del agente principal"),
+        ]),
+        ("Enjambre", [
+            ("swarm start [--target] [--scope]", "Recon + Guardian permanentes"),
+            ("swarm status / stop",     "Estado / detener el enjambre"),
+            ("swarm plan / task <cmd>", "Plan de recon / encolar tarea"),
+            ("swarm finding add <título>", "Hallazgo pendiente de validación"),
+            ("swarm findings / queue / events", "Consultar hallazgos / cola / eventos"),
+            ("swarm validate / cancel / block", "Validar / cancelar / bloquear"),
         ]),
         ("Targets", [
             ("target / objetivo",       "Lista targets · ●=activo"),
@@ -5876,7 +5857,9 @@ def build_commands_panel():
         sub.add_column(justify="left",  style=f"bold {CYAN}", no_wrap=True)
         sub.add_column(justify="left",  style=WHITE)
         for cmd, desc in rows:
-            sub.add_row(cmd, desc)
+            # Escapamos los corchetes de placeholders (\[--target], etc.)
+            # para que Rich no los trate como etiquetas de estilo.
+            sub.add_row(rich_escape(cmd), desc)
 
         block = Group(
             Text(title, style=f"bold {PURPLE}"),
@@ -9293,7 +9276,6 @@ def _handle_agent_meta_action(fix_cmd, proxy_mode=None):
       agent:tor restart          → reinicia el servicio tor (sudo)
       agent:learn <texto>        → guarda <texto> como lección persistente
     """
-    global PROXY_MODE
     scoped = proxy_mode is not None
     raw = (fix_cmd or "").strip()
     norm = raw.lower()
@@ -10334,14 +10316,21 @@ def print_help():
 [bold {WHITE}]comandos / commands[/bold {WHITE}]     Tabla compacta con todos los comandos.
 [bold {WHITE}]refresh / refrescar[/bold {WHITE}]     Redibuja el splash.
 [bold {WHITE}]clear / limpiar[/bold {WHITE}]         Igual que refresh.
-[bold {WHITE}]models [nombre|índice][/bold {WHITE}]  Lista modelos de LM Studio (con estado/contexto) y marca el activo.
+[bold {WHITE}]models \\[nombre|índice][/bold {WHITE}]  Lista modelos de LM Studio (con estado/contexto) y marca el activo.
                         Con argumento cambia el modelo activo: `models 2` o `models qwen`.
                         `models auto` vuelve al modo automático (primer modelo cargado).
-[bold {WHITE}]backend [nombre][/bold {WHITE}]        Cambia el backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local).
+[bold {WHITE}]backend \\[nombre][/bold {WHITE}]        Cambia el backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local).
                         Sin argumento muestra el backend activo y las opciones. Ollama Cloud usa OLLAMA_API_KEY.
 [bold {WHITE}]tools / herramientas[/bold {WHITE}]    Herramientas instaladas y faltantes.
-[bold {WHITE}]proxy [on/off/status][/bold {WHITE}]   Estado y control del enrutado por Tor/proxychains.
+[bold {WHITE}]proxy \\[on/off/status][/bold {WHITE}]   Estado y control del enrutado por Tor/proxychains.
 [bold {WHITE}]salir / exit / quit[/bold {WHITE}]     Cierra el agente.
+
+[bold {ORANGE}]Autonomía[/bold {ORANGE}]
+
+[bold {WHITE}]auto \\[on|off|status|steps <N>|N][/bold {WHITE}]
+                        Modo autónomo del agente principal: tras cada COMANDO analiza la
+                        salida y ejecuta el siguiente sin esperar input. `auto steps N` cambia
+                        el límite de pasos por turno (default 20).
 
 [bold {ORANGE}]Skills[/bold {ORANGE}]
 
@@ -10349,6 +10338,30 @@ def print_help():
 [bold {WHITE}]tools_master / master[/bold {WHITE}]   Lista las listas exhaustivas de herramientas en tools_master/.
 [bold {WHITE}]use / usar <skill>[/bold {WHITE}]      Activa una skill (inyecta su contenido + su lista master si existe).
 [bold {WHITE}]unuse / quitar <skill>[/bold {WHITE}]  Desactiva una skill activa.
+
+[bold {ORANGE}]Subagentes y orquestación[/bold {ORANGE}]
+
+[bold {WHITE}]subagent new <nombre> <skill> <tarea>[/bold {WHITE}]  Lanza un mini-agente autónomo.
+[bold {WHITE}]subagent list / show <n> / kill <n>[/bold {WHITE}]     Lista, muestra o detiene subagentes.
+[bold {WHITE}]goal <descripción>[/bold {WHITE}]                     Orquestador multi-fase hasta cumplir el objetivo.
+[bold {WHITE}]goal … || criteria: … || budget: …[/bold {WHITE}]     Criterios verificables (file_exists, cmd_rc, port_open…)
+                        y presupuesto (tiempo/comandos). El agente NO acepta GOAL_DONE si fallan.
+[bold {WHITE}]goal spec <ruta>[/bold {WHITE}]                      Carga el objetivo desde un archivo.
+[bold {WHITE}]goal status / show / list / kill[/bold {WHITE}]      Estado, panel, goals persistidos y parada.
+[bold {WHITE}]goal resume <id> / discard <id>[/bold {WHITE}]       Reanuda o borra el estado de un goal.
+
+[bold {ORANGE}]Enjambre (Recon + Guardian)[/bold {ORANGE}]
+
+[bold {WHITE}]swarm start \\[--target X] \\[--scope ruta] \\[--level 1-2] \\[--llm][/bold {WHITE}]
+                        Inicia los dos workers permanentes y el orquestador determinista.
+[bold {WHITE}]swarm start … --store postgres --dsn <DSN> --redis <URL>[/bold {WHITE}]
+                        Memoria compartida PostgreSQL y eventos Redis Streams (opcionales).
+[bold {WHITE}]swarm status / stop[/bold {WHITE}]                   Estado de workers/colas/hallazgos · detener.
+[bold {WHITE}]swarm plan \\[--enqueue] / task <comando>[/bold {WHITE}]  Plan de recon desde el scope · encolar tarea.
+[bold {WHITE}]swarm finding add <título> / evidence <id> <ruta>[/bold {WHITE}]  Registrar hallazgo y evidencia.
+[bold {WHITE}]swarm findings \\[estado] / queue \\[rol] / events \\[N][/bold {WHITE}]  Consultar hallazgos, cola y eventos.
+[bold {WHITE}]swarm validate <id> / cancel <id>[/bold {WHITE}]     Validar con el Guardian · cancelar tarea.
+[bold {WHITE}]swarm block <target> <motivo> / unblock <target>[/bold {WHITE}]  Bloquear/desbloquear en políticas.
 
 [bold {ORANGE}]Targets (contexto del objetivo)[/bold {ORANGE}]
 
@@ -13636,7 +13649,6 @@ def main(argv=None):
     # silencioso a input() (sin toolbar live, pero auto-attach sigue OK).
     try:
         from prompt_toolkit import PromptSession
-        from prompt_toolkit.formatted_text import ANSI
         _pt_session = PromptSession()
         _pt_available = True
     except ImportError:

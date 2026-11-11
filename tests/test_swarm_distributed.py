@@ -14,17 +14,10 @@ import tempfile
 import time
 import unittest
 
-try:
-    import psycopg2  # noqa: F401
-    HAS_PSYCOPG = True
-except Exception:
-    HAS_PSYCOPG = False
+import importlib.util
 
-try:
-    import redis  # noqa: F401
-    HAS_REDIS = True
-except Exception:
-    HAS_REDIS = False
+HAS_PSYCOPG = importlib.util.find_spec("psycopg2") is not None
+HAS_REDIS = importlib.util.find_spec("redis") is not None
 
 
 def _free_port():

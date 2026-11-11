@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import threading
 from enum import IntEnum
 
 
@@ -26,9 +25,6 @@ class PolicyDecision:
     fingerprint: str = ""
     duplicate_of: int | None = None
     target: str | None = None
-
-    def as_dict(self) -> dict:
-        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass

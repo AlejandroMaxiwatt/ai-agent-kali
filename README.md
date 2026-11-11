@@ -181,6 +181,7 @@ Indicadores extra:
 | `models` / `modelos` | Modelos expuestos por LM Studio |
 | `tools` / `herramientas` | Tabla categorizada de las **137 herramientas** que el agente reconoce (17 categorías) con instaladas/faltantes |
 | `compact` / `compactar` | Compacta history (acelera prefill del modelo en sesiones largas) |
+| `auto [on\|off\|status\|steps <N>]` | Modo autónomo del agente principal: tras cada COMANDO analiza y ejecuta el siguiente sin esperar input. `auto steps 50` cambia el límite por turno |
 | `copy [n]` / `c [n]` / `copiar [n]` | Copia el último comando propuesto (o el n-ésimo desde el final) al portapapeles vía OSC 52 + fallbacks nativos (xclip, wl-copy, pbcopy) |
 | `salir` / `exit` / `quit` | Cierra el agente |
 
@@ -337,6 +338,8 @@ Orquestador que recibe un objetivo en lenguaje natural y lo ejecuta en fases ite
 | Comando | Acción |
 |---|---|
 | `goal <descripción>` | Lanza el orquestador en background |
+| `goal <desc> \|\| criteria: … \|\| budget: …` | Añade criterios verificables (`file_exists`, `file_contains`, `cmd_rc`, `port_open`…) y presupuesto (tiempo/comandos). El `GOAL_DONE` se rechaza si fallan |
+| `goal spec <ruta>` | Carga la especificación desde un archivo (soporta formato por líneas) |
 | `goal status` | Estado actual (fase, subagentes lanzados, motivo) |
 | `goal show` | Panel-resumen completo |
 | `goal kill` | Detiene goal y subagentes de la fase actual |
@@ -389,6 +392,39 @@ Terminal bell + panel grande con:
 - Detecta respuesta vacía y reporta causa específica (prompt grande / modelo sobrecargado).
 - Excluye `_timeline.md` del prompt del orquestador (160 kB típicos, no aporta a planificar).
 - El informe automático se genera incluso si el goal terminó EXHAUSTED — y se le pide al LLM que **rebata la decisión del orquestador** si hay un vector en `notes.md`.
+
+### Enjambre (Recon + Guardian)
+
+Arquitectura de **1 agente principal + 2 workers permanentes**:
+
+- **ReconWorker**: procesa una cola de reconocimiento, extrae activos/hallazgos y encola seguimientos.
+- **GuardianWorker**: valida hallazgos con evidencia y alcance; confirma, rechaza o pide más evidencia.
+- **PolicyEngine**: motor determinista fuera de los modelos; alcance, niveles 1–4, duplicados, rate limits y bloqueos.
+- **Memoria**: SQLite local (`memory/swarm/<target>.db`) o PostgreSQL; eventos opcionales en Redis Streams.
+
+| Comando | Acción |
+|---|---|
+| `swarm start [--target X] [--scope ruta] [--level 1-2] [--llm]` | Inicia Recon + Guardian y el orquestador |
+| `swarm start … --store postgres --dsn <DSN> --redis <URL>` | Versión distribuida (PostgreSQL + Redis Streams) |
+| `swarm status` / `swarm stop` | Estado de workers/colas/hallazgos · detener |
+| `swarm plan [--enqueue]` | Genera el plan de recon desde el scope |
+| `swarm task <comando>` | Encola una tarea de reconocimiento |
+| `swarm finding add <título>` | Registra un hallazgo pendiente de validación |
+| `swarm evidence <id> <ruta>` | Adjunta evidencia (hash SHA-256) |
+| `swarm validate <id>` | Pide validación al Guardian |
+| `swarm cancel <id>` | Cancela una tarea pendiente o mata la que está en ejecución |
+| `swarm findings [estado]` · `swarm queue [rol]` · `swarm events [N]` | Consultar hallazgos, cola y eventos |
+| `swarm block <target> <motivo>` / `swarm unblock <target>` | Bloquear/desbloquear un target en el motor de políticas |
+
+El agente principal puede emitir una línea `FINDING: <sev> | <título> | <claim>`; el orquestador la registra y el Guardian la valida. En el prompt recibe un bloque `[ENJAMBRE · contexto validado]` con confirmados, pendientes y rechazados.
+
+Visor de solo lectura:
+
+```bash
+python3 scripts/swarm_db.py --list
+python3 scripts/swarm_db.py --target acme --section all
+python3 scripts/swarm_db.py --target acme --sql "SELECT id,status,title FROM findings"
+```
 
 ### VSCode/Cursor bridge
 
@@ -635,10 +671,22 @@ Las faltantes se pueden auto-instalar cuando el modelo intente usarlas (auto-ins
 
 ```
 ~/ai-agent-kali/
-├── agent.py                         # Script principal
+├── agent.py                         # Script principal (harness + REPL)
 ├── README.md                        # Este archivo
 ├── venv/                            # Entorno virtual Python
 ├── assets/                          # Imágenes para splash
+├── prompts/system.md                # System prompt versionado
+├── agent_core/                      # CommandResult + GoalSpec/verificador
+├── agent_swarm/                     # 1 principal + 2 workers permanentes
+│   ├── orchestrator.py              # orquestador determinista
+│   ├── policy.py                    # alcance, niveles, duplicados, rate limits
+│   ├── store.py / postgres_store.py # memoria compartida
+│   ├── event_bus.py                 # eventos en proceso / Redis Streams
+│   └── workers.py                   # ReconWorker + GuardianWorker
+├── docs/                            # Arquitectura y documentación
+├── tests/                           # Suite (67 tests)
+├── scripts/                         # run_tests.sh, swarm_db.py, túnel SSH
+├── herramientas/                    # herramientas locales (typo3-brute-tor)
 │
 ├── skills/                          # Skills cargables (use <nombre>)
 │   ├── recon/skill.md

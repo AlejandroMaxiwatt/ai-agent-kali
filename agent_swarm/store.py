@@ -14,7 +14,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 
-from .models import (Asset, Decision, Evidence, Finding, Task)
+from .models import Decision, Evidence, Finding, Task
 
 
 def _now() -> str:
@@ -273,15 +273,6 @@ class Store:
             )
             self._conn.commit()
             return True
-
-    def requeue_task(self, task_id: int):
-        with self._lock:
-            self._conn.execute(
-                """UPDATE tasks SET status='pending', started_at='',
-                   finished_at='' WHERE id=?""",
-                (task_id,),
-            )
-            self._conn.commit()
 
     def get_task(self, task_id: int) -> Task | None:
         with self._lock:

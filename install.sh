@@ -299,7 +299,7 @@ download_project() {
         --exclude='__pycache__/'    --exclude='*.pyc'
         --exclude='.env'            --exclude='.env.local' --exclude='.env.*.local'
         --exclude='privkey.pem'     --exclude='*.pem'
-        --exclude='agent_old.py'    --exclude='theharvester_*'
+        --exclude='theharvester_*'
         --exclude='reports/'        --exclude='scans/'
         --exclude='evidence/'       --exclude='logs/'
         --exclude='memory/sessions/' --exclude='memory/subagents/' --exclude='memory/lessons/'
@@ -322,7 +322,7 @@ download_project() {
         find "$INSTALL_DIR" -type d -name '__pycache__' -prune -exec rm -rf {} +
         find "$INSTALL_DIR" -type f -name '*.pyc' -delete
         rm -f "$INSTALL_DIR/.env" "$INSTALL_DIR/.env.local" \
-              "$INSTALL_DIR/privkey.pem" "$INSTALL_DIR/agent_old.py" \
+              "$INSTALL_DIR/privkey.pem" \
               "$INSTALL_DIR/install.sh"
         find "$INSTALL_DIR" -maxdepth 1 -name 'theharvester_*' -delete
         if [[ -d "$INSTALL_DIR/targets" ]]; then
