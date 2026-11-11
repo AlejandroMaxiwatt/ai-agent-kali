@@ -6653,6 +6653,31 @@ def _strip_context_regurgitation(answer):
 _TOOL_SATURATION_THRESHOLD = 3
 
 
+def _process_swarm_findings(answer):
+    """Registra los bloques `FINDING:` en el enjambre.
+
+    Devuelve `(answer_limpio, mensajes_para_history)`. Si el enjambre está
+    apagado, el bloque se elimina igualmente para no dejar ruido.
+    """
+    items = extract_findings(answer)
+    if not items:
+        return answer, []
+    messages = []
+    if _SWARM is not None:
+        for sev, title, claim in items:
+            try:
+                fid = _SWARM.submit_finding(
+                    title, severity=sev, claim=claim, created_by="main",
+                )
+                messages.append(
+                    f"FINDING #{fid} registrado [{sev}] {title[:120]} "
+                    f"— pendiente de validación del Guardian"
+                )
+            except Exception as e:
+                messages.append(f"FINDING no registrado: {e}")
+    return strip_findings(answer), messages
+
+
 def _build_swarm_context(max_findings=8):
     """Resumen compacto del enjambre para inyectar en el prompt del modelo.
 
@@ -7258,26 +7283,9 @@ def ask_model(user_input):
         # Limpiar bloques del answer guardado (igual que TARGET_UPDATE).
         answer = strip_file_blocks(answer)
 
-    # Procesar FINDING: (solo si el enjambre está activo). El hallazgo se
+    # Procesar FINDING: (si el enjambre está activo). El hallazgo se
     # registra como pendiente; el Guardian lo validará en background.
-    finding_msgs = []
-    finding_items = extract_findings(answer)
-    if finding_items:
-        if _SWARM is not None:
-            for sev, title, claim in finding_items:
-                try:
-                    fid = _SWARM.submit_finding(
-                        title, severity=sev, claim=claim, created_by="main",
-                    )
-                    finding_msgs.append(
-                        f"FINDING #{fid} registrado [{sev}] {title[:120]} "
-                        f"— pendiente de validación del Guardian"
-                    )
-                except Exception as e:
-                    finding_msgs.append(f"FINDING no registrado: {e}")
-        # Si el enjambre está apagado, el bloque se elimina igualmente para
-        # no dejar ruido en el history.
-        answer = strip_findings(answer)
+    answer, finding_msgs = _process_swarm_findings(answer)
 
     history.append({"role": "assistant", "content": answer})
 
@@ -7502,6 +7510,43 @@ def get_context_used():
 
 # Aviso único de contexto al cruzar el umbral crítico en cada sesión.
 _CONTEXT_WARN_SHOWN = {"high": False, "full": False}
+
+
+def render_swarm_bar():
+    """Línea de estado en vivo del enjambre para el REPL.
+
+    Devuelve un Rich Text o None si el enjambre no está activo.
+    """
+    if _SWARM is None:
+        return None
+    try:
+        st = _SWARM.store.stats()
+        tasks = st.get("tasks", {})
+        pending = sum(v.get("pending", 0) for v in tasks.values())
+        running = sum(v.get("running", 0) for v in tasks.values())
+        finds = st.get("findings", {})
+        text = Text()
+        text.append("│ ", style=PURPLE)
+        text.append("swarm", style=f"bold {PURPLE}")
+        text.append(
+            f"  recon={'ON' if _SWARM.recon.is_alive() else 'off'}"
+            f" · guardian={'ON' if _SWARM.guardian.is_alive() else 'off'}",
+            style=GRAY,
+        )
+        text.append(f"  · cola {pending}p/{running}r", style=GRAY)
+        text.append(
+            f"  · hallazgos {finds.get('confirmed', 0)}✓ "
+            f"{finds.get('pending_validation', 0)}… "
+            f"{finds.get('rejected', 0)}✗",
+            style=GRAY,
+        )
+        if st.get("active_blocks"):
+            text.append(f"  · bloqueos {st['active_blocks']}",
+                        style=f"bold {RED}")
+        text.append(f"  · target {_SWARM.target or '—'}", style=GRAY)
+        return text
+    except Exception:
+        return None
 
 
 def render_context_bar():
@@ -8460,28 +8505,67 @@ def _execute_shell_interactive(command, timeout=1800):
     return (cleaned, "", rc)
 
 
-def _execute_shell(command, timeout=300, stream=None):
+def _execute_shell(command, timeout=300, stream=None, cancel_event=None):
     """Ejecuta `command` con shell=True y devuelve (stdout, stderr, returncode).
-    Si `stream` es True (o STREAM_OUTPUT True por defecto), imprime stdout/stderr
-    en directo línea a línea mientras los recolecta para devolverlos al modelo.
 
-    En modo no-stream, fijamos stdin=DEVNULL para que herramientas que requieren
-    input interactivo (sudo sin password cacheada, prompts de tools) fallen
-    rápido en vez de colgar bloqueadas esperando teclas que no van a llegar.
+    Si `stream` es True (o STREAM_OUTPUT True por defecto), imprime
+    stdout/stderr en directo línea a línea mientras los recolecta.
+
+    `cancel_event` permite matar el subproceso desde otro hilo (usado por
+    `swarm cancel`). Se devuelve rc=-2 y un marcador en stderr.
+
+    En modo no-stream, fijamos stdin=DEVNULL para que herramientas que
+    requieren input interactivo fallen rápido en vez de colgarse.
     """
     if stream is None:
         stream = STREAM_OUTPUT
 
+    def _cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
     if not stream:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            text=True,
         )
-        return (proc.stdout or "").rstrip(), (proc.stderr or "").rstrip(), proc.returncode
+        # Un watcher mata el proceso si llega la cancelación. `communicate`
+        # se encarga de drenar los pipes (evita deadlock con salidas grandes).
+        stop_watch = threading.Event()
+
+        def _watch_cancel():
+            while proc.poll() is None and not stop_watch.is_set():
+                if _cancelled():
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(0.2)
+
+        watcher = threading.Thread(target=_watch_cancel, daemon=True)
+        watcher.start()
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            raise subprocess.TimeoutExpired(
+                command, timeout, output=out, stderr=err,
+            )
+        finally:
+            stop_watch.set()
+            watcher.join(timeout=1)
+
+        if _cancelled():
+            return ((out or "").rstrip(),
+                    ((err or "").rstrip()
+                     + "\n[comando cancelado por el enjambre]").strip(),
+                    -2)
+        return ((out or "").rstrip(), (err or "").rstrip(), proc.returncode)
 
     # Modo streaming con select() sobre los descriptores de los pipes
     import select
@@ -8505,7 +8589,12 @@ def _execute_shell(command, timeout=300, stream=None):
     start = time.monotonic()
     timed_out = False
 
+    cancelled = False
     while streams:
+        if _cancelled():
+            proc.kill()
+            cancelled = True
+            break
         if time.monotonic() - start > timeout:
             proc.kill()
             timed_out = True
@@ -8535,6 +8624,12 @@ def _execute_shell(command, timeout=300, stream=None):
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+    if cancelled:
+        return ("".join(stdout_buf).rstrip(),
+                ("".join(stderr_buf).rstrip()
+                 + "\n[comando cancelado por el enjambre]").strip(),
+                -2)
 
     if timed_out:
         raise subprocess.TimeoutExpired(command, timeout)
@@ -9684,7 +9779,7 @@ def _print_troubleshoot_summary(result):
 
 
 def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
-                proxy_mode=None):
+                proxy_mode=None, cancel_event=None):
     """Ejecuta `command` y devuelve un `CommandResult`.
 
     Si `auto=True` se salta TODAS las confirmaciones (modo autopilot de
@@ -10051,11 +10146,17 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
             # Modo streaming (sólo en main): cabecera dim + _execute_shell
             # pinta las líneas en directo.
             _q_print(f"[dim]› {_describe_command(command)}[/]")
-            return _execute_shell(eff_cmd, timeout=timeout_s, stream=True)
+            return _execute_shell(
+                eff_cmd, timeout=timeout_s, stream=True,
+                cancel_event=cancel_event,
+            )
         # Batch en main → spinner animado. Subagente → sin spinner, captura
         # directa para devolver el output al loop autónomo.
         with _q_spinner(_describe_command(command)):
-            return _execute_shell(eff_cmd, timeout=timeout_s, stream=False)
+            return _execute_shell(
+                eff_cmd, timeout=timeout_s, stream=False,
+                cancel_event=cancel_event,
+            )
 
     # Calcular timeout dinámico: si el comando usa un wordlist medio/grande,
     # subimos automáticamente a COMMAND_TIMEOUT_S_LARGE (30 min por defecto).
@@ -10136,8 +10237,13 @@ def run_command(command, auto=False, target=_NO_TARGET_SENTINEL,
         # findings parciales de herramientas largas (gobuster, ffuf,
         # nuclei, masscan…) se perderían y el modelo creería que la
         # herramienta no encontró nada.
-        captured_out = e.stdout if e.stdout is not None else ""
-        captured_err = e.stderr if e.stderr is not None else ""
+        # TimeoutExpired expone `.output` (y a veces `.stdout` según la
+        # versión de Python). Cubrimos ambos.
+        captured_out = getattr(e, "stdout", None)
+        if captured_out is None:
+            captured_out = getattr(e, "output", None)
+        captured_out = captured_out or ""
+        captured_err = getattr(e, "stderr", None) or ""
         if isinstance(captured_out, bytes):
             captured_out = captured_out.decode("utf-8", errors="replace")
         if isinstance(captured_err, bytes):
@@ -10332,7 +10438,7 @@ def print_commands():
         ("Orquestación", "goal discard <id>",                   "Borra el estado persistido de un goal (el log queda)"),
         ("Orquestación", "goal kill",                           "Detiene el goal y los subagentes de su fase actual"),
 
-        ("Enjambre", "swarm start [--target X] [--scope ruta] [--level N] [--llm]", "Inicia los 2 workers permanentes (Recon + Guardian) y el orquestador determinista."),
+        ("Enjambre", "swarm start [--target X] [--scope ruta] [--level N] [--llm] [--store sqlite|postgres] [--dsn DSN] [--redis URL]", "Inicia los 2 workers permanentes (Recon + Guardian) y el orquestador determinista. Store SQLite local o PostgreSQL; eventos opcionales en Redis Streams."),
         ("Enjambre", "swarm status · swarm stop",                 "Estado de workers/colas/hallazgos · detiene el enjambre."),
         ("Enjambre", "swarm plan [--enqueue] · swarm task <cmd>", "Genera un plan de recon desde el scope · encola un comando de recon."),
         ("Enjambre", "swarm finding add <título> · swarm evidence <id> <ruta>", "Registra un hallazgo · adjunta evidencia para validación."),
@@ -12923,6 +13029,8 @@ def _swarm_runner(command, task):
         return run_command(
             command, auto=True,
             target=task.target if task else None,
+            cancel_event=(getattr(task, "cancel_event", None)
+                          if task else None),
         )
     finally:
         _swarm_thread_marker.active = False
@@ -13021,6 +13129,7 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         console.print(Panel(
             "[bold]swarm start[/] \\[--target X] \\[--scope ruta] "
             "\\[--level 1-2] \\[--llm] \\[--poll seg]\n"
+            "  \\[--store sqlite|postgres] \\[--dsn DSN] \\[--redis URL]\n"
             "[bold]swarm stop[/] · [bold]swarm status[/]\n"
             "[bold]swarm plan[/] \\[--enqueue] — plan de recon desde el scope\n"
             "[bold]swarm task[/] <comando> — encola una tarea de recon\n"
@@ -13045,6 +13154,9 @@ def _repl_swarm(user_input, cmd_lower, first_word):
         level = 2
         use_llm = False
         poll = 1.0
+        store_backend = "sqlite"
+        dsn = None
+        redis_url = None
         try:
             args = shlex.split(rest)
         except ValueError:
@@ -13068,6 +13180,12 @@ def _repl_swarm(user_input, cmd_lower, first_word):
                 except ValueError:
                     poll = 1.0
                 i += 2
+            elif a in ("--store", "--backend") and i + 1 < len(args):
+                store_backend = args[i + 1].strip().lower(); i += 2
+            elif a in ("--dsn",) and i + 1 < len(args):
+                dsn = args[i + 1]; i += 2
+            elif a in ("--redis",) and i + 1 < len(args):
+                redis_url = args[i + 1]; i += 2
             elif a in ("--llm", "--ia"):
                 use_llm = True; i += 1
             else:
@@ -13089,21 +13207,46 @@ def _repl_swarm(user_input, cmd_lower, first_word):
                 console.print(f"[{RED}]✗ no se pudo leer scope: {e}[/]")
                 return _REPL_HANDLED
         try:
-            from agent_swarm import SwarmOrchestrator
+            from agent_swarm import SwarmOrchestrator, make_event_bus
         except Exception as e:
             console.print(f"[{RED}]✗ no se pudo importar agent_swarm: {e}[/]")
             return _REPL_HANDLED
+        if store_backend in ("postgres", "postgresql", "pg") and not dsn:
+            console.print(
+                f"[{RED}]✗ backend postgres requiere --dsn. Ejemplo:[/] "
+                f"[dim]--dsn postgresql://user:pass@127.0.0.1:5432/agent[/]"
+            )
+            return _REPL_HANDLED
+        event_bus = None
+        if redis_url:
+            try:
+                event_bus = make_event_bus("redis", redis_url)
+            except Exception as e:
+                console.print(
+                    f"[{RED}]✗ no se pudo conectar a Redis: {e}[/] "
+                    f"[dim](¿redis-server activo y paquete `redis`?)"
+                )
+                return _REPL_HANDLED
         safe_target = re.sub(r"[^A-Za-z0-9_.-]", "_", target or "default")
         store_path = os.path.join(
             WORKSPACE, "memory", "swarm", f"{safe_target}.db"
         )
-        _SWARM = SwarmOrchestrator(
-            store_path=store_path, target=target, scope_text=scope_text,
-            autonomy_level=level, runner=_swarm_runner,
-            llm_validator=_swarm_llm_validator if use_llm else None,
-            llm_planner=_swarm_llm_planner if use_llm else None,
-            poll_interval=poll,
-        )
+        try:
+            _SWARM = SwarmOrchestrator(
+                store_path=store_path, target=target, scope_text=scope_text,
+                autonomy_level=level, runner=_swarm_runner,
+                llm_validator=_swarm_llm_validator if use_llm else None,
+                llm_planner=_swarm_llm_planner if use_llm else None,
+                poll_interval=poll,
+                store_backend=store_backend, dsn=dsn,
+                event_bus=event_bus,
+            )
+        except Exception as e:
+            console.print(
+                f"[{RED}]✗ no se pudo iniciar el store "
+                f"({store_backend}): {e}[/]"
+            )
+            return _REPL_HANDLED
         _SWARM.start()
         console.print()
         console.print(Panel(
@@ -13506,6 +13649,9 @@ def main(argv=None):
             _check_subagent_notifications()
             _check_goal_notifications()
             console.print(render_context_bar())
+            swarm_bar = render_swarm_bar()
+            if swarm_bar is not None:
+                console.print(swarm_bar)
             console.print()
             if _pt_available:
                 # Toolbar inferior dinámico — prompt_toolkit la repinta cada

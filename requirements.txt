@@ -4,3 +4,7 @@ pyfiglet>=1.0.4
 requests>=2.33.0
 python-dotenv>=1.2.0
 prompt_toolkit>=3.0.0
+
+# Enjambre distribuido (opcional: store PostgreSQL y eventos Redis Streams)
+psycopg2-binary>=2.9
+redis>=5.0

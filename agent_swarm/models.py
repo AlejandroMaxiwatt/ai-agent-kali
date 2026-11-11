@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
 from enum import IntEnum
 
 
@@ -50,6 +51,10 @@ class Task:
     agent: str = ""
     attempts: int = 0
     fingerprint: str = ""
+    # Evento transitorio de cancelación (no se persiste en SQLite).
+    cancel_event: object = dataclasses.field(
+        default=None, repr=False, compare=False,
+    )
 
 
 @dataclasses.dataclass

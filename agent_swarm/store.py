@@ -39,6 +39,9 @@ class Store:
         self.path = os.path.abspath(path)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._lock = threading.RLock()
+        # Bus de eventos opcional (Redis Streams, etc.). Si es None, los
+        # eventos solo se persisten en SQLite.
+        self.event_bus = None
         self._conn = sqlite3.connect(
             self.path, check_same_thread=False, timeout=15,
         )
@@ -473,7 +476,16 @@ class Store:
                 (_now(), type_, agent, task_id, _json(payload)),
             )
             self._conn.commit()
-            return int(cur.lastrowid)
+            event_id = int(cur.lastrowid)
+        # Publicación opcional externa (Redis Streams, etc.). No debe
+        # romper el flujo si el bus está caído.
+        if self.event_bus is not None:
+            try:
+                self.event_bus.publish(type_, payload or {},
+                                       agent=agent, task_id=task_id)
+            except Exception:
+                pass
+        return event_id
 
     def list_events(self, limit: int = 50) -> list[dict]:
         with self._lock:
@@ -525,7 +537,12 @@ class Store:
     def stats(self) -> dict:
         with self._lock:
             def count(sql, args=()):
-                return int(self._conn.execute(sql, args).fetchone()[0])
+                row = self._conn.execute(sql, args).fetchone()
+                if row is None:
+                    return 0
+                if isinstance(row, dict):
+                    return int(next(iter(row.values())))
+                return int(row[0])
             return {
                 "tasks": self.task_stats(),
                 "findings": {

@@ -24,8 +24,15 @@ class SwarmOrchestrator:
                  autonomy_level: int = AutonomyLevel.PREAPPROVED,
                  runner=None, llm_validator=None, llm_planner=None,
                  poll_interval: float = 1.0,
-                 per_minute: int = 30, per_hour: int = 300):
-        self.store = Store(store_path)
+                 per_minute: int = 30, per_hour: int = 300,
+                 store_backend: str = "sqlite", dsn: str | None = None,
+                 event_bus=None):
+        from .store_factory import make_store
+        self.store_backend = store_backend
+        self.store = make_store(store_backend, store_path, dsn)
+        # El store publica cada evento en el bus (si hay uno).
+        self.store.event_bus = event_bus
+        self.event_bus = event_bus
         self.target = target
         self.scope = Scope.from_text(scope_text, target)
         self.autonomy_level = int(autonomy_level)
@@ -36,10 +43,14 @@ class SwarmOrchestrator:
         self.stop_event = threading.Event()
         self._started = False
         self._lock = threading.Lock()
+        # task_id → threading.Event para matar el comando en ejecución.
+        self.cancel_events = {}
         self.recon = ReconWorker(
             self.store, self.policy, runner, self.stop_event,
             target=target, llm_planner=llm_planner,
             poll_interval=poll_interval,
+            on_task_started=self.register_cancel_event,
+            on_task_finished=self.unregister_cancel_event,
         )
         self.guardian = GuardianWorker(
             self.store, self.policy, self.stop_event,
@@ -76,6 +87,11 @@ class SwarmOrchestrator:
                 w.join(timeout=timeout)
         self.store.add_event("swarm_stopped", "orchestrator")
         self.store.close()
+        if self.event_bus is not None:
+            try:
+                self.event_bus.close()
+            except Exception:
+                pass
 
     def is_running(self) -> bool:
         return bool(self._started and (
@@ -158,12 +174,22 @@ class SwarmOrchestrator:
             self.request_validation(fid)
         return fid
 
+    def register_cancel_event(self, task_id: int, event):
+        self.cancel_events[task_id] = event
+
+    def unregister_cancel_event(self, task_id: int):
+        self.cancel_events.pop(task_id, None)
+
     def cancel_task(self, task_id: int, reason: str = "") -> bool:
+        # Si el comando está en ejecución, matarlo de verdad.
+        event = self.cancel_events.get(task_id)
+        if event is not None:
+            event.set()
         ok = self.store.cancel_task(task_id, reason)
         if ok:
             self.store.add_event(
                 "task_cancelled", "orchestrator", task_id,
-                {"reason": reason},
+                {"reason": reason, "killed_running": event is not None},
             )
         return ok
 
@@ -229,6 +255,7 @@ class SwarmOrchestrator:
         return {
             "running": self.is_running(),
             "target": self.target,
+            "store": self.store_backend,
             "scope": self.scope.describe(),
             "scope_empty": self.scope.is_empty(),
             "autonomy_level": self.autonomy_level,
@@ -246,7 +273,7 @@ class SwarmOrchestrator:
         st = s["stats"]
         lines = [
             f"Enjambre: {'ACTIVO' if s['running'] else 'detenido'}",
-            f"Target: {s['target'] or '(ninguno)'}",
+            f"Target: {s['target'] or '(ninguno)'} · store: {s['store']}",
             f"Scope: {s['scope']}",
             f"Autonomía: {s['autonomy_level']} (máx. autoaprobado; "
             f"nivel 3 siempre pide aprobación humana)",

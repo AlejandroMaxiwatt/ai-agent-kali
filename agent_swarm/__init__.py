@@ -22,9 +22,15 @@ from .models import (
     PolicyDecision,
     Task,
 )
+from .event_bus import (
+    InProcessEventBus,
+    RedisStreamsEventBus,
+    make_event_bus,
+)
 from .orchestrator import SwarmOrchestrator
 from .policy import PolicyEngine, Scope
 from .store import Store
+from .store_factory import make_store
 
 __all__ = [
     "AutonomyLevel",
@@ -37,4 +43,8 @@ __all__ = [
     "PolicyEngine",
     "Scope",
     "Store",
+    "make_store",
+    "InProcessEventBus",
+    "RedisStreamsEventBus",
+    "make_event_bus",
 ]

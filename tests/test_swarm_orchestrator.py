@@ -80,6 +80,33 @@ class TestSwarmOrchestrator(unittest.TestCase):
         self.assertGreaterEqual(len(assets), 2)
         self.assertTrue(any("whatweb" in (t.command or "") for t in tasks))
 
+    def test_cancel_running_task(self):
+        def slow_runner(command, task):
+            for _ in range(500):
+                if (task.cancel_event is not None
+                        and task.cancel_event.is_set()):
+                    return SimpleNamespace(rc=-2, output="cancelado")
+                time.sleep(0.01)
+            return SimpleNamespace(rc=0, output="done")
+
+        self.orch.recon.runner = slow_runner
+        tid, decision = self.orch.submit_recon_task("sleep 1")
+        self.assertIsNotNone(tid, decision)
+
+        def running():
+            t = self.orch.store.get_task(tid)
+            return t if t and t.status == "running" else None
+
+        self.assertIsNotNone(self._wait(running))
+        self.assertTrue(self.orch.cancel_task(tid, "cancelación de test"))
+
+        def cancelled():
+            t = self.orch.store.get_task(tid)
+            return t if t and t.status == "cancelled" else None
+
+        task = self._wait(cancelled)
+        self.assertIsNotNone(task, self.orch.store.get_task(tid))
+
     def test_out_of_scope_task_rejected(self):
         tid, decision = self.orch.submit_recon_task("nmap -sV 8.8.8.8")
         self.assertIsNone(tid)
@@ -103,6 +130,30 @@ class TestSwarmOrchestrator(unittest.TestCase):
 
         finding = self._wait(resolved)
         self.assertEqual(finding.status, "confirmed", finding)
+
+    def test_guardian_llm_second_opinion(self):
+        # Determinista no concluyente → el validador LLM (falso) confirma.
+        self.orch.guardian.llm_validator = (
+            lambda finding, texts, scope: {
+                "decision": "confirmed", "confidence": 0.9,
+                "reason": "validación LLM simulada",
+            }
+        )
+        fid = self.orch.submit_finding(
+            "Hallazgo sin prueba determinista", severity="high",
+            claim="La versión 1.2 parece vulnerable",
+            auto_validate=False,
+        )
+        self.orch.request_validation(fid)
+
+        def resolved():
+            finding = self.orch.store.get_finding(fid)
+            return finding if finding.status != "pending_validation" else None
+
+        finding = self._wait(resolved)
+        self.assertEqual(finding.status, "confirmed", finding)
+        decisions = self.orch.store.decisions_for_finding(fid)
+        self.assertTrue(any(d.decision == "confirmed" for d in decisions))
 
     def test_guardian_requires_more_evidence_for_version_only(self):
         fid = self.orch.submit_finding(

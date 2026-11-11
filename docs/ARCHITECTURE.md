@@ -16,6 +16,11 @@ goal Comprometer TYPO3 || criteria: file_exists:evidence/x.txt; cmd_rc:test -s e
 # Goal headless (CI/cron)
 python agent.py --goal "Comprometer TYPO3 || criteria: file_exists:evidence/x.txt" --target acme
 
+# Enjambre permanente (Recon + Guardian)
+swarm start --target acme --scope targets/acme/scope.md
+# versión distribuida opcional
+swarm start --target acme --store postgres --dsn postgresql://user:pass@host/agent --redis redis://127.0.0.1:6379/0
+
 # Tests
 ./scripts/run_tests.sh
 ```
@@ -28,9 +33,20 @@ prompts/system.md            # contrato del modelo (system prompt versionado)
 agent_core/
 ├── results.py               # CommandResult
 └── goalspec.py              # GoalSpec + verificador objetivo de criterios
+agent_swarm/                 # 1 principal + 2 subagentes permanentes
+├── orchestrator.py          # orquestador determinista
+├── policy.py                # alcance, niveles, duplicados, rate limits
+├── store.py                 # memoria compartida SQLite
+├── postgres_store.py        # adaptador PostgreSQL opcional
+├── event_bus.py             # eventos en proceso / Redis Streams
+├── workers.py               # ReconWorker + GuardianWorker
+└── models.py                # Task/Finding/Evidence/Decision
+skills/validation/skill.md   # validación independiente del Guardian
 tests/
 ├── test_core.py             # núcleo puro (sin LLM ni Rich)
-└── test_agent_integration.py# P0/P1: ejecución, proxy aislado, goal loop
+├── test_agent_integration.py# P0/P1: ejecución, proxy aislado, goal loop
+├── test_swarm_*.py          # enjambre, políticas, validación
+└── test_swarm_distributed.py# PostgreSQL + Redis (servidores temporales)
 ```
 
 `agent_core` no importa Rich, OpenAI ni el estado global del REPL. Se puede

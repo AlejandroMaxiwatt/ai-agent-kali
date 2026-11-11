@@ -136,13 +136,32 @@ swarm help
   lo aplica el `PolicyEngine`/`Store`, no el modelo.
 - Todo queda en `memory/swarm/swarm.db` (ignorado por git).
 
+## Backends y operación
+
+- **Store:** `sqlite` (default) o `postgres`:
+  ```
+  swarm start --store postgres --dsn postgresql://user:pass@host:5432/agent
+  ```
+  `PostgresStore` reutiliza la API de `Store` y usa `FOR UPDATE SKIP LOCKED`
+  para reclamar tareas entre varios procesos.
+- **Eventos:** `InProcessEventBus` (default) o Redis Streams:
+  ```
+  swarm start --redis redis://127.0.0.1:6379/0
+  ```
+  Redis se usa para notificar/observar; la cola autoritativa sigue en el
+  Store.
+- **Preempción real:** `swarm cancel <id>` mata el subproceso en ejecución
+  (`cancel_event` → watcher → `proc.kill()`), no solo lo marca.
+- **Panel en vivo:** el REPL muestra una línea `swarm recon=… · cola … ·
+  hallazgos …` antes de cada prompt.
+
 ## Limitaciones actuales / siguientes pasos
 
-- SQLite local en lugar de PostgreSQL; la interfaz del `Store` permite
-  sustituirlo.
-- Cola en proceso; Redis Streams/NATS sería el siguiente paso para varios
-  procesos/máquinas.
+- NATS no implementado; Redis Streams cubre la comunicación distribuida.
+- El store PostgreSQL requiere `psycopg2-binary`; el bus Redis requiere
+  `redis`. Ambos son opcionales y están en `requirements.txt`.
 - Los workers usan reglas deterministas para activos/seguimientos; el
   planner LLM es opcional (`--llm`) y está acotado a 3 comandos.
 - El Guardian valida con reglas + LLM opcional; no ejecuta explotación.
-- La UI es el REPL; falta un panel de estado en vivo.
+- La preempción mata el proceso, pero no garantiza limpieza de ficheros
+  temporales que la herramienta hubiera creado a medias.

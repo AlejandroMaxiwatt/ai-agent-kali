@@ -174,12 +174,15 @@ class ReconWorker(_WorkerBase):
     role = "recon"
 
     def __init__(self, store, policy, runner, stop_event,
-                 target=None, llm_planner=None, poll_interval=1.0):
+                 target=None, llm_planner=None, poll_interval=1.0,
+                 on_task_started=None, on_task_finished=None):
         super().__init__("swarm-recon", store, stop_event, poll_interval)
         self.policy = policy
         self.runner = runner
         self.target = target
         self.llm_planner = llm_planner
+        self.on_task_started = on_task_started
+        self.on_task_finished = on_task_finished
 
     def run(self):
         self.store.register_agent(self.name, self.role)
@@ -211,7 +214,26 @@ class ReconWorker(_WorkerBase):
             )
             return
 
-        rc, output = _result_fields(self.runner(task.command, task))
+        # Evento de cancelación: el runner lo pasa a run_command y este
+        # mata el subproceso si el operador ejecuta `swarm cancel`.
+        event = threading.Event()
+        task.cancel_event = event
+        if self.on_task_started:
+            self.on_task_started(task.id, event)
+        try:
+            rc, output = _result_fields(self.runner(task.command, task))
+        finally:
+            if self.on_task_finished:
+                self.on_task_finished(task.id)
+
+        if event.is_set() or rc == -2:
+            self.store.add_event(
+                "task_cancelled", self.name, task.id,
+                {"reason": "cancelada durante la ejecución"},
+            )
+            self.store.finish_task(task.id, "cancelled", output, rc)
+            return
+
         status = "done" if rc == 0 else "failed"
         self.store.finish_task(task.id, status, output, rc)
         self.store.add_event(

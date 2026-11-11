@@ -36,6 +36,51 @@ class TestFindingProtocol(unittest.TestCase):
         self.assertIn("Antes", cleaned)
         self.assertIn("Después", cleaned)
 
+    def test_integration_with_fake_swarm(self):
+        class FakeSwarm:
+            def __init__(self):
+                self.calls = []
+
+            def submit_finding(self, title, severity="info", claim="",
+                               created_by="main"):
+                self.calls.append({
+                    "title": title, "severity": severity,
+                    "claim": claim, "created_by": created_by,
+                })
+                return 42
+
+        fake = FakeSwarm()
+        old = agent._SWARM
+        agent._SWARM = fake
+        try:
+            text = (
+                "Evidencia real.\n"
+                "FINDING: high | SQLi en login | id=1 devolvió error SQL\n"
+                "Siguiente: validar."
+            )
+            cleaned, msgs = agent._process_swarm_findings(text)
+            self.assertEqual(len(fake.calls), 1)
+            self.assertEqual(fake.calls[0]["severity"], "high")
+            self.assertEqual(fake.calls[0]["title"], "SQLi en login")
+            self.assertEqual(fake.calls[0]["created_by"], "main")
+            self.assertTrue(any("#42" in m for m in msgs))
+            self.assertNotIn("FINDING:", cleaned)
+            self.assertIn("Evidencia real.", cleaned)
+        finally:
+            agent._SWARM = old
+
+    def test_no_swarm_still_strips(self):
+        old = agent._SWARM
+        agent._SWARM = None
+        try:
+            cleaned, msgs = agent._process_swarm_findings(
+                "texto\nFINDING: low | X | Y\nfin"
+            )
+            self.assertEqual(msgs, [])
+            self.assertNotIn("FINDING:", cleaned)
+        finally:
+            agent._SWARM = old
+
 
 if __name__ == "__main__":
     unittest.main()
