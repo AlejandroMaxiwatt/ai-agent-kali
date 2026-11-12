@@ -204,6 +204,24 @@ def _llm_kwargs(profile, overrides=None):
     return base
 
 
+def _create_completion(**kwargs):
+    """Llama a `client.chat.completions.create` normalizando antes la lista
+    de mensajes.
+
+    Algunas plantillas Jinja estrictas (Qwen, Llama, Mistral) lanzan
+    "System message must be at the beginning." si reciben más de un mensaje
+    `system` o si aparece uno después de un turno user/assistant. El agente
+    inyecta contexto como mensajes `system` (fecha, scans, FILE_READ,
+    resultado de FILE_OPS, contexto del enjambre…), así que consolidamos
+    todo en UN único `system` inicial y degradamos los intermedios a `user`.
+    """
+    messages = kwargs.get("messages")
+    if messages:
+        kwargs = dict(kwargs)
+        kwargs["messages"] = _normalize_messages_for_api(messages)
+    return client.chat.completions.create(**kwargs)
+
+
 # Fallback de ventana de contexto. El valor EFECTIVO se detecta por modelo
 # en `get_max_context_tokens()`:
 #   · LM Studio → /api/v0/models (loaded_context_length / max_context_length)
@@ -1253,7 +1271,7 @@ def _subagent_call_llm(sub):
     kwargs = _llm_kwargs("subagent")
     kwargs["messages"] = msgs
     try:
-        resp = client.chat.completions.create(**kwargs)
+        resp = _create_completion(**kwargs)
         answer = (resp.choices[0].message.content or "") if resp.choices else ""
     except Exception as e:
         sub.log(f"ERROR LLM: {e}")
@@ -2421,7 +2439,7 @@ def _goal_request_plan(goal_run, available_skills, max_attempts=3):
         try:
             kwargs = _llm_kwargs("orchestrator")
             kwargs["messages"] = msgs
-            resp = client.chat.completions.create(**kwargs)
+            resp = _create_completion(**kwargs)
             text = (resp.choices[0].message.content or "") if resp.choices else ""
         except Exception as e:
             goal_run.log(f"ERROR llamada LLM-orquestador attempt {attempt+1}: {e}")
@@ -3362,7 +3380,7 @@ def _generate_goal_report(goal_run):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
-        resp = client.chat.completions.create(**kwargs)
+        resp = _create_completion(**kwargs)
         content = (resp.choices[0].message.content or "") if resp.choices else ""
     except Exception as e:
         goal_run.log(f"ERROR generando informe: {e}")
@@ -6398,6 +6416,50 @@ def _compact_messages_for_call(messages):
     return compacted
 
 
+def _normalize_messages_for_api(messages):
+    """Normaliza mensajes al contrato de plantillas de chat estrictas.
+
+    - Fusiona todos los mensajes `system` INICIALES en uno solo (índice 0).
+    - Degrada a `user` cualquier `system` que aparezca después de un turno
+      user/assistant, porque plantillas como la de Qwen lanzan
+      "System message must be at the beginning." en ese caso.
+    - No muta la lista ni los dicts originales.
+    """
+    if not messages:
+        return []
+
+    leading_system = []
+    rest = []
+    seen_non_system = False
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        if role == "system":
+            if not seen_non_system:
+                leading_system.append(content)
+            else:
+                nm = dict(msg)
+                nm["role"] = "user"
+                nm["content"] = (
+                    "[SISTEMA · contexto inyectado]\n" + content
+                )
+                rest.append(nm)
+        else:
+            seen_non_system = True
+            rest.append(msg)
+
+    if not leading_system:
+        return rest
+
+    merged = "\n\n".join(
+        c.strip() for c in leading_system if c.strip()
+    )
+    return [{"role": "system", "content": merged}] + rest
+
+
 # Regex compartidos por detección de alucinación Y de regurgitación. Cada
 # regex se compila UNA sola vez y se referencia por nombre en ambas listas
 # para evitar drift entre ellas.
@@ -7455,7 +7517,7 @@ def _ask_model_batch(kwargs):
     """Modo no-streaming: spinner animado mientras espera, render Markdown
     al terminar. El contador de tiempo en vivo está en el spinner."""
     with _AnimatedSpinner("Pensando"):
-        response = client.chat.completions.create(**kwargs)
+        response = _create_completion(**kwargs)
 
     if getattr(response, "usage", None):
         LAST_USAGE["prompt_tokens"] = response.usage.prompt_tokens or 0
@@ -7490,11 +7552,11 @@ def _ask_model_streaming(kwargs):
     first_token_at = None
 
     try:
-        stream = client.chat.completions.create(**stream_kwargs)
+        stream = _create_completion(**stream_kwargs)
     except TypeError:
         # Si el cliente/servidor no soporta stream_options, retry sin él.
         stream_kwargs.pop("stream_options", None)
-        stream = client.chat.completions.create(**stream_kwargs)
+        stream = _create_completion(**stream_kwargs)
 
     # Spinner durante el prefill. Se cierra automáticamente al recibir el
     # primer token, antes de empezar a escribir a stdout.
@@ -13323,7 +13385,7 @@ def _swarm_llm_validator(finding, evidence_texts, scope_text):
             {"role": "system", "content": skill},
             {"role": "user", "content": prompt},
         ]
-        resp = client.chat.completions.create(**kwargs)
+        resp = _create_completion(**kwargs)
         text = (resp.choices[0].message.content or "") if resp.choices else ""
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
@@ -13357,7 +13419,7 @@ def _swarm_llm_planner(task, output, assets):
             {"role": "system", "content": skill},
             {"role": "user", "content": prompt},
         ]
-        resp = client.chat.completions.create(**kwargs)
+        resp = _create_completion(**kwargs)
         text = (resp.choices[0].message.content or "") if resp.choices else ""
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
@@ -13415,7 +13477,7 @@ def _swarm_goal_planner(context):
             {"role": "system", "content": skill},
             {"role": "user", "content": prompt},
         ]
-        resp = client.chat.completions.create(**kwargs)
+        resp = _create_completion(**kwargs)
         text = (resp.choices[0].message.content or "") if resp.choices else ""
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
