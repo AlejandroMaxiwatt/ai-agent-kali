@@ -627,6 +627,19 @@ Cuando el operador pega datos estructurados (Censys, Shodan, una tabla) y dice "
 
 Cada skill es un directorio en `skills/` con un archivo `skill.md` cuyo contenido se inyecta como mensaje `system` cuando se activa con `use`.
 
+**Activación automática por palabras lanzaderas.** `skills/triggers.json` asocia cada skill con varias frases (ES/EN). Si el prompt del operador contiene una, la skill se activa sola antes de llamar al modelo — sin teclear `use`. Ejemplos:
+
+| Prompt | Skill activada |
+|---|---|
+| `realiza un escaneo de red` | `recon` |
+| `enumeración de servicios` | `recon_activo` |
+| `audita wordpress` | `wordpress_audit` |
+| `pentest web con sql injection` | `web_pentest` |
+| `movimiento lateral con impacket` | `lateral_movement` |
+| `redacta el informe` | `reporting` |
+
+La comparación ignora mayúsculas y acentos, normaliza `-`/`_`/`/` y usa límites de palabra. Un mismo prompt puede activar varias skills. Se desactiva con `SKILL_AUTO_ACTIVATE=0` en `.env` o en el entorno.
+
 | Skill | Foco |
 |---|---|
 | `recon` | Reconocimiento pasivo / semi-pasivo. OSINT, DNS, subdominios, fingerprinting. Sin port-scans completos ni fuzzing |

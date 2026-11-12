@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime
 
 import requests
@@ -410,6 +411,14 @@ LESSONS_DIR = os.path.join(WORKSPACE, "memory", "lessons")
 LESSONS_INDEX_PATH = os.path.join(LESSONS_DIR, "INDEX.md")
 ACTIVE_SKILLS = []
 ACTIVE_TARGET = None  # nombre del target cargado en el contexto, o None
+
+# Palabras lanzaderas: si el prompt contiene una frase de skills/triggers.json,
+# la skill correspondiente se activa automáticamente antes de llamar al LLM.
+# Desactivable con SKILL_AUTO_ACTIVATE=0 en el entorno/.env.
+SKILL_AUTO_ACTIVATE = os.environ.get(
+    "SKILL_AUTO_ACTIVATE", "1"
+).strip().lower() not in ("0", "false", "off", "no")
+SKILL_TRIGGERS_FILE = os.path.join(SKILLS_DIR, "triggers.json")
 
 # Centinela para distinguir "no se pasó target" de "target explícito None"
 # en spawn_subagent (un goal sin target activo pasa None a propósito).
@@ -872,6 +881,123 @@ def deactivate_skill(name):
         "content": f"[Skill desactivada: {name}]"
     })
     return True
+
+
+# ── Palabras lanzaderas de skills ─────────────────────────────
+# Cada skill declara en skills/triggers.json varias frases (ES/EN). Si el
+# prompt del operador contiene una, la skill se activa antes de llamar al
+# modelo: "realiza un escaneo de red" → recon, "audita wordpress" →
+# wordpress_audit, etc. Las frases se comparan sin acentos, mayúsculas ni
+# guiones, y con límites de palabra para evitar falsos positivos.
+
+_SKILL_TRIGGERS_CACHE = None
+_SKILL_TRIGGERS_MTIME = None
+
+
+def _normalize_trigger_text(text):
+    """Minúsculas, sin acentos, '-'/'_'/'/' → espacio y espacios colapsados."""
+    raw = unicodedata.normalize("NFKD", str(text or "").lower())
+    raw = "".join(c for c in raw if not unicodedata.combining(c))
+    raw = re.sub(r"[-_/]+", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def load_skill_triggers():
+    """Carga skills/triggers.json → {skill: [frases normalizadas]}.
+
+    Si el fichero no existe o está mal formado, devuelve {} y el agente
+    sigue funcionando sin activación automática.
+    """
+    global _SKILL_TRIGGERS_CACHE, _SKILL_TRIGGERS_MTIME
+
+    try:
+        mtime = os.path.getmtime(SKILL_TRIGGERS_FILE)
+    except OSError:
+        mtime = None
+    if (_SKILL_TRIGGERS_CACHE is not None
+            and mtime == _SKILL_TRIGGERS_MTIME):
+        return _SKILL_TRIGGERS_CACHE
+
+    data = {}
+    try:
+        with open(SKILL_TRIGGERS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+    triggers = {}
+    if isinstance(data, dict):
+        for skill, items in data.items():
+            if not isinstance(items, list):
+                continue
+            clean = []
+            for item in items:
+                if not isinstance(item, str):
+                    continue
+                norm = _normalize_trigger_text(item)
+                if norm and norm not in clean:
+                    clean.append(norm)
+            if clean:
+                triggers[str(skill)] = clean
+
+    _SKILL_TRIGGERS_CACHE = triggers
+    _SKILL_TRIGGERS_MTIME = mtime
+    return triggers
+
+
+def match_skill_triggers(text):
+    """Devuelve [(skill, frase, score)] para cada skill que haga match.
+
+    Sólo considera skills con `skill.md` presente. Ordena de más específica
+    (frase más larga) a menos, para que la primera activación sea la más
+    relevante.
+    """
+    norm = _normalize_trigger_text(text)
+    if not norm:
+        return []
+
+    matches = []
+    for skill, triggers in load_skill_triggers().items():
+        if not os.path.isfile(os.path.join(SKILLS_DIR, skill, "skill.md")):
+            continue
+        best_trigger = None
+        best_score = -1
+        for trig in triggers:
+            pattern = (
+                r"(?<!\w)"
+                + re.escape(trig).replace(r"\ ", r"\s+")
+                + r"(?!\w)"
+            )
+            if re.search(pattern, norm):
+                # Frases más largas = más específicas (y menos ambiguas).
+                score = len(trig) + trig.count(" ") * 8
+                if score > best_score:
+                    best_score = score
+                    best_trigger = trig
+        if best_trigger is not None:
+            matches.append((skill, best_trigger, best_score))
+
+    matches.sort(key=lambda m: (-m[2], m[0]))
+    return matches
+
+
+def auto_activate_skills(text):
+    """Activa las skills cuyas palabras lanzaderas aparecen en `text`.
+
+    Devuelve [(skill, frase)] sólo para las que se han activado AHORA
+    (las ya activas se omiten). No imprime nada: el caller decide el
+    feedback al operador.
+    """
+    if not SKILL_AUTO_ACTIVATE:
+        return []
+
+    activated = []
+    for skill, trigger, _score in match_skill_triggers(text):
+        if skill in ACTIVE_SKILLS:
+            continue
+        if activate_skill(skill):
+            activated.append((skill, trigger))
+    return activated
 
 
 # ============================================================
@@ -10975,10 +11101,14 @@ def print_skills_menu():
         )
 
     console.print(table)
+    n_triggers = sum(len(v) for v in load_skill_triggers().values())
     console.print(
         f"[dim]Activar: [bold]use <skill>[/]  ·  Desactivar: [bold]unuse <skill>[/]  ·  "
         f"●=activa  ○=disponible  ✗=falta skill.md  ·  "
-        f"Tools master = lista exhaustiva cargada con la skill (tools_master/<skill>.md)[/]"
+        f"Tools master = lista exhaustiva cargada con la skill (tools_master/<skill>.md)\n"
+        f"Activación automática: {n_triggers} palabras lanzaderas en "
+        f"skills/triggers.json (p. ej. «escaneo de red» → recon). "
+        f"Desactivable con SKILL_AUTO_ACTIVATE=0.[/]"
     )
 
 
@@ -11872,7 +12002,7 @@ def _execute_main_command(command):
     return result, rc
 
 
-def run_autonomous_turn(user_input, max_steps=None):
+def run_autonomous_turn(user_input, max_steps=None, trigger_text=None):
     """Ciclo completo de un turno del operador:
 
         prompt → LLM → COMANDO → ejecutar → resultado → análisis → COMANDO → …
@@ -11881,8 +12011,31 @@ def run_autonomous_turn(user_input, max_steps=None):
     operador tenía que escribir "sigue" en cada iteración. Ahora, con
     AUTO_CONTINUE activo, el bucle continúa hasta que el modelo deje de
     proponer comandos, el operador cancele, o se alcance `max_steps`.
+
+    `trigger_text` permite buscar palabras lanzaderas sólo en lo que tecleó
+    el operador, sin contaminar la detección con el contenido de ficheros
+    adjuntos vía `@archivo`.
     """
     max_steps = AUTO_CONTINUE_MAX_STEPS if max_steps is None else max_steps
+
+    # Palabras lanzaderas: activa skills según la intención del prompt
+    # (p. ej. "realiza un escaneo de red" → recon, "audita wordpress" →
+    # wordpress_audit). Se hace ANTES de ask_model para que el skill.md y su
+    # tools_master estén ya en el contexto del modelo en este mismo turno.
+    auto_skills = auto_activate_skills(
+        user_input if trigger_text is None else trigger_text
+    )
+    if auto_skills:
+        detail = ", ".join(
+            f"{skill} ← «{trigger}»" for skill, trigger in auto_skills
+        )
+        console.print(
+            f"[bold {GREEN}]✓ Skills activadas automáticamente:[/] "
+            f"{rich_escape(detail)}\n"
+            f"[dim]Activas: {rich_escape(', '.join(ACTIVE_SKILLS) or 'ninguna')}[/]"
+        )
+        save_session()
+
     answer = ask_model(user_input)
     steps_done = 0
     recent_cmds = []
@@ -14455,13 +14608,15 @@ def main(argv=None):
             # escribió @<nombre>, buscamos en el workspace y, si hay varias,
             # le preguntamos cuál usar. El contenido de los archivos elegidos
             # se inyecta como bloques de contexto delante de la petición.
+            # Las palabras lanzaderas se buscan en lo que tecleó el operador
+            # (`user_input`), no en el contenido de ficheros adjuntos.
             effective_input, _ = resolve_at_mentions(user_input)
 
             # ask_model imprime el answer en directo (streaming) o como Markdown
             # al final si STREAM_OUTPUT está desactivado. No volvemos a imprimirlo.
             # Ciclo completo: prompt → COMANDO → resultado → análisis →
             # siguiente COMANDO (con AUTO_CONTINUE activo, hasta el límite).
-            run_autonomous_turn(effective_input)
+            run_autonomous_turn(effective_input, trigger_text=user_input)
 
         except KeyboardInterrupt:
             print()
