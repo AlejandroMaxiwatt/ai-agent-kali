@@ -57,6 +57,13 @@ MODEL_NAME_FALLBACK = "qwen3.8-27b-turbo-fable-cold-fusion-735-882-heretic-uncen
 OLLAMA_BASE_URL = "https://ollama.com/v1"
 OLLAMA_MODEL_FALLBACK = "qwen3-coder:480b-cloud"
 
+# --- Strata (motor de inferencia OpenAI-compatible) ---
+# Servidor propio en el tailnet. Expone /v1/models y /v1/chat/completions,
+# pero no metadatos de contexto nativos (usa STRATA_CONTEXT_TOKENS).
+# Modelo servido actualmente: iq3_s (Qwen3.8-Flash-Next IQ3_S).
+STRATA_BASE_URL = "http://100.68.49.90:47832/v1"
+STRATA_MODEL_FALLBACK = "iq3_s"
+
 WORKSPACE = os.path.expanduser("~/ai-agent-kali")
 
 # Cargar variables del .env del workspace al entorno del proceso. Las heredan
@@ -71,6 +78,7 @@ except ImportError:
 # Overrides por entorno/.env (sin editar agent.py):
 #   LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
 #   LMSTUDIO_BASE_URL=http://it1-pc:1234/v1
+#   STRATA_BASE_URL=http://host:47832/v1
 #   OLLAMA_BASE_URL / MODEL_NAME_FALLBACK / OLLAMA_MODEL_FALLBACK
 LMSTUDIO_BASE_URL = os.environ.get(
     "LMSTUDIO_BASE_URL", LMSTUDIO_BASE_URL
@@ -78,11 +86,17 @@ LMSTUDIO_BASE_URL = os.environ.get(
 OLLAMA_BASE_URL = os.environ.get(
     "OLLAMA_BASE_URL", OLLAMA_BASE_URL
 ).rstrip("/")
+STRATA_BASE_URL = os.environ.get(
+    "STRATA_BASE_URL", STRATA_BASE_URL
+).rstrip("/")
 MODEL_NAME_FALLBACK = os.environ.get(
     "MODEL_NAME_FALLBACK", MODEL_NAME_FALLBACK
 )
 OLLAMA_MODEL_FALLBACK = os.environ.get(
     "OLLAMA_MODEL_FALLBACK", OLLAMA_MODEL_FALLBACK
+)
+STRATA_MODEL_FALLBACK = os.environ.get(
+    "STRATA_MODEL_FALLBACK", STRATA_MODEL_FALLBACK
 )
 
 # Si True, los comandos propuestos por el agente se ejecutan sin pedir confirmación.
@@ -231,6 +245,16 @@ def _create_completion(**kwargs):
 # qwen3.6-27b típicamente: 32768. Modelos largos: 65536, 131072, 200000.
 MAX_CONTEXT_TOKENS = 34196
 
+# Strata no expone la ventana de contexto en /v1/models. Usa este valor
+# conservador (override con STRATA_CONTEXT_TOKENS en .env). Súbelo si tu
+# modelo servido soporta más contexto.
+try:
+    STRATA_CONTEXT_TOKENS = int(
+        os.environ.get("STRATA_CONTEXT_TOKENS", MAX_CONTEXT_TOKENS)
+    )
+except ValueError:
+    STRATA_CONTEXT_TOKENS = MAX_CONTEXT_TOKENS
+
 # Compactación de prompt (anti-lentitud en modelos locales).
 # Cuanto más prompt envíes al LLM, más tarda en procesar (prefill). En
 # sesiones largas los `Resultado del comando:` se acumulan y disparan la
@@ -314,13 +338,14 @@ ORANGE_DARK = CYAN_DARK
 console = Console()
 
 # ============================================================
-# BACKENDS DE MODELO (LM Studio local / Ollama Cloud)
+# BACKENDS DE MODELO (LM Studio local / Ollama Cloud / Strata)
 # ============================================================
 # El agente puede apuntar a distintos backends OpenAI-compatibles. El operador
-# cambia entre ellos en el REPL con `backend <nombre>`. LM Studio es el default.
+# cambia entre ellos en el REPL con `backend <nombre>`. Strata es el default.
 #
 #   · lmstudio  → servidor local/tailnet (sin API key real).
 #   · ollama    → Ollama Cloud (https://ollama.com/v1), API key en OLLAMA_API_KEY.
+#   · strata    → motor de inferencia local/tailnet (sin API key), modelo iq3_s.
 
 BACKENDS = {
     "lmstudio": {
@@ -340,15 +365,32 @@ BACKENDS = {
         # Si /api/show no responde, usamos el fallback conservador local.
         "context_fallback": MAX_CONTEXT_TOKENS,
         "needs_key": True,
+        "key_env": "OLLAMA_API_KEY",
         # La API de Ollama devuelve los modelos en orden no determinista: cada
         # llamada varía. Ordenamos alfabéticamente para que la numeración de
         # `models` sea estable y coincida entre el listado y la selección.
         "sort_models": True,
     },
+    "strata": {
+        "label": "Strata (motor local/tailnet)",
+        "base_url": STRATA_BASE_URL,
+        # Strata no exige API key, pero acepta Bearer si se configura.
+        "api_key": lambda: os.environ.get("STRATA_API_KEY", "") or "strata",
+        "fallback": STRATA_MODEL_FALLBACK,
+        # Sin metadatos de contexto en /v1/models: valor conservador
+        # configurable con STRATA_CONTEXT_TOKENS.
+        "context_fallback": STRATA_CONTEXT_TOKENS,
+        "needs_key": False,
+        "key_env": "STRATA_API_KEY",
+    },
 }
 
 # Backend activo (clave de BACKENDS). Lo cambia switch_backend() desde el REPL.
-_ACTIVE_BACKEND = "lmstudio"
+# Por defecto Strata; override con AGENT_BACKEND=lmstudio|ollama|strata.
+_DEFAULT_BACKEND = os.environ.get("AGENT_BACKEND", "strata").strip().lower()
+_ACTIVE_BACKEND = (
+    _DEFAULT_BACKEND if _DEFAULT_BACKEND in BACKENDS else "strata"
+)
 
 
 def active_backend_cfg():
@@ -5151,8 +5193,8 @@ def append_runs_entry(command, rc, target=None):
 # ============================================================
 
 def get_lmstudio_models():
-    """Lista de IDs de modelos expuestos por el backend activo (LM Studio o
-    Ollama Cloud). Nombre histórico; sirve para cualquier backend
+    """Lista de IDs de modelos expuestos por el backend activo (LM Studio,
+    Ollama Cloud o Strata). Nombre histórico; sirve para cualquier backend
     OpenAI-compatible. Si el backend no responde, cae a su fallback."""
     cfg = active_backend_cfg()
     base = cfg["base_url"].rstrip("/")
@@ -5195,10 +5237,11 @@ def get_lmstudio_models_detailed():
     Devuelve lista de dicts: {id, state, arch, max_ctx, loaded_ctx, caps, quant}.
     """
     # El API nativo de estado/contexto solo existe en LM Studio. En otros
-    # backends (Ollama Cloud) saltamos directo al fallback de solo-IDs.
+    # backends (Ollama Cloud, Strata) saltamos directo al fallback de solo-IDs.
     if _ACTIVE_BACKEND != "lmstudio":
+        state = "served" if _ACTIVE_BACKEND == "strata" else "cloud"
         return [
-            {"id": m, "state": "cloud", "arch": "", "quant": "",
+            {"id": m, "state": state, "arch": "", "quant": "",
              "max_ctx": None, "loaded_ctx": None, "caps": []}
             for m in get_lmstudio_models()
         ]
@@ -5340,8 +5383,9 @@ def get_max_context_tokens():
     """Ventana de contexto efectiva del modelo activo.
 
     Se recalcula cuando cambia el backend o el modelo. Para cloud (Ollama)
-    consulta `/api/show`; para LM Studio usa los metadatos nativos. Si no
-    hay metadatos, cae a `MAX_CONTEXT_TOKENS`.
+    consulta `/api/show`; para LM Studio usa los metadatos nativos. Strata no
+    expone el dato: usa `STRATA_CONTEXT_TOKENS`. Si no hay metadatos, cae a
+    `MAX_CONTEXT_TOKENS`.
     """
     backend = _ACTIVE_BACKEND
     model = _LAST_ACTIVE_MODEL
@@ -5429,9 +5473,9 @@ def set_active_model(selector):
 
 
 def switch_backend(selector):
-    """Cambia el backend de modelo activo (`lmstudio` | `ollama`) y reconstruye
-    el cliente OpenAI. Resetea la selección manual de modelo (cada backend tiene
-    sus propios modelos). Devuelve (ok, mensaje).
+    """Cambia el backend de modelo activo (`lmstudio` | `ollama` | `strata`)
+    y reconstruye el cliente OpenAI. Resetea la selección manual de modelo
+    (cada backend tiene sus propios modelos). Devuelve (ok, mensaje).
 
     selector="" / "status" → informa del backend actual sin cambiarlo.
     """
@@ -5448,6 +5492,7 @@ def switch_backend(selector):
     aliases = {
         "lm": "lmstudio", "lmstudio": "lmstudio", "local": "lmstudio",
         "ollama": "ollama", "cloud": "ollama", "ollama-cloud": "ollama",
+        "strata": "strata", "stratum": "strata", "motor": "strata",
     }
     target = aliases.get(sel, sel)
 
@@ -5459,11 +5504,12 @@ def switch_backend(selector):
 
     # Validación de API key para backends que la requieren.
     if cfg.get("needs_key"):
-        key = os.environ.get("OLLAMA_API_KEY", "")
+        key_env = cfg.get("key_env", "OLLAMA_API_KEY")
+        key = os.environ.get(key_env, "")
         if not key:
             return False, (f"El backend '{target}' ({cfg['label']}) necesita "
-                           f"OLLAMA_API_KEY. Añádela a ~/ai-agent-kali/.env "
-                           f"(OLLAMA_API_KEY=...) y reinicia, o expórtala en el "
+                           f"{key_env}. Añádela a ~/ai-agent-kali/.env "
+                           f"({key_env}=...) y reinicia, o expórtala en el "
                            f"entorno.")
 
     _ACTIVE_BACKEND = target
@@ -5989,7 +6035,7 @@ def build_commands_panel():
             ("help / ayuda",            "Ayuda extendida"),
             ("comandos / commands",     "Esta tabla de comandos"),
             ("models [nombre|índice]",  "Lista modelos / cambia el activo (auto = automático)"),
-            ("backend [nombre|test]",   "Cambia backend: ollama (nube) / lmstudio (local); test = diagnóstico"),
+            ("backend [nombre|test]",   "Cambia backend: strata (motor local) / lmstudio / ollama (nube); test = diagnóstico"),
             ("tools / herramientas",    "Herramientas instaladas"),
             ("proxy [on/off/status]",   "Control de Tor/proxychains"),
             ("sudo [set/refresh/clear]", "Cachea contraseña sudo (subagentes)"),
@@ -7639,6 +7685,18 @@ def _fmt_elapsed(seconds):
     return f"{h}h {m:02d}m {s:02d}s"
 
 
+def _message_final_text(message):
+    """Texto final (`content`) de un mensaje del API.
+
+    Los modelos de razonamiento (p. ej. iq3_s en Strata) devuelven
+    `content=None` mientras sólo han emitido `reasoning_content`. Ese
+    razonamiento NO debe tratarse como respuesta ni ejecutarse como
+    COMANDO; simplemente se descarta.
+    """
+    content = getattr(message, "content", None)
+    return content if isinstance(content, str) else ""
+
+
 def _ask_model_batch(kwargs):
     """Modo no-streaming: spinner animado mientras espera, render Markdown
     al terminar. El contador de tiempo en vivo está en el spinner."""
@@ -7650,12 +7708,26 @@ def _ask_model_batch(kwargs):
         LAST_USAGE["completion_tokens"] = response.usage.completion_tokens or 0
         LAST_USAGE["total_tokens"] = response.usage.total_tokens or 0
 
-    answer = response.choices[0].message.content
+    message = response.choices[0].message
+    answer = _message_final_text(message)
     console.print()
     console.print(f"[bold {ORANGE}]Agente:[/bold {ORANGE}]")
     # El strip de TARGET_UPDATE pasa después en ask_model; aquí mostramos el answer
     # tal cual viene (los bloques siguen presentes y el usuario los verá).
-    console.print(Markdown(answer))
+    if answer:
+        console.print(Markdown(answer))
+    else:
+        reasoning = getattr(message, "reasoning_content", "") or ""
+        console.print(
+            f"[yellow]› el modelo no devolvió respuesta final "
+            f"(agotó max_tokens durante el razonamiento).[/]"
+        )
+        if reasoning:
+            preview = reasoning.strip()[-600:]
+            console.print(
+                f"[dim]razonamiento descartado (no se ejecuta): "
+                f"{rich_escape(preview)}[/]"
+            )
     return answer
 
 
@@ -7676,6 +7748,7 @@ def _ask_model_streaming(kwargs):
     chunks = []
     final_usage = None
     first_token_at = None
+    reasoning_chars = 0
 
     try:
         stream = _create_completion(**stream_kwargs)
@@ -7700,6 +7773,15 @@ def _ask_model_streaming(kwargs):
                 continue
 
             delta = chunk.choices[0].delta
+            # Modelos de razonamiento (Strata/iq3_s): primero llegan deltas
+            # `reasoning_content` y sólo después `content`. El razonamiento no
+            # se imprime ni se devuelve como respuesta (podría contener
+            # COMANDOs hipotéticos que no deben ejecutarse).
+            reasoning_text = (
+                getattr(delta, "reasoning_content", None) if delta else None
+            )
+            if reasoning_text:
+                reasoning_chars += len(reasoning_text)
             text = getattr(delta, "content", None) if delta else None
             if text:
                 if first_token_at is None:
@@ -7732,10 +7814,17 @@ def _ask_model_streaming(kwargs):
             f"total {_fmt_elapsed(elapsed)}[/]"
         )
     else:
-        console.print(
-            f"[dim]› sin tokens (¿modelo cancelado?) · "
-            f"{_fmt_elapsed(elapsed)}[/]"
-        )
+        if reasoning_chars:
+            console.print(
+                f"[yellow]› el modelo sólo emitió razonamiento "
+                f"({reasoning_chars:,} chars) sin respuesta final; "
+                f"sube max_tokens o simplifica el prompt.[/]"
+            )
+        else:
+            console.print(
+                f"[dim]› sin tokens (¿modelo cancelado?) · "
+                f"{_fmt_elapsed(elapsed)}[/]"
+            )
     sys.stdout.flush()
 
     if final_usage:
@@ -10653,8 +10742,8 @@ def print_help():
 [bold {WHITE}]clear / limpiar[/bold {WHITE}]         Igual que refresh.
 [bold {WHITE}]models \\[nombre|índice][/bold {WHITE}]  Lista modelos de LM Studio (con estado/contexto) y marca el activo.
                         Con argumento cambia el modelo activo: `models 2` o `models qwen`.
-                        `models auto` vuelve al modo automático (primer modelo cargado).
-[bold {WHITE}]backend \\[nombre|test][/bold {WHITE}]  Cambia el backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local).
+                        `models auto` vuelve al modo automático (primer modelo del backend).
+[bold {WHITE}]backend \\[nombre|test][/bold {WHITE}]  Cambia el backend de modelo: `backend strata` (motor local) / `backend lmstudio` / `backend ollama` (nube).
                         `backend test` prueba la conexión y muestra el error exacto.
                         Sin argumento muestra el backend activo y las opciones. Ollama Cloud usa OLLAMA_API_KEY.
 [bold {WHITE}]tools / herramientas[/bold {WHITE}]    Herramientas instaladas y faltantes.
@@ -10763,7 +10852,7 @@ def print_commands():
         ("General",  "refresh / refrescar",     "Limpia pantalla y redibuja el splash"),
         ("General",  "clear / limpiar",         "Igual que refresh"),
         ("General",  "models [nombre|índice]",  "Lista modelos (estado/contexto) y cambia el activo; `models auto` = automático"),
-        ("General",  "backend [nombre|test]",   "Cambia backend de modelo: `backend ollama` (nube) / `backend lmstudio` (local). `backend test` diagnostica la conexión y muestra el error exacto"),
+        ("General",  "backend [nombre|test]",   "Cambia backend de modelo: `backend strata` (motor local) / `backend lmstudio` / `backend ollama` (nube). `backend test` diagnostica la conexión y muestra el error exacto"),
         ("General",  "tools / herramientas",    "Tabla de herramientas instaladas vs faltantes"),
         ("General",  "proxy [on/off/status]",   "Estado y control del enrutado por Tor/proxychains"),
         ("General",  "sudo [status|refresh|set|clear]", "Gestiona la password sudo. `sudo refresh` refresca el caché (15 min). `sudo set` almacena la password en memoria (no a disco) para que subagentes/autopilot la usen sin pedirla. `sudo clear` la borra."),
@@ -10908,7 +10997,7 @@ def print_models():
 
     console.print(table)
 
-    mode = "manual" if _SELECTED_MODEL else "automático (primer modelo cargado)"
+    mode = "manual" if _SELECTED_MODEL else "automático (primer modelo del backend)"
     console.print(
         f"[dim]Activo (●): [bold {GREEN}]{active}[/]  ·  selección: {mode}[/]"
     )
@@ -12180,15 +12269,18 @@ def _repl_backend(user_input, cmd_lower, first_word):
         for name, cfg in BACKENDS.items():
             mark = "●" if name == _ACTIVE_BACKEND else "○"
             note = ""
-            if cfg.get("needs_key") and not os.environ.get("OLLAMA_API_KEY"):
-                note = "  [dim](falta OLLAMA_API_KEY)[/]"
+            key_env = cfg.get("key_env")
+            if cfg.get("needs_key") and key_env and not os.environ.get(key_env):
+                note = f"  [dim](falta {key_env})[/]"
             console.print(
                 f"  [bold {CYAN}]{mark}[/] {name:10} "
                 f"{rich_escape(str(cfg['label']))} · "
                 f"{rich_escape(str(cfg['base_url']))}{note}"
             )
-        console.print(f"[dim]Cambiar: [bold {CYAN}]backend ollama[/] / "
-                      f"[bold {CYAN}]backend lmstudio[/][/]")
+        opts = " / ".join(
+            f"[bold {CYAN}]backend {n}[/]" for n in BACKENDS
+        )
+        console.print(f"[dim]Cambiar: {opts}[/]")
         console.print(f"[dim]Diagnóstico de conexión: "
                       f"[bold {CYAN}]backend test[/][/]")
         return _REPL_HANDLED
@@ -12234,8 +12326,9 @@ def _repl_backend(user_input, cmd_lower, first_word):
                 f"{rich_escape(base)}, que el host/puerto sean alcanzables "
                 f"y el firewall. "
                 f"Para LM Studio: activa 'Serve on Local Network' y el "
-                f"puerto 1234. Para cambiar la URL sin editar código: "
-                f"LMSTUDIO_BASE_URL=http://host:1234/v1 en .env.[/]"
+                f"puerto 1234. Para Strata: puerto 47832. Para cambiar la "
+                f"URL sin editar código: LMSTUDIO_BASE_URL=… / "
+                f"STRATA_BASE_URL=… / OLLAMA_BASE_URL=… en .env.[/]"
             )
         if _ACTIVE_BACKEND == "ollama":
             root = base[:-3] if base.endswith("/v1") else base

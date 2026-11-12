@@ -162,11 +162,14 @@ resuelve por modelo y la cachea por `(backend, modelo)`:
 - **LM Studio** → `/api/v0/models` (`loaded_context_length` o
   `max_context_length`).
 - **Ollama Cloud** → `POST /api/show` → `model_info.<arquitectura>.context_length`.
+- **Strata** → no publica el dato en `/v1/models`; usa
+  `STRATA_CONTEXT_TOKENS`.
 - **Fallback** → `MAX_CONTEXT_TOKENS` si el backend no expone el dato.
 
 Se usa en la barra de contexto y en el umbral de compactación
 (`COMPACT_TRIGGER_PCT`). Al cambiar de modelo (`models N`) o de backend
-(`backend ollama`) se invalida la caché y se vuelve a resolver.
+(`backend strata|lmstudio|ollama`) se invalida la caché y se vuelve a
+resolver.
 
 ## Modo headless
 

@@ -41,7 +41,7 @@ Agente de IA local para pentesting ofensivo en Kali Linux. Conecta con un LLM ex
 
 - **Kali Linux** (o cualquier distro Linux moderna con Python 3.11+).
 - **Python 3.11+** con venv.
-- **LM Studio** corriendo en local o LAN con un modelo cargado y la API expuesta (por defecto `http://127.0.0.1:1234/v1`). Modelo recomendado: cualquiera con context window ≥ 32k tokens (Qwen 2.5/3.x 14B-32B, Llama 3.1/3.3 70B, etc.).
+- Un backend LLM OpenAI-compatible: **Strata** (por defecto, `http://100.68.49.90:47832/v1`), **LM Studio** (`http://127.0.0.1:1234/v1`) u **Ollama Cloud**. Modelo recomendado: cualquiera con context window ≥ 32k tokens (Qwen 2.5/3.x 14B-32B, Llama 3.1/3.3 70B, etc.).
 - **chafa** (render del emblema): `sudo apt install chafa`
 - **kitty terminal** (recomendado, render pixel-perfect del emblema): `sudo apt install kitty`
 - **Mullvad CLI** (opcional, estado VPN en el splash): `sudo apt install mullvad-vpn`
@@ -67,6 +67,10 @@ Edita las constantes al principio de `agent.py`:
 
 | Variable | Default | Descripción |
 |---|---|---|
+| `AGENT_BACKEND` | `strata` | Backend al arrancar: `strata`, `lmstudio` u `ollama`. Cambio en caliente con `backend <nombre>` |
+| `STRATA_BASE_URL` | `http://100.68.49.90:47832/v1` | Endpoint OpenAI-compatible de Strata. **Configurable en `.env`** |
+| `STRATA_MODEL_FALLBACK` | `iq3_s` | Modelo a usar si Strata no expone ninguno |
+| `STRATA_CONTEXT_TOKENS` | `MAX_CONTEXT_TOKENS` | Ventana de contexto de Strata (no la publica en `/v1/models`) |
 | `LMSTUDIO_BASE_URL` | `http://lmstudio-oficina:1234/v1` | Endpoint de LM Studio. **Configurable en `.env`** (`LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1`) |
 | `MODEL_NAME_FALLBACK` | modelo local por defecto | Modelo a usar si el backend no expone ninguno. Override en `.env` |
 | `OLLAMA_BASE_URL` / `OLLAMA_API_KEY` | `https://ollama.com/v1` | Backend cloud OpenAI-compatible |
@@ -179,7 +183,8 @@ Indicadores extra:
 | `help` / `ayuda` | Ayuda extendida |
 | `comandos` / `commands` | Tabla compacta con todos los comandos |
 | `refresh` / `clear` | Redibuja el splash |
-| `models` / `modelos` | Modelos expuestos por LM Studio |
+| `models` / `modelos` | Modelos expuestos por el backend activo (Strata, LM Studio u Ollama) |
+| `backend [nombre\|test]` | Cambia entre `strata`, `lmstudio` y `ollama`; `backend test` diagnostica la conexión |
 | `tools` / `herramientas` | Tabla categorizada de las **137 herramientas** que el agente reconoce (17 categorías) con instaladas/faltantes |
 | `compact` / `compactar` | Compacta history (acelera prefill del modelo en sesiones largas) |
 | `auto [on\|off\|status\|steps <N>]` | Modo autónomo del agente principal: tras cada COMANDO analiza y ejecuta el siguiente sin esperar input. `auto steps 50` cambia el límite por turno |
@@ -758,20 +763,30 @@ Las faltantes se pueden auto-instalar cuando el modelo intente usarlas (auto-ins
 
 **El agente no se conecta al modelo**
 > 1. En el REPL: `backend test` — muestra la URL efectiva y el error exacto.
-> 2. Comprueba resolución y puerto:
+> 2. Comprueba resolución y puerto según el backend:
 > ```bash
+> # Strata (por defecto)
+> curl -m 5 http://100.68.49.90:47832/v1/models
+> # LM Studio
 > getent hosts lmstudio-oficina
 > curl -m 5 http://lmstudio-oficina:1234/v1/models
 > ss -ltn | grep 1234
 > ```
-> 3. Si LM Studio está en otra máquina, configura la URL en `.env` (sin editar código):
+> 3. Configura la URL en `.env` (sin editar código):
 > ```bash
-> LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1     # LM Studio en esta máquina
-> LMSTUDIO_BASE_URL=http://it1-pc:1234/v1        # tailnet/LAN
-> LMSTUDIO_BASE_URL=http://192.168.1.20:1234/v1  # LAN
+> AGENT_BACKEND=strata
+> STRATA_BASE_URL=http://100.68.49.90:47832/v1     # Strata en el tailnet
+> STRATA_CONTEXT_TOKENS=131072                     # si tu modelo soporta más
+>
+> AGENT_BACKEND=lmstudio
+> LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1       # LM Studio en esta máquina
+> LMSTUDIO_BASE_URL=http://it1-pc:1234/v1          # tailnet/LAN
+> LMSTUDIO_BASE_URL=http://192.168.1.20:1234/v1    # LAN
 > ```
-> 4. En LM Studio activa **Serve on Local Network**, puerto 1234, y permite el puerto en el firewall.
+> 4. En LM Studio activa **Serve on Local Network**, puerto 1234, y permite el puerto en el firewall. En Strata, verifica que el puerto 47832 esté expuesto.
 > 5. Fallback cloud: `backend ollama` (requiere `OLLAMA_API_KEY` en `.env`).
+>
+> Cambio en caliente sin reiniciar: `backend strata`, `backend lmstudio`, `backend ollama`.
 
 **El goal falla con "Modelo devolvió respuesta VACÍA"**
 > El prompt del orquestador supera el context window real del modelo. El agente reintenta automáticamente con prompt MINIMAL (sólo attack-surface + notes + identities, head corto). Si aun así falla, revisa el log en `memory/subagents/_goal-<id>.log`, baja `MAX_CONTEXT_TOKENS` para coincidir con el modelo real, o usa un modelo con context window más grande.
